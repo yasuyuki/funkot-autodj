@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# Local cache and large generated audio
+/funkot-cache/
+/testdata/
+*.wav
+!funkot-core/tests/data/*.wav
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

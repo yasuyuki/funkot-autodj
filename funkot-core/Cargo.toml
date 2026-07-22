@@ -1,0 +1,33 @@
+[package]
+name = "funkot-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Funkot auto-DJ mixing engine: analysis, tempo-sync, DJ-style crossfades"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+symphonia = { version = "0.6", default-features = false, features = [
+    "mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "wav", "pcm", "alac", "id3v2",
+] }
+signalsmith-stretch = "0.1.3"
+rubato = "4"
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+log = "0.4"
+
+[features]
+default = []
+## Expose [`crate::testutil`] for engine / integration tests in other crates.
+## In-crate unit tests already see it via `cfg(test)`.
+testutil = []
+
+[dev-dependencies]
+approx = "0.5"
+# Enable `testutil` for integration tests (`tests/*.rs`) without requiring
+# `--features testutil` on the command line.
+funkot-core = { path = ".", features = ["testutil"] }
