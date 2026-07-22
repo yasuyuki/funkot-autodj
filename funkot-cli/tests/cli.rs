@@ -78,8 +78,10 @@ fn render_two_tracks_end_to_end() {
     let out = dir.join("out.wav");
 
     let sr = 44_100u32;
-    write_wav(&a, &synth_track(180.0, 16, 32, 16, sr)).expect("a");
-    write_wav(&b, &synth_track(178.0, 16, 32, 16, sr)).expect("b");
+    // Keep total bars roughly constant, but shorten intro+main so that
+    // the engine reaches `outro_start` early enough for `TransitionStarted`.
+    write_wav(&a, &synth_track(180.0, 8, 8, 48, sr)).expect("a");
+    write_wav(&b, &synth_track(178.0, 8, 8, 48, sr)).expect("b");
     fs::write(&list, "a.wav\nb.wav\n").expect("list");
 
     let status = bin()
@@ -89,7 +91,9 @@ fn render_two_tracks_end_to_end() {
             "--render",
             out.to_str().unwrap(),
             "--render-speed",
-            "0",
+            "10",
+            "--transition-clip-seconds",
+            "2",
             "--sample-rate",
             "44100",
             "--cache-dir",
@@ -99,6 +103,25 @@ fn render_two_tracks_end_to_end() {
         .expect("spawn");
     assert!(status.success(), "exit status {status}");
     assert!(out.is_file(), "out.wav missing");
+
+    // Transition clips should be emitted automatically for `--render`.
+    let transitions_dir = dir.join("out_transitions");
+    let entries: Vec<_> = fs::read_dir(&transitions_dir).expect("read transitions dir").collect();
+    assert_eq!(entries.len(), 1, "expected 1 transition clip, got {}", entries.len());
+    let clip_path = entries[0].as_ref().unwrap().path();
+    let clip_reader = hound::WavReader::open(&clip_path).expect("open clip");
+    let spec = clip_reader.spec();
+    assert_eq!(spec.channels, 2);
+    assert_eq!(spec.sample_rate, 44_100);
+    assert_eq!(spec.bits_per_sample, 32);
+    assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+    let samples = clip_reader.len() as u64;
+    let frames = samples / 2;
+    let duration = frames as f64 / 44_100.0;
+    assert!(
+        duration > 0.5,
+        "expected clip duration > 0.5s, got {duration:.2}s"
+    );
 
     let mut reader = hound::WavReader::open(&out).expect("open out");
     let spec = reader.spec();
@@ -151,6 +174,8 @@ fn render_s16_wav_format() {
             "s16",
             "--render-speed",
             "0",
+            "--transition-clip-seconds",
+            "2",
             "--sample-rate",
             "44100",
             "--cache-dir",

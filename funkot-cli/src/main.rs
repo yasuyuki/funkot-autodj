@@ -1,6 +1,6 @@
 //! funkot-autodj CLI: live playback via cpal, or offline WAV render.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
@@ -67,6 +67,14 @@ struct Args {
     #[arg(long, value_name = "OUT.wav")]
     render: Option<PathBuf>,
 
+    /// Per-transition clip length (seconds) emitted during `--render`.
+    /// Generated clips start at each transition start frame and are
+    /// capped by the available render duration.
+    ///
+    /// Default matches existing transition extraction presets (~90s).
+    #[arg(long, default_value_t = 90.0)]
+    transition_clip_seconds: f64,
+
     /// Offline WAV sample format (default: 32-bit float, no clamp)
     #[arg(long, value_enum, default_value_t = WavFormat::F32)]
     wav_format: WavFormat,
@@ -115,6 +123,7 @@ fn run() -> Result<()> {
             out,
             args.wav_format,
             args.render_speed,
+            args.transition_clip_seconds,
             &stop,
         )?;
     } else {
@@ -223,6 +232,7 @@ fn run_render(
     out_path: &std::path::Path,
     wav_format: WavFormat,
     render_speed: f64,
+    transition_clip_seconds: f64,
     stop: &AtomicBool,
 ) -> Result<()> {
     let playlist_len = playlist.len();
@@ -230,6 +240,149 @@ fn run_render(
     let mut engine = Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
 
     let mut writer = WavStreamWriter::create(out_path, sample_rate, wav_format)?;
+
+    // During offline rendering, additionally emit per-transition WAV clips
+    // to speed up verification after each transition rule change.
+    let transition_enabled = transition_clip_seconds.is_finite()
+        && transition_clip_seconds > 0.0
+        && playlist_len >= 2;
+    let clip_len_frames = if transition_enabled {
+        (transition_clip_seconds * f64::from(sample_rate)).round() as u64
+    } else {
+        0
+    };
+
+    struct TransitionCapture {
+        start_frame: u64, // output-file frame indices
+        end_frame: u64,   // exclusive
+        writer: WavStreamWriter,
+    }
+
+    fn parse_real_mix_v_number(stem: &str) -> Option<u32> {
+        let prefix = "real_mix_v";
+        if !stem.starts_with(prefix) {
+            return None;
+        }
+        let mut digits = String::new();
+        for ch in stem[prefix.len()..].chars() {
+            if ch.is_ascii_digit() {
+                digits.push(ch);
+            } else {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse::<u32>().ok()
+        }
+    }
+
+    fn sanitize_component(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut last_us = false;
+        for ch in s.chars() {
+            let keep = ch.is_ascii_alphanumeric() || ch == '_';
+            if keep {
+                out.push(ch);
+                last_us = false;
+            } else if !last_us {
+                out.push('_');
+                last_us = true;
+            }
+        }
+        let out = out.trim_matches('_');
+        if out.is_empty() {
+            "track".to_string()
+        } else {
+            out.to_string()
+        }
+    }
+
+    fn short_name_from_path(path: &PathBuf) -> String {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+        // Strip leading track number like "03. " or "12 ".
+        let mut s = stem.trim_start();
+        let mut i = 0usize;
+        for ch in s.chars() {
+            if ch.is_ascii_digit() {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if i > 0 {
+            let rest = &s[i..];
+            if rest.starts_with('.') {
+                s = rest[1..].trim_start();
+            } else if rest.starts_with(' ') {
+                s = rest.trim_start();
+            }
+        }
+
+        // Prefer the last "- <number> <title>" segment if present.
+        let parts: Vec<&str> = s.split(" - ").collect();
+        let mut chosen: Option<&str> = None;
+        for p in &parts {
+            let t = p.trim_start();
+            let mut j = 0usize;
+            for ch in t.chars() {
+                if ch.is_ascii_digit() {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j > 0 {
+                let after = t[j..].trim_start();
+                if !after.is_empty() {
+                    chosen = Some(after);
+                }
+            }
+        }
+
+        let raw = if let Some(c) = chosen {
+            c
+        } else {
+            parts.first().copied().unwrap_or(s)
+        };
+        sanitize_component(raw)
+    }
+
+    fn wav_suffix(w: WavFormat) -> &'static str {
+        match w {
+            WavFormat::F32 => "f32",
+            WavFormat::S24 => "s24",
+            WavFormat::S16 => "s16",
+        }
+    }
+
+    let transitions_dir = if transition_enabled {
+        let out_parent = out_path.parent().unwrap_or_else(|| Path::new("testdata"));
+        let stem = out_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mix");
+        if let Some(v) = parse_real_mix_v_number(stem) {
+            out_parent.join(format!("real_mix_v{v}_transitions"))
+        } else {
+            out_parent.join(format!("{stem}_transitions"))
+        }
+    } else {
+        PathBuf::new()
+    };
+
+    if transition_enabled {
+        std::fs::create_dir_all(&transitions_dir)?;
+    }
+
+    let mut transition_captures: Vec<TransitionCapture> = Vec::new();
+    let mut next_transition_idx: u32 = 1;
 
     const CHUNK_FRAMES: usize = 8192;
     let mut buf = vec![0.0f32; CHUNK_FRAMES * 2];
@@ -242,7 +395,12 @@ fn run_render(
     // Skip writing long post-track silence while the loader prepares the next
     // track (render() returns zeros and never blocks). Keep short gaps that
     // occur between kicks in the material itself.
-    let silence_skip_frames = u64::from(sample_rate); // ~1s
+    let silence_skip_frames = if transition_enabled {
+        // Keep clip boundaries stable in output-file frame indices.
+        u64::MAX
+    } else {
+        u64::from(sample_rate) // ~1s
+    };
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -250,9 +408,15 @@ fn run_render(
         }
 
         let n = engine.render(&mut buf);
+        let n_frames_u64 = n as u64;
+        let transition_frames_into_end = engine.transition_frames_into().unwrap_or(0);
+        let mut transitions_started: Vec<(PathBuf, PathBuf)> = Vec::new();
         for event in engine.poll_events() {
             if matches!(event, EngineEvent::TrackStarted { .. }) {
                 seen_track_started = true;
+            }
+            if let EngineEvent::TransitionStarted { from, to } = &event {
+                transitions_started.push((from.clone(), to.clone()));
             }
             print_event(&event, playlist_len);
         }
@@ -282,8 +446,62 @@ fn run_render(
             consecutive_silent_frames = 0;
         }
 
+        // Anchor per-transition clip start on the output-file frame index.
+        let chunk_start_frame = rendered_frames;
+
+        if transition_enabled && !transitions_started.is_empty() && transition_frames_into_end <= n_frames_u64 {
+            for (from, to) in transitions_started {
+                let start_offset = if transition_frames_into_end == 0 {
+                    0
+                } else {
+                    n_frames_u64.saturating_sub(transition_frames_into_end)
+                };
+                let start_frame = chunk_start_frame + start_offset;
+                let end_frame = start_frame.saturating_add(clip_len_frames);
+
+                let from_name = short_name_from_path(&from);
+                let to_name = short_name_from_path(&to);
+                let clip_path = transitions_dir.join(format!(
+                    "{:02}_{from_name}_to_{to_name}_{}.wav",
+                    next_transition_idx,
+                    wav_suffix(wav_format)
+                ));
+
+                let w = WavStreamWriter::create(&clip_path, sample_rate, wav_format)?;
+                transition_captures.push(TransitionCapture {
+                    start_frame,
+                    end_frame,
+                    writer: w,
+                });
+                next_transition_idx += 1;
+            }
+        } else if transition_enabled && !transitions_started.is_empty() {
+            eprintln!(
+                "warn: transition clip start skipped: frames_into_end={} n={}",
+                transition_frames_into_end, n
+            );
+        }
+
         writer.write_interleaved(chunk)?;
-        rendered_frames += n as u64;
+        // Also write overlapping samples into active transition capture(s).
+        if transition_enabled && clip_len_frames > 0 && !transition_captures.is_empty() {
+            let chunk_end_frame = chunk_start_frame + n_frames_u64;
+            for cap in transition_captures.iter_mut() {
+                let overlap_start = cap.start_frame.max(chunk_start_frame);
+                let overlap_end = cap.end_frame.min(chunk_end_frame);
+                if overlap_end <= overlap_start {
+                    continue;
+                }
+
+                let overlap_frames = overlap_end - overlap_start;
+                let chunk_off_frames = overlap_start - chunk_start_frame;
+                let src_start = (chunk_off_frames as usize) * 2;
+                let src_end = src_start + (overlap_frames as usize) * 2;
+                cap.writer.write_interleaved(&chunk[src_start..src_end])?;
+            }
+        }
+
+        rendered_frames += n_frames_u64;
 
         let audio_secs = rendered_frames as f64 / f64::from(sample_rate);
         let progress_secs = audio_secs as u64;
@@ -317,6 +535,14 @@ fn run_render(
         "peak level: {:.4} ({peak_dbfs:.2} dBFS); samples |x|>1: {}; frames with over: {}",
         stats.peak, stats.over_samples, stats.over_frames
     );
+
+    if transition_enabled {
+        let n_clips = next_transition_idx.saturating_sub(1);
+        for cap in transition_captures {
+            let _ = cap.writer.finalize();
+        }
+        println!("wrote {} transition clips to {}", n_clips, transitions_dir.display());
+    }
     Ok(())
 }
 

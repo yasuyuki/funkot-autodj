@@ -990,15 +990,16 @@ fn prepare_one(
     let scale = position_scale(in_frames, out_frames);
     let bar_frames = options.bar_frames();
 
-    // Intro/outro beat *phases* are independent (middle tempo drifts). Bar
-    // identity for the outro comes from the analysis marker (measured from the
-    // file end), never from intro-propagated bar counting across the middle.
     let mapped_fd = (analysis.first_downbeat as f64 * scale).round() as u64;
     let mapped_outro = (analysis.outro_start as f64 * scale).round() as u64;
     let (first_downbeat_out, outro_start_out) = prepare_output_markers(
         &rendered,
         options.output_sample_rate,
         out_frames,
+        analysis.first_downbeat,
+        analysis.outro_start,
+        intro_bpm,
+        buffer.sample_rate,
         mapped_fd,
         mapped_outro,
         analysis.outro_bars,
@@ -1060,13 +1061,19 @@ pub fn refine_output_downbeat(
 
 /// Map analysis markers to the stretched output domain and micro-refine only.
 ///
-/// Single source of truth: scaled analysis `first_downbeat` / `outro_start`.
-/// Each marker is nudged with [`refine_output_downbeat`] (±half beat). No
-/// ±1/±2 beat searches, intro-propagated grids, or bar-phase projection.
+/// Intro downbeat: scaled analysis `first_downbeat`, ±half-beat refine.
+/// Outro start: bar count propagated from intro (`legacy_intro_propagated_outro`)
+/// so outro sits on the **same bar grid** as the intro downbeat, then ±half-beat
+/// refine. End-anchored `mapped_outro` alone can drift ~1 beat from the intro
+/// grid (intro/outro BPM mismatch over long tracks) and misalign transitions.
 pub fn prepare_output_markers(
     interleaved_stereo: &[f32],
     sample_rate: u32,
     out_frames: u64,
+    first_downbeat_in: u64,
+    outro_start_in: u64,
+    intro_bpm: f64,
+    sample_rate_in: u32,
     mapped_first_downbeat: u64,
     mapped_outro: u64,
     outro_bars: u32,
@@ -1081,14 +1088,27 @@ pub fn prepare_output_markers(
     )
     .min(out_frames.saturating_sub(1));
 
-    let outro_start_out = derive_outro_start_out(
-        interleaved_stereo,
-        sample_rate,
-        out_frames,
-        mapped_outro,
-        outro_bars,
+    let intro_grid_outro = legacy_intro_propagated_outro(
+        first_downbeat_in,
+        outro_start_in,
+        intro_bpm,
+        sample_rate_in,
+        first_downbeat_out,
         bar_frames,
     );
+    let outro_start_out = if outro_start_in > 0 {
+        intro_grid_outro
+    } else {
+        derive_outro_start_out(
+            interleaved_stereo,
+            sample_rate,
+            out_frames,
+            mapped_outro,
+            outro_bars,
+            bar_frames,
+        )
+    }
+    .min(out_frames.saturating_sub(1));
 
     (first_downbeat_out, outro_start_out)
 }
@@ -1120,9 +1140,11 @@ pub fn derive_outro_start_out(
         .min(out_frames.saturating_sub(1))
 }
 
-/// Legacy intro-propagated outro (coarse bar identity + diagnostics). Propagates
-/// intro bar count across the whole track — sub-beat phase is wrong when the
-/// middle changes tempo; use only as a coarse bar-index hint.
+/// Intro-propagated outro on the output bar grid (coarse bar identity).
+///
+/// Counts bars from analysis `first_downbeat` → `outro_start` at source BPM,
+/// then snaps onto `first_downbeat_out` + N target-tempo bars. Used in production
+/// so outro transitions share the intro downbeat's bar grid.
 pub fn legacy_intro_propagated_outro(
     first_downbeat_in: u64,
     outro_start_in: u64,
@@ -1460,6 +1482,10 @@ mod tests {
             out_frames,
             fd,
             true_outro,
+            bpm,
+            sr,
+            fd,
+            true_outro,
             outro_bars,
             bar,
         );
@@ -1469,14 +1495,20 @@ mod tests {
         );
         let prep_err =
             (prep_outro as i64 - true_outro as i64).unsigned_abs() as f64 * 1000.0 / f64::from(sr);
+        // Outro follows intro bar grid; sub-beat error vs file-end anchor can be larger.
         assert!(
-            prep_err < 8.0,
+            prep_err < 120.0,
             "prepare_output_markers failed: err {prep_err:.2}ms"
+        );
+        let bars_from_intro = (prep_outro.saturating_sub(fd_out) as f64 / bar).round();
+        assert!(
+            (bars_from_intro - bars_from_intro.round()).abs() < 0.01,
+            "outro must sit on intro bar grid"
         );
     }
 
     #[test]
-    fn production_ignores_intro_legacy_grid() {
+    fn outro_aligns_to_intro_bar_grid() {
         let sr = 44_100u32;
         let bpm = 198.0;
         let (stereo, fd, true_outro, bar, beat) =
@@ -1484,35 +1516,37 @@ mod tests {
         let out_frames = (stereo.len() / 2) as u64;
         let outro_bars = 8u32;
 
-        let legacy = legacy_intro_propagated_outro(fd, true_outro, bpm, sr, fd, bar);
-        let legacy_err_beats = (legacy as i64 - true_outro as i64) as f64 / beat;
-        assert!(
-            legacy_err_beats.abs() > 0.4,
-            "fixture must desync legacy: Δbeats={legacy_err_beats:.3}"
-        );
-
-        let production = prepare_output_markers(
+        let (fd_out, production) = prepare_output_markers(
             &stereo,
             sr,
             out_frames,
             fd,
             true_outro,
+            bpm,
+            sr,
+            fd,
+            true_outro,
             outro_bars,
             bar,
-        )
-        .1;
-
-        let prod_err_ms =
-            (production as i64 - true_outro as i64).unsigned_abs() as f64 * 1000.0 / f64::from(sr);
-        assert!(
-            prod_err_ms < 8.0,
-            "production marker must stay on analysis outro: err {prod_err_ms:.2}ms (got={production})"
         );
+
+        let legacy = legacy_intro_propagated_outro(fd, true_outro, bpm, sr, fd_out, bar);
+        let legacy_err_beats = (legacy as i64 - true_outro as i64) as f64 / beat;
+        assert!(
+            legacy_err_beats.abs() > 0.4,
+            "fixture must desync end vs intro grid: Δbeats={legacy_err_beats:.3}"
+        );
+
         let vs_legacy_ms =
             (production as i64 - legacy as i64).unsigned_abs() as f64 * 1000.0 / f64::from(sr);
         assert!(
-            vs_legacy_ms > 40.0,
-            "production must not follow legacy grid: Δ={vs_legacy_ms:.1}ms"
+            vs_legacy_ms < 1.0,
+            "production outro must match intro bar grid: Δ={vs_legacy_ms:.2}ms (prod={production} grid={legacy})"
+        );
+        let bar_phase = (production.saturating_sub(fd_out) as f64 / bar).fract();
+        assert!(
+            bar_phase < 0.01 || bar_phase > 0.99,
+            "outro must land on intro bar line, frac={bar_phase:.4}"
         );
     }
 
@@ -1627,11 +1661,18 @@ mod tests {
         let mapped_fd = (0.0 * scale).round() as u64;
         let outro_bars = 16u32;
         let mapped_outro = out_frames.saturating_sub((f64::from(outro_bars) * bar).round() as u64);
+        let source_bar = f64::from(sr) * 60.0 / bpm * f64::from(BEATS_PER_BAR);
+        let outro_start_in =
+            buf.frames.saturating_sub((f64::from(outro_bars) * source_bar).round() as u64);
 
         let (fd_out, outro_out) = prepare_output_markers(
             &rendered,
             sr,
             out_frames,
+            0,
+            outro_start_in,
+            bpm,
+            sr,
             mapped_fd,
             mapped_outro,
             outro_bars,

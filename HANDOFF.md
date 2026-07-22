@@ -1,6 +1,6 @@
 # funkot-autodj — チャット引き継ぎメモ
 
-最終更新: 2026-07-21（v12 簡略ルールで再生成、遷移診断とレンダー完了）
+最終更新: 2026-07-22（v13: アウトロをイントロ小節格子に統一、聴感確認待ち）
 
 関連会話: [Funkot自動DJ実装](9dbb7172-b71e-4cf1-98d7-b518a8087a0e)
 
@@ -51,11 +51,12 @@
 - `gain==0` のフレームはバスに加算しない
 - `fade_out_end` 到達直後に `drop_prev`
 
-### アウトロマーカー（対応済み）
+### アウトロマーカー（v13 更新）
 
-- 末尾独立のキック位相 refine（`refine_output_downbeat`）
-- 解析 `mapped_outro`/`first_downbeat` の **scale 済み粗位置のみ**を rough（単一信頼源）として採用し、±半拍以内の位相微調整のみ
-- **使わない**: `align_outro_bar_phase` のような ±2拍探索による bar identity 投影、および legacy intro-propagated 格子を coarse に使うパス
+- イントロ側: 解析 `first_downbeat` → scale → ±半拍 refine（従来どおり）
+- **アウトロ側: 解析 `first_downbeat`→`outro_start` の小節数をイントロ格子へ propagate**（`legacy_intro_propagated_outro`）し、末尾 scale だけの独立格子は使わない
+  - 理由: v12 では末尾 scale の outro がイントロ格子から **~0.9〜3.3拍**ずれ、1→2 / 2→3 で小節 identity が崩れた（キック相関 ±1拍）
+- ±半拍 refine はアウトロには適用しない（中盤ドリフトで隣接キックへ吸われるため）
 - 入口: `prepare_output_markers`（`engine.rs`）
 
 ### 遷移時位相ロック（現行方針 = v12）
@@ -132,25 +133,30 @@
 | v9 | `real_mix_v9_phase_lock_f32.wav` | 位相ロック（±2拍含む） | 3→4ほか改善。**2→3が大幅ずれ**（entry→0） |
 | v10 | `real_mix_v10_phase_lock2_f32.wav` | 2段ロック＋端却下。2→3は+1拍 | **2→3: 拍は合うが小節ずれ**。他は正常 |
 | v11 | `real_mix_v11_bar_preserve_f32.wav` | **微調整±0.5拍のみ** | **聴感確認待ち** |
-| **v12** | **`real_mix_v12_simplified_strict_f32.wav`** | アウトロ/小節は解析粗位置→±半拍 refine のみ（bar identity 投影を廃止） | レンダー完了（下記診断メモ参照） |
+| **v12** | **`real_mix_v12_simplified_strict_f32.wav`** | アウトロ/小節は解析粗位置→±半拍 refine のみ（bar identity 投影を廃止） | ダウンビート OK。**1→2 / 2→3 小節ずれ** |
+| **v13** | **`real_mix_v13_intro_grid_f32.wav`** | **アウトロをイントロ小節格子に統一**（末尾 scale 格子を廃止） | レンダー完了（~2194s）。聴感確認待ち |
 
 遷移ディレクトリ: `testdata/real_mix_vN_transitions/`（特に `02_…` が 2→3）
 
 ### 計測メモ（transition_phase_diag）
 
-v12 の `transition_phase_diag`（nominal→aligned の Δms）は次の通りでした（`align_next_entry_to_prev` の ±0.5拍微調整のみ）:
+v12（末尾 scale outro）:
 
-- **1→2**: **+5.80ms**（+256f）
-- **2→3**: **+0.00ms**（+0f）
-- **3→4**: **+23.22ms**（+1024f）
-- **4→5**: **+0.00ms**（+0f）
+- **1→2**: kick xcorr **+1.0拍** → 小節ずれ（ユーザー確認）
+- **2→3**: kick xcorr **-1.0拍** → 小節ずれ（ユーザー確認）
+
+v13 修正後（イントロ格子 outro）:
+
+- **1→2**: kick xcorr **+0.25拍**（+75ms）。大幅改善、要聴感確認
+- **2→3**: aligned entry **-0.02拍**（-5.8ms）
+- **3→4 / 4→5**: 未再計測（レンダー後確認）
 
 ---
 
 ## 6. 次チャットでやること候補
 
-1. **v12（`real_mix_v12_simplified_strict_f32.wav`）を聴感確認**  
-   特に **2→3** と **3→4** の「ダブルハット/小節ずれっぽさ」が残っていないかを優先でお願いします。
+1. **v13（`real_mix_v13_intro_grid_f32.wav` + `real_mix_v13_transitions/`）を聴感確認**  
+   v12 フィードバック: ダウンビート OK、**1→2 / 2→3 小節ずれ**。v13 で 2→3 は診断上ほぼ解消、1→2 は残差 ~0.25拍
 2. 問題がなければ 1→2 / 4→5 も通しで再確認
 3. 残課題（未着手・低優先）:
    - ミックスピーク超過（ヘッドルーム／リミッター）

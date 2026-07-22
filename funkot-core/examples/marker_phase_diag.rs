@@ -71,7 +71,7 @@ fn main() {
     println!(
         "target_bpm={target_bpm:.3} out_sr={out_sr} beat={beat_frames:.1}f ({beat_ms:.2}ms) bar={bar_frames:.1}f ({bar_ms:.2}ms)"
     );
-    println!("v12 rule: analysis cache → scale → ±half-beat refine only");
+    println!("v13 rule: intro downbeat refine + outro on intro-propagated bar grid");
     println!();
 
     for (ti, path) in files.iter().enumerate() {
@@ -140,6 +140,10 @@ fn main() {
             &rendered,
             out_sr,
             out_frames,
+            analysis.first_downbeat,
+            analysis.outro_start,
+            analysis.intro_bpm,
+            buf.sample_rate,
             mapped_fd,
             mapped_outro,
             analysis.outro_bars,
