@@ -1,5 +1,6 @@
 //! funkot-autodj CLI: live playback via cpal, or offline WAV render.
 
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -642,11 +643,19 @@ fn run_live(
 
     let (event_tx, event_rx) = mpsc::channel::<EngineEvent>();
     let mut stereo_scratch = Vec::<f32>::new();
+    // Skip engine.render while paused so playheads / transitions stay put.
+    let paused = Arc::new(AtomicBool::new(false));
+    let paused_cb = Arc::clone(&paused);
 
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [f32], _| {
+                if paused_cb.load(Ordering::SeqCst) {
+                    data.fill(0.0);
+                    return;
+                }
+
                 let frames = data.len() / channels as usize;
                 let need = frames * 2;
                 if stereo_scratch.len() < need {
@@ -684,6 +693,29 @@ fn run_live(
         .context("failed to build audio output stream")?;
 
     stream.play().context("failed to start audio stream")?;
+    eprintln!("press Enter to pause/resume, Ctrl+C to stop");
+
+    // Toggle pause from stdin (no TUI dep). EOF or read error ends the watcher.
+    let paused_stdin = Arc::clone(&paused);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let now_paused = !paused_stdin.fetch_xor(true, Ordering::SeqCst);
+                    if now_paused {
+                        println!("paused");
+                    } else {
+                        println!("resumed");
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 
     let mut finished = false;
     while !stop.load(Ordering::SeqCst) && !finished {

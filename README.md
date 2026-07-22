@@ -75,7 +75,7 @@ funkot-autodj -l playlist.txt \
 ./dev.sh cargo test -p funkot-core --release --test analysis_golden
 ```
 
-終了は Ctrl+C または kill。
+ライブ再生中は Enter で一時停止/再開。終了は Ctrl+C または kill。
 
 対応形式: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV
 
