@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 use funkot_core::cache;
 use funkot_core::decode;
-use funkot_core::engine::{align_next_entry_to_prev, plan_transition, prepare_output_markers};
+use funkot_core::engine::{
+    align_next_entry_scored, align_next_entry_with_phase_hypotheses, plan_transition,
+    prepare_output_markers,
+};
 use funkot_core::stretch::{self, position_scale};
 use funkot_core::{EngineOptions, PitchMode, BEATS_PER_BAR, NOMINAL_BPM};
 
@@ -67,7 +70,7 @@ fn main() {
         let scale = position_scale(buf.frames, out_frames);
         let mapped_fd = (analysis.first_downbeat as f64 * scale).round() as u64;
         let mapped_outro = (analysis.outro_start as f64 * scale).round() as u64;
-        let (fd_out, outro_out) = prepare_output_markers(
+        let (fd_out, outro_out, outro_end) = prepare_output_markers(
             &rendered,
             out_sr,
             out_frames,
@@ -86,26 +89,61 @@ fn main() {
             analysis.outro_bars,
             fd_out,
             outro_out,
+            outro_end,
             rendered,
         )
     };
 
-    let (prev_name, _pi, po, _pfd, poutro, prev_s) = prep(&files[0]);
-    let (next_name, ni, _no, nfd, _noutro, next_s) = prep(&files[1]);
+    let (prev_name, _pi, po, _pfd, poutro, pend, prev_s) = prep(&files[0]);
+    let (next_name, ni, _no, nfd, _noutro, _nend, next_s) = prep(&files[1]);
     let plan = plan_transition(options.fade_bars, ni, po);
     let entry = nfd.saturating_add(((f64::from(plan.skip)) * bar_frames).round() as u64);
-    let entry_aligned =
-        align_next_entry_to_prev(&prev_s, poutro, &next_s, entry, out_sr, beat_frames);
+    let (entry_grid, score_grid) =
+        align_next_entry_scored(&prev_s, poutro, &next_s, entry, out_sr, beat_frames);
+    let delta = poutro as i64 - pend as i64;
+    let entry_end_nom = if delta >= 0 {
+        entry.saturating_add(delta as u64)
+    } else {
+        entry.saturating_sub((-delta) as u64)
+    };
+    let (entry_end, score_end) =
+        align_next_entry_scored(&prev_s, poutro, &next_s, entry_end_nom, out_sr, beat_frames);
+    let entry_aligned = align_next_entry_with_phase_hypotheses(
+        &prev_s, poutro, &next_s, entry, poutro, pend, out_sr, beat_frames,
+    );
 
     println!("target_bpm={target:.3} beat={beat_frames:.1}f bar={bar_frames:.1}f");
     println!("prev={prev_name}");
-    println!("  outro_start_out={poutro} outro_bars={po}");
+    println!(
+        "  outro_grid={poutro} outro_end_anchored={pend} (Δ={}f / {:.2}ms / {:.3} beats) outro_bars={po}",
+        delta,
+        delta as f64 * 1000.0 / f64::from(out_sr),
+        delta as f64 / beat_frames,
+    );
     println!("next={next_name}");
     println!(
-        "  first_downbeat_out={nfd} intro_bars={ni} entry={entry} aligned={entry_aligned} (Δ={}f / {:.2}ms) skip={}",
+        "  first_downbeat_out={nfd} intro_bars={ni} entry={entry} skip={}",
+        plan.skip
+    );
+    println!(
+        "  hyp_grid: aligned={entry_grid} (Δ={}f / {:.2}ms) score={score_grid:.3}",
+        entry_grid as i64 - entry as i64,
+        (entry_grid as i64 - entry as i64) as f64 * 1000.0 / f64::from(out_sr),
+    );
+    println!(
+        "  hyp_end:  aligned={entry_end} (Δ={}f / {:.2}ms vs nominal) score={score_end:.3}",
+        entry_end as i64 - entry as i64,
+        (entry_end as i64 - entry as i64) as f64 * 1000.0 / f64::from(out_sr),
+    );
+    println!(
+        "  chosen:   aligned={entry_aligned} (Δ={}f / {:.2}ms) [{}]",
         entry_aligned as i64 - entry as i64,
         (entry_aligned as i64 - entry as i64) as f64 * 1000.0 / f64::from(out_sr),
-        plan.skip
+        if entry_aligned == entry_end && entry_end != entry_grid {
+            "end-anchored"
+        } else {
+            "intro-grid"
+        }
     );
     println!(
         "plan: f_eff={} m={} fadeout={}..{} (bars)",

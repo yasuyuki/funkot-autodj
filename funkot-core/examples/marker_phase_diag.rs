@@ -136,7 +136,7 @@ fn main() {
             analysis.outro_bars,
             bar_frames,
         );
-        let (prod_fd, prod_outro) = prepare_output_markers(
+        let (prod_fd, prod_outro, prod_end) = prepare_output_markers(
             &rendered,
             out_sr,
             out_frames,
@@ -169,7 +169,7 @@ fn main() {
             bar_frames,
         );
         println!(
-            "  outro:  mapped={mapped_outro}  refined={refined_outro}  production={prod_outro}  legacy(grid)={legacy}"
+            "  outro:  mapped={mapped_outro}  refined={refined_outro}  production(grid)={prod_outro}  end_anchored={prod_end}  legacy(grid)={legacy}"
         );
         print_delta(
             "    mapped→production",

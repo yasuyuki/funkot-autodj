@@ -44,8 +44,12 @@ pub struct PreparedTrack {
     pub frames: u64,
     /// First downbeat in the stretched/output domain.
     pub first_downbeat_out: u64,
-    /// Outro start downbeat in the stretched/output domain.
+    /// Outro start on the intro-propagated bar grid (transition trigger).
     pub outro_start_out: u64,
+    /// End-anchored outro (±half-beat refined). May disagree with
+    /// [`Self::outro_start_out`] by ~1 beat when intro/outro analysis grids drift;
+    /// [`align_next_entry_with_phase_hypotheses`] picks the better sync at mix time.
+    pub outro_end_anchored_out: u64,
     pub intro_bars: u32,
     pub outro_bars: u32,
     /// Linear gain from analysis (`10^(gain_db/20)`), or 1.0 when disabled.
@@ -167,18 +171,39 @@ pub fn align_next_entry_to_prev(
     sample_rate: u32,
     beat_frames: f64,
 ) -> u64 {
+    align_next_entry_scored(
+        prev_interleaved,
+        prev_start,
+        next_interleaved,
+        next_entry,
+        sample_rate,
+        beat_frames,
+    )
+    .0
+}
+
+/// Like [`align_next_entry_to_prev`], also returning the best normalized
+/// kick-energy correlation in the ±half-beat window (0 if alignment is skipped).
+pub fn align_next_entry_scored(
+    prev_interleaved: &[f32],
+    prev_start: u64,
+    next_interleaved: &[f32],
+    next_entry: u64,
+    sample_rate: u32,
+    beat_frames: f64,
+) -> (u64, f64) {
     if sample_rate == 0 || !(beat_frames.is_finite() && beat_frames > 1.0) {
-        return next_entry;
+        return (next_entry, 0.0);
     }
     let prev_frames = prev_interleaved.len() / 2;
     let next_frames = next_interleaved.len() / 2;
     if prev_frames < PHASE_ALIGN_HOP * 4 || next_frames < PHASE_ALIGN_HOP * 4 {
-        return next_entry;
+        return (next_entry, 0.0);
     }
 
     let hops_per_beat = beat_frames / PHASE_ALIGN_HOP as f64;
     if !(hops_per_beat.is_finite() && hops_per_beat > 1.0) {
-        return next_entry;
+        return (next_entry, 0.0);
     }
     // Keep the lag search within ±PHASE_ALIGN_FINE_BEATS (strictly, in quantized hops).
     // Previously we used `ceil(...) + 2`, which could slightly exceed half a beat and
@@ -199,7 +224,7 @@ pub fn align_next_entry_to_prev(
         let min_lag_frames = max_lag_hops * PHASE_ALIGN_HOP;
         let min_win_frames = (2.0 * beat_frames).round() as usize;
         if avail < min_lag_frames + min_win_frames {
-            return next_entry;
+            return (next_entry, 0.0);
         }
         let w_frames = avail - min_lag_frames;
         let w_hops = (w_frames / PHASE_ALIGN_HOP).max(8);
@@ -209,14 +234,14 @@ pub fn align_next_entry_to_prev(
     let prev_mono = mono_slice(prev_interleaved, prev_start as usize, need_frames);
     let next_mono = mono_slice(next_interleaved, next_entry as usize, need_frames);
     if prev_mono.len() < need_frames || next_mono.len() < need_frames {
-        return next_entry;
+        return (next_entry, 0.0);
     }
 
     let prev_env = kick_energy_envelope(&prev_mono, sample_rate, PHASE_ALIGN_HOP);
     let next_env = kick_energy_envelope(&next_mono, sample_rate, PHASE_ALIGN_HOP);
     let need_hops = need_frames / PHASE_ALIGN_HOP;
     if prev_env.len() < need_hops || next_env.len() < need_hops {
-        return next_entry;
+        return (next_entry, 0.0);
     }
 
     let xcorr = |lag: i64| energy_xcorr_at_win(&prev_env, &next_env, lag, win_hops);
@@ -231,7 +256,7 @@ pub fn align_next_entry_to_prev(
         }
     }
     if !(fine_corr.is_finite() && fine_corr >= PHASE_ALIGN_MIN_CORR) {
-        return next_entry;
+        return (next_entry, 0.0);
     }
 
     let lag_frames = lag_hops.saturating_mul(PHASE_ALIGN_HOP as i64);
@@ -243,13 +268,83 @@ pub fn align_next_entry_to_prev(
     let adjusted = adjusted.min(next_frames.saturating_sub(1) as u64);
 
     if lag_frames > 0 && adjusted == 0 && next_entry > 0 {
-        return next_entry;
+        return (next_entry, fine_corr);
     }
     if lag_frames < 0 && adjusted + 1 >= next_frames as u64 && next_entry + 1 < next_frames as u64 {
-        return next_entry;
+        return (next_entry, fine_corr);
     }
 
-    adjusted
+    (adjusted, fine_corr)
+}
+
+/// Align next entry, choosing between intro-grid and end-anchored outro phase.
+///
+/// Transition still triggers on the intro-grid playhead (`prev_start`). When that
+/// grid disagrees with the end-anchored outro by a substantial fraction of a beat,
+/// the matching next entry is near `nominal + (grid - end_anchored)`. Both
+/// hypotheses are micro-aligned (±0.5 beat) and the higher kick-energy score wins.
+/// Does not search ±1/±2 beats of bar identity (v10 failure mode).
+pub fn align_next_entry_with_phase_hypotheses(
+    prev_interleaved: &[f32],
+    prev_start: u64,
+    next_interleaved: &[f32],
+    nominal_entry: u64,
+    outro_intro_grid: u64,
+    outro_end_anchored: u64,
+    sample_rate: u32,
+    beat_frames: f64,
+) -> u64 {
+    let (entry_grid, score_grid) = align_next_entry_scored(
+        prev_interleaved,
+        prev_start,
+        next_interleaved,
+        nominal_entry,
+        sample_rate,
+        beat_frames,
+    );
+
+    let delta = outro_intro_grid as i64 - outro_end_anchored as i64;
+    // Ignore tiny disagreements (same phase within ~1ms).
+    if delta.abs() < 48 {
+        return entry_grid;
+    }
+
+    let next_frames = (next_interleaved.len() / 2) as u64;
+    let nominal_end = if delta >= 0 {
+        nominal_entry.saturating_add(delta as u64)
+    } else {
+        nominal_entry.saturating_sub((-delta) as u64)
+    }
+    .min(next_frames.saturating_sub(1));
+
+    let (entry_end, score_end) = align_next_entry_scored(
+        prev_interleaved,
+        prev_start,
+        next_interleaved,
+        nominal_end,
+        sample_rate,
+        beat_frames,
+    );
+
+    // When the intro-grid trigger sits later than the end-anchored kick (common when
+    // bars_between rounds up), prefer the end hypothesis. Kick-only scores can
+    // slightly favor the wrong (grid) peak on dense Funkot kicks — allow a small
+    // deficit. When the grid sits earlier (Totsumal-style), keep intro-grid unless
+    // end scores clearly better.
+    const SCORE_EPS: f64 = 0.02;
+    const GRID_LATER_SLACK: f64 = 0.05;
+    let grid_later = delta as f64 > 0.35 * beat_frames;
+    if grid_later {
+        if score_end + GRID_LATER_SLACK >= score_grid {
+            entry_end
+        } else {
+            entry_grid
+        }
+    } else if score_end > score_grid + SCORE_EPS {
+        entry_end
+    } else {
+        entry_grid
+    }
 }
 
 fn mono_slice(interleaved: &[f32], start: usize, n: usize) -> Vec<f32> {
@@ -668,12 +763,14 @@ impl Engine {
             .first_downbeat_out
             .saturating_add(bar_to_frames(plan.skip, self.bar_frames));
         let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
-        // Sub-beat micro-align only (±0.5 beat); bar identity stays with markers.
-        let entry = align_next_entry_to_prev(
+        // ±0.5 beat micro-align, choosing intro-grid vs end-anchored outro phase.
+        let entry = align_next_entry_with_phase_hypotheses(
             &active.track.samples,
             active.playhead,
             &next.samples,
             nominal,
+            active.track.outro_start_out,
+            active.track.outro_end_anchored_out,
             self.options.output_sample_rate,
             beat_frames,
         );
@@ -992,7 +1089,7 @@ fn prepare_one(
 
     let mapped_fd = (analysis.first_downbeat as f64 * scale).round() as u64;
     let mapped_outro = (analysis.outro_start as f64 * scale).round() as u64;
-    let (first_downbeat_out, outro_start_out) = prepare_output_markers(
+    let (first_downbeat_out, outro_start_out, outro_end_anchored_out) = prepare_output_markers(
         &rendered,
         options.output_sample_rate,
         out_frames,
@@ -1024,6 +1121,7 @@ fn prepare_one(
         frames: out_frames,
         first_downbeat_out: first_downbeat_out.min(out_frames.saturating_sub(1)),
         outro_start_out,
+        outro_end_anchored_out,
         intro_bars: analysis.intro_bars,
         outro_bars: analysis.outro_bars,
         gain_linear,
@@ -1059,13 +1157,15 @@ pub fn refine_output_downbeat(
     )
 }
 
-/// Map analysis markers to the stretched output domain and micro-refine only.
+/// Map analysis markers to the stretched output domain.
 ///
-/// Intro downbeat: scaled analysis `first_downbeat`, ±half-beat refine.
-/// Outro start: bar count propagated from intro (`legacy_intro_propagated_outro`)
-/// so outro sits on the **same bar grid** as the intro downbeat, then ±half-beat
-/// refine. End-anchored `mapped_outro` alone can drift ~1 beat from the intro
-/// grid (intro/outro BPM mismatch over long tracks) and misalign transitions.
+/// Returns `(first_downbeat_out, outro_intro_grid, outro_end_anchored)`:
+/// - Intro downbeat: scaled analysis `first_downbeat`, ±half-beat refine.
+/// - Intro-grid outro: bar count from intro (`legacy_intro_propagated_outro`) —
+///   used as the transition trigger so scheduling stays on one bar grid.
+/// - End-anchored outro: scaled `mapped_outro` ±half-beat refine — local kick
+///   phase at the file end. May differ from the intro grid by ~0.5–1 beat;
+///   [`align_next_entry_with_phase_hypotheses`] selects the better sync.
 pub fn prepare_output_markers(
     interleaved_stereo: &[f32],
     sample_rate: u32,
@@ -1078,7 +1178,7 @@ pub fn prepare_output_markers(
     mapped_outro: u64,
     outro_bars: u32,
     bar_frames: f64,
-) -> (u64, u64) {
+) -> (u64, u64, u64) {
     let beat_frames = bar_frames / f64::from(BEATS_PER_BAR);
     let first_downbeat_out = refine_output_downbeat(
         interleaved_stereo,
@@ -1088,29 +1188,31 @@ pub fn prepare_output_markers(
     )
     .min(out_frames.saturating_sub(1));
 
-    let intro_grid_outro = legacy_intro_propagated_outro(
-        first_downbeat_in,
-        outro_start_in,
-        intro_bpm,
-        sample_rate_in,
-        first_downbeat_out,
+    let end_anchored = derive_outro_start_out(
+        interleaved_stereo,
+        sample_rate,
+        out_frames,
+        mapped_outro,
+        outro_bars,
         bar_frames,
-    );
-    let outro_start_out = if outro_start_in > 0 {
-        intro_grid_outro
-    } else {
-        derive_outro_start_out(
-            interleaved_stereo,
-            sample_rate,
-            out_frames,
-            mapped_outro,
-            outro_bars,
-            bar_frames,
-        )
-    }
+    )
     .min(out_frames.saturating_sub(1));
 
-    (first_downbeat_out, outro_start_out)
+    let outro_intro_grid = if outro_start_in > 0 {
+        legacy_intro_propagated_outro(
+            first_downbeat_in,
+            outro_start_in,
+            intro_bpm,
+            sample_rate_in,
+            first_downbeat_out,
+            bar_frames,
+        )
+        .min(out_frames.saturating_sub(1))
+    } else {
+        end_anchored
+    };
+
+    (first_downbeat_out, outro_intro_grid, end_anchored)
 }
 
 /// Outro start from scaled analysis cache, with ±half-beat periodic refine.
@@ -1476,7 +1578,7 @@ mod tests {
             "refine must lock exact kick: err {kick_err_ms:.2}ms (got={outro_out} true={true_outro})"
         );
 
-        let (fd_out, prep_outro) = prepare_output_markers(
+        let (fd_out, prep_outro, _end_anchored) = prepare_output_markers(
             &stereo,
             sr,
             out_frames,
@@ -1516,7 +1618,7 @@ mod tests {
         let out_frames = (stereo.len() / 2) as u64;
         let outro_bars = 8u32;
 
-        let (fd_out, production) = prepare_output_markers(
+        let (fd_out, production, end_anchored) = prepare_output_markers(
             &stereo,
             sr,
             out_frames,
@@ -1547,6 +1649,12 @@ mod tests {
         assert!(
             bar_phase < 0.01 || bar_phase > 0.99,
             "outro must land on intro bar line, frac={bar_phase:.4}"
+        );
+        let end_err_ms =
+            (end_anchored as i64 - true_outro as i64).unsigned_abs() as f64 * 1000.0 / f64::from(sr);
+        assert!(
+            end_err_ms < 8.0,
+            "end-anchored outro must stay on analysis kick: err {end_err_ms:.2}ms"
         );
     }
 
@@ -1613,6 +1721,24 @@ mod tests {
         let aligned0 =
             align_next_entry_to_prev(&prev, near_start, &next_late, near_start, sr, beat);
         assert!(aligned0 > 0, "must not clamp entry to 0 (got {aligned0})");
+
+        // Intro-grid vs end-anchored disagreement: still stay within half a beat.
+        let phase_delta = (0.08 * f64::from(sr)).round() as u64;
+        let chosen = align_next_entry_with_phase_hypotheses(
+            &prev,
+            prev_start,
+            &next_late,
+            entry,
+            prev_start + phase_delta,
+            prev_start,
+            sr,
+            beat,
+        );
+        let chosen_beats = (chosen as i64 - entry as i64) as f64 / beat;
+        assert!(
+            chosen_beats.abs() < 0.5,
+            "phase hypothesis pick must stay sub-beat, got {chosen_beats:.3} beats"
+        );
     }
 
     #[test]
@@ -1665,7 +1791,7 @@ mod tests {
         let outro_start_in =
             buf.frames.saturating_sub((f64::from(outro_bars) * source_bar).round() as u64);
 
-        let (fd_out, outro_out) = prepare_output_markers(
+        let (fd_out, outro_out, end_anchored) = prepare_output_markers(
             &rendered,
             sr,
             out_frames,
@@ -1688,6 +1814,12 @@ mod tests {
         assert!(
             err_ms < 15.0,
             "fixed-tempo outro off: got={outro_out} expect≈{expect_outro} err={err_ms:.1}ms"
+        );
+        let end_err_ms = (end_anchored as i64 - expect_outro as i64).unsigned_abs() as f64 * 1000.0
+            / f64::from(sr);
+        assert!(
+            end_err_ms < 15.0,
+            "end-anchored should match on fixed tempo: err={end_err_ms:.1}ms"
         );
 
         // Outro should also be near an integer number of bars after fd at target tempo
