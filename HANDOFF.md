@@ -1,6 +1,6 @@
 # funkot-autodj — チャット引き継ぎメモ
 
-最終更新: 2026-07-22（v16: 端の kick+hat groove / prev nudge で 1→2 ダウンビートロック）
+最終更新: 2026-07-22（v17: mod-4 kick+hat groove で 1→2 小節 identity 修正 + CI fixtures）
 
 関連会話: [Funkot自動DJ実装](9dbb7172-b71e-4cf1-98d7-b518a8087a0e)
 
@@ -60,19 +60,19 @@
 - 入口: `prepare_output_markers` → `(fd, intro_grid, end_anchored)`
 - 解析キャッシュ形状は不変（`real-cache-v4` / `CACHE_VERSION=4` のまま）。出力ドメインの refine のみ変更
 
-### 遷移時位相ロック（v16）
+### 遷移時位相ロック（v17）
 
 - `align_next_entry_with_phase_hypotheses`（`engine.rs`）
-- 各仮説を **±0.5拍のみ**で micro-align（`align_next_entry_scored`）
+- **Stage 1（位相）**: intro格子 / end-anchored の各仮説を **±0.5拍のみ** micro-align（`align_next_entry_scored`）
+- **Stage 2（小節 identity）**: 各仮説の nominal から **整拍オフセット `{0,1,2,3}`** を試し、同じ kick+hat groove スコアで再 micro-align。`SCORE_EPS=0.02` で明確勝ちのみ採用（曖昧な 4-on-floor は grid+0 を維持）
 - スコアは **kick + 0.4×hat**。kick/hat が ¼拍以上食い違うときは **kick（ダウンビート）優先**
-- next がファイル先頭でこれ以上早められないとき、同じ位相補正を **`prev_nudge`（≤½拍の prev スキップ）** で適用（1→2: ~0.25拍）
-- **end-anchored は kick/groove score が intro格子より明確に高いときだけ採用**（`SCORE_EPS=0.02`）
-- **±1/±2拍の coarse 探索は禁止**（v10: 拍は合うが小節ずれ）
+- next がファイル先頭で早められないとき、同じ位相補正を **`prev_nudge`（≤½拍の prev スキップ）** で適用
+- **±1/±2拍の coarse kick-only xcorr は禁止**（v10: 拍は合うが小節ずれ）。整拍探索は groove スコア比較のみ
 
 ### 診断用 example
 
 - `funkot-core/examples/marker_phase_diag.rs` — マーカー比較
-- `funkot-core/examples/transition_phase_diag.rs` — 2曲の遷移位相（両仮説の score / prev_nudge も表示）
+- `funkot-core/examples/transition_phase_diag.rs` — 2曲の遷移位相（両仮説の score / prev_nudge / bar_off も表示）
 
 ```sh
 ./dev.sh cargo run -p funkot-core --example transition_phase_diag --release -- \
@@ -94,19 +94,20 @@
 | 4 | `Nicho - Gakumas no Remix - 03 Sekaiichi Kawaii Watashi.flac` |
 | 5 | `Nicho - Gakumas no Remix 2 - 04 Boom Boom Pow.flac` |
 
-- キャッシュ: `testdata/real-cache-v4`（全曲 intro/outro **64/64** 寄り）。v16 でも再生成不要
-- 再レンダー例:
+- キャッシュ: `testdata/real-cache-v4`（全曲 intro/outro **64/64** 寄り）。v17 でも再生成不要
+- 再レンダー例（CI最速）:
 
 ```sh
 ./dev.sh cargo run -p funkot-cli --release -- \
   -l testdata/real_playlist.txt \
   --cache-dir testdata/real-cache-v4 \
-  --no-loop \
   --render testdata/real_mix_vXX.wav \
-  --wav-format f32
+  --wav-format f32 \
+  --ci-fast
 ```
 
-- `--render` 既定は約10倍速ペース（ローダー追いつき用）。`--render-speed 0` は無制限だがアウトロ延長フォールバックのリスクあり
+- `--ci-fast` = `--no-loop` + `--render-speed 0` + `--jobs 0`（全CPUで並列 prepare）。**音・解析結果は変えない**（壁時計のみ短縮）
+- `--jobs N`（1=従来の逐次ローダー、0=全CPU）。`prepare_tracks_parallel` → `Engine::from_prepared`
 - `--transition-clip-seconds`（既定90）で遷移WAVを同時出力
 - ピークが +3 dBFS 程度になることあり（リミッター未実装）
 
@@ -139,58 +140,65 @@
 | v13 | `real_mix_v13_intro_grid_f32.wav` | アウトロをイントロ小節格子に統一 | **1→2 / 3→4 ダウンビートずれ**。2→3 / 4→5 は正しい |
 | v14 | `real_mix_v14_phase_hyp_f32.wav` | 遷移時に intro格子 vs end-anchored を選択 | **1→2 小節ずれ**（他は正しい）。ダウンビート検出自体は正しい |
 | v15 | `real_mix_v15_grid_prefer_f32.wav` | end は kick score 明確勝ちのみ（slack 廃止） | **1→2 ダウンビートずれ**。2→3 / 3→4 / 4→5 は正しい |
-| **v16** | **`real_mix_v16_edge_groove_f32.wav`** | 端 groove refine + kick優先 + prev_nudge | **聴感確認待ち** |
+| v16 | `real_mix_v16_edge_groove_f32.wav` | 端 groove refine + kick優先 + prev_nudge | **1→2 小節ずれ継続**（ダウンビートは全体正しい）。他遷移の小節は正しい |
+| **v17** | **`real_mix_v17_bar_groove_f32.wav`** | **mod-4 groove bar identity**（kick+hat、明確勝ちのみ） | **聴感確認待ち** |
 
 遷移ディレクトリ: `testdata/real_mix_vN_transitions/`（`01_…` = 1→2）
 
 ### 計測メモ（transition_phase_diag）
 
-v15（slack 廃止、end は明確勝ちのみ）:
-
-- **1→2**: chosen **intro-grid**。kick **+0.25拍**（v14 の +1拍ずれを回避）。mid は -0.73拍のまま（帯域不一致）
-- **3→4**: chosen **end-anchored** 維持（score 0.916 ≫ 0.549）。kick **0.00拍**
-- **2→3 / 4→5**: intro-grid 維持
-
 v16（edge groove + kick優先 + prev_nudge）:
 
-- **1→2**: chosen **intro-grid** + **prev_nudge≈3328f (~0.25拍)**。kick **+0.019拍**（ロック）。hat は配置差で ~−0.48拍のまま（KazuyaP=offbeat hat / Totsumal=onbeat hat）
-- **2→3**: intro-grid。kick/hat **~0**
-- **3→4**: end-anchored 維持。kick/hat/mid **0.00**
-- **4→5**: intro-grid。kick/hat **0.00**
+- **1→2**: chosen **intro-grid** + **prev_nudge≈3328f (~0.25拍)**。kick **+0.019拍**（ロック）。hat ~−0.48 / mid ~−0.977（小節ずれの兆候）
+- **2→3 / 3→4 / 4→5**: 良好
+
+v17（mod-4 bar groove）:
+
+- **1→2**: chosen **grid+≈2拍**（aligned≈31216）。kick/hat/mid **~0.00拍**（小節ロック）
+- **2→3**: intro-grid bar_off≈0。kick/hat/mid **~0**
+- **3→4**: end-anchored 相当。kick/hat/mid **0.00**
+- **4→5**: intro-grid。kick/hat/mid **0.00**
 
 根因メモ（1→2）:
 
-1. KazuyaP の intro格子と end-anchored が ~0.72拍ずれる（ソース領域の小節数えと末尾位相の差）
-2. 遷移区間で **kick は +¼拍、hat は −¼拍**と食い違う（アレンジ差）。合成スコアだと 0 に張り付く
-3. Totsumal の `first_downbeat` がファイル先頭付近のため、kick が要求する「entry を早める」補正がクランプされ、v15 では残差 +0.25拍のまま
-4. v16: kick 優先で位相を決め、クランプ時は同等の相対位相を **prev を ¼拍スキップ**して実現
+1. ダウンビート（kick位相）は合っていても、KazuyaP アウトロと Totsumal イントロの **どの拍が小節頭か（mod-4）** が食い違っていた
+2. kick は毎拍にあるため ±0.5拍 micro だけでは小節を解決できない。hat+kick groove の整拍候補比較が必要
+3. v10 の kick-only coarse は 2→3 を壊す → 整拍は groove スコア＋明確マージンのみ（曖昧時は markers の grid+0）
 
 ---
 
 ## 6. 次チャットでやること候補
 
-1. **v16（`real_mix_v16_edge_groove_f32.wav` + `real_mix_v16_transitions/`）を聴感確認**  
+1. **v17（`real_mix_v17_bar_groove_f32.wav` + `real_mix_v17_transitions/`）を聴感確認**  
    特に **1→2**（`01_KazuyaP_to_Totsumal`）。2→3 / 3→4 / 4→5 が崩れていないかも確認
 2. 残課題（未着手・低優先）:
-   - 1→2 の hat 配置差（onbeat vs offbeat）自体はアレンジ差 — ダウンビート（kick）優先で許容
    - 解析側で intro/outro 格子不一致そのものを減らす（キャッシュ v5 候補）
    - ミックスピーク超過（ヘッドルーム／リミッター）
    - ハイパス重なり中は設計上ハットが両デッキから聞こえる（300Hz HPF）
-   - CI
    - コンテナ内 rustfmt/clippy が DNS 失敗することがある
 
 ---
 
-## 7. テスト・ビルド
+## 7. テスト・ビルド・CI
 
 ```sh
 ./dev.sh cargo test -p funkot-core --release
+./dev.sh cargo test -p funkot-core --release --test analysis_golden
 # 位相ロック単体:
 ./dev.sh cargo test -p funkot-core --release --lib engine::tests::align_next_entry_micro_only
-./dev.sh cargo test -p funkot-core --release --lib engine::tests::phase_hypotheses_prefer_grid_unless_end_clearly_wins
+./dev.sh cargo test -p funkot-core --release --lib engine::tests::bar_identity_groove_corrects_two_beat_marker_error
+
+# 最小フィクスチャ生成（フルミックスではない。WAVは gitignore、golden.json のみコミット）
+./dev.sh cargo run -p funkot-cli --release -- \
+  --gen-test-fixtures funkot-core/tests/fixtures
+
+# CI最速レンダー（結果不変・並列 prepare）
+./dev.sh cargo run -p funkot-cli --release -- \
+  -l testdata/real_playlist.txt --cache-dir testdata/real-cache-v4 \
+  --render out.wav --wav-format f32 --ci-fast
 ```
 
-主要テスト: `engine::tests::*`, `fade_curve`, `engine` integration, `ffi`, CLI e2e。
+主要テスト: `engine::tests::*`, `analysis_golden`, `fade_curve`, `engine` integration, `ffi`, CLI e2e。
 
 ---
 
@@ -201,4 +209,4 @@ v16（edge groove + kick優先 + prev_nudge）:
 - **変更後は毎回コミット**（本チャットで方針変更済み）
 - `testdata/` の実音源・巨大 WAV は成果物確認用；リポジトリには載せない想定
 - 「ミッドハイパス」= ハイパス（低域カット）。ローパスに戻さない
-- 小節identityをキック相関の ±N拍で取らない（v10 の失敗を繰り返さない）
+- 小節identityをキック相関の ±N拍で取らない（v10 の失敗を繰り返さない）。groove スコアの整拍候補比較は v17 で許可
