@@ -249,14 +249,84 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn print_event(event: &EngineEvent, playlist_len: usize) {
+fn fmt_hms(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+/// Local wall-clock HH:MM:SS (no chrono).
+fn local_hms() -> String {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm = std::mem::zeroed();
+        #[cfg(unix)]
+        {
+            if libc::localtime_r(&t, &mut tm).is_null() {
+                return "--:--:--".into();
+            }
+        }
+        #[cfg(windows)]
+        {
+            if libc::localtime_s(&mut tm, &t) != 0 {
+                return "--:--:--".into();
+            }
+        }
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
+
+/// Wall time spent actually playing (excludes pre-first-track prep and pauses).
+#[derive(Default)]
+struct PlayElapsed {
+    start: Option<Instant>,
+    pause_at: Option<Instant>,
+    paused: Duration,
+}
+
+impl PlayElapsed {
+    fn on_track_started(&mut self) {
+        if self.start.is_none() {
+            self.start = Some(Instant::now());
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        // Ignore pause toggles before the first track — prep time is already excluded.
+        if self.start.is_none() {
+            return;
+        }
+        if paused {
+            if self.pause_at.is_none() {
+                self.pause_at = Some(Instant::now());
+            }
+        } else if let Some(at) = self.pause_at.take() {
+            self.paused += at.elapsed();
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        let Some(start) = self.start else {
+            return Duration::ZERO;
+        };
+        let mut e = start.elapsed().saturating_sub(self.paused);
+        if let Some(at) = self.pause_at {
+            e = e.saturating_sub(at.elapsed());
+        }
+        e
+    }
+}
+
+fn print_event(event: &EngineEvent, playlist_len: usize, play_elapsed: &mut PlayElapsed) {
     match event {
         EngineEvent::TrackStarted { index, path } => {
+            play_elapsed.on_track_started();
             println!(
-                "> now playing [{}/{}] {}",
+                "> now playing [{}/{}] {}  {} (+{})",
                 index + 1,
                 playlist_len,
-                file_name(path)
+                file_name(path),
+                local_hms(),
+                fmt_hms(play_elapsed.elapsed()),
             );
         }
         EngineEvent::TransitionStarted { from, to } => {
@@ -269,6 +339,46 @@ fn print_event(event: &EngineEvent, playlist_len: usize) {
         EngineEvent::Finished => {
             println!("finished");
         }
+    }
+}
+
+#[cfg(test)]
+mod play_elapsed_tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn excludes_prep_and_pause() {
+        let mut clock = PlayElapsed::default();
+        assert_eq!(clock.elapsed(), Duration::ZERO);
+
+        thread::sleep(Duration::from_millis(30));
+        clock.on_track_started();
+        let after_start = clock.elapsed();
+
+        thread::sleep(Duration::from_millis(40));
+        clock.set_paused(true);
+        let at_pause = clock.elapsed();
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            clock.elapsed().as_millis().abs_diff(at_pause.as_millis()) < 15,
+            "elapsed must freeze while paused"
+        );
+
+        clock.set_paused(false);
+        thread::sleep(Duration::from_millis(40));
+        let after_resume = clock.elapsed();
+
+        assert!(after_start.as_millis() < 20, "start should be near zero");
+        assert!(at_pause.as_millis() >= 30, "should count play before pause");
+        assert!(
+            after_resume.as_millis() >= at_pause.as_millis() + 25,
+            "should resume counting after unpause"
+        );
+        assert!(
+            after_resume.as_millis() < at_pause.as_millis() + 80,
+            "must not include paused interval"
+        );
     }
 }
 
@@ -451,6 +561,7 @@ fn run_render(
     let mut consecutive_silent_frames: u64 = 0;
     let mut last_progress_secs = 0u64;
     let wall_start = Instant::now();
+    let mut play_elapsed = PlayElapsed::default();
     // Skip writing long post-track silence while the loader prepares the next
     // track (render() returns zeros and never blocks). Keep short gaps that
     // occur between kicks in the material itself.
@@ -477,7 +588,7 @@ fn run_render(
             if let EngineEvent::TransitionStarted { from, to } = &event {
                 transitions_started.push((from.clone(), to.clone()));
             }
-            print_event(&event, playlist_len);
+            print_event(&event, playlist_len, &mut play_elapsed);
         }
 
         if n == 0 {
@@ -693,10 +804,12 @@ fn run_live(
         .context("failed to build audio output stream")?;
 
     stream.play().context("failed to start audio stream")?;
+    let play_elapsed = Arc::new(Mutex::new(PlayElapsed::default()));
     eprintln!("press Enter to pause/resume, Ctrl+C to stop");
 
     // Toggle pause from stdin (no TUI dep). EOF or read error ends the watcher.
     let paused_stdin = Arc::clone(&paused);
+    let play_elapsed_stdin = Arc::clone(&play_elapsed);
     thread::spawn(move || {
         let stdin = io::stdin();
         let mut line = String::new();
@@ -706,6 +819,9 @@ fn run_live(
                 Ok(0) => break,
                 Ok(_) => {
                     let now_paused = !paused_stdin.fetch_xor(true, Ordering::SeqCst);
+                    if let Ok(mut clock) = play_elapsed_stdin.lock() {
+                        clock.set_paused(now_paused);
+                    }
                     if now_paused {
                         println!("paused");
                     } else {
@@ -724,7 +840,8 @@ fn run_live(
                 if matches!(event, EngineEvent::Finished) {
                     finished = true;
                 }
-                print_event(&event, playlist_len);
+                let mut clock = play_elapsed.lock().unwrap_or_else(|e| e.into_inner());
+                print_event(&event, playlist_len, &mut clock);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
