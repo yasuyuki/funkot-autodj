@@ -248,6 +248,147 @@ pub fn refine_kick_marker(
     (lo as u64).saturating_add(local).min(frames as u64 - 1)
 }
 
+/// Bars of sparse intro-head / outro-tail audio used by [`refine_groove_phase`].
+const GROOVE_REFINE_BARS: u32 = 4;
+/// Relative weight of hi-hat band vs kick when scoring Funkot bar phase.
+const GROOVE_HAT_WEIGHT: f64 = 0.40;
+
+/// Refine a downbeat by scoring kick + hi-hat placement over the first few bars.
+///
+/// Funkot keeps a fixed kick/hat grid inside each bar; at intro start and outro
+/// end other instruments thin out, so those edges are the most reliable phase
+/// anchors. Search stays inside ±half a beat (never ±1/±2 beat bar identity).
+pub fn refine_groove_phase(
+    interleaved_stereo: &[f32],
+    sample_rate: u32,
+    approx_frame: u64,
+    beat_frames: f64,
+    search_radius_ms: f64,
+) -> u64 {
+    let frames = interleaved_stereo.len() / 2;
+    if frames == 0 || sample_rate == 0 || !(beat_frames.is_finite() && beat_frames > 1.0) {
+        return approx_frame.min(frames.saturating_sub(1) as u64);
+    }
+    let approx = approx_frame.min(frames as u64 - 1);
+    let half_beat_ms = beat_frames * 1000.0 / f64::from(sample_rate) * 0.45;
+    let radius_ms = search_radius_ms.max(1.0).min(half_beat_ms);
+    let radius = ((radius_ms / 1000.0) * f64::from(sample_rate))
+        .round()
+        .max(1.0) as i64;
+
+    let n_beats = GROOVE_REFINE_BARS.saturating_mul(BEATS_PER_BAR).clamp(4, 32);
+    let span = (f64::from(n_beats) * beat_frames).ceil() as i64 + radius + 8;
+    let center = approx as i64;
+    let lo = (center - radius).max(0) as usize;
+    let hi = ((center + span) as usize).min(frames.saturating_sub(1));
+    if lo >= hi {
+        return approx;
+    }
+
+    let mut mono = Vec::with_capacity(hi - lo + 1);
+    for i in lo..=hi {
+        let l = interleaved_stereo[i * 2];
+        let r = interleaved_stereo[i * 2 + 1];
+        mono.push(0.5 * (l + r));
+    }
+    let kick = biquad_lowpass(&mono, f64::from(sample_rate), LOWPASS_HZ);
+    let hat = highpass_1pole(&mono, f64::from(sample_rate), HIGHPASS_HZ);
+    let hop = KICK_REFINE_HOP.min(kick.len().max(1));
+
+    let band_peak = |band: &[f32], pos_f: f64| -> f64 {
+        if pos_f < 0.0 {
+            return 0.0;
+        }
+        let pos = pos_f.round() as isize;
+        let w = (hop as isize / 2).max(1);
+        let a = (pos - w).max(0) as usize;
+        let b = ((pos + w) as usize).min(band.len().saturating_sub(1));
+        let mut best = 0.0f64;
+        for s in &band[a..=b] {
+            let e = f64::from(*s).abs();
+            if e.is_finite() && e > best {
+                best = e;
+            }
+        }
+        best
+    };
+
+    let approx_local = (approx as i64 - lo as i64) as f64;
+    let sigma = (radius as f64 / 2.5).max(1.0);
+    let mut best_delta = 0i64;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut center_score = f64::NEG_INFINITY;
+    let step = (hop as i64 / 2).max(1);
+    let mut delta = -radius;
+    while delta <= radius {
+        let mut kick_sum = 0.0f64;
+        let mut hat_sum = 0.0f64;
+        for k in 0..n_beats {
+            let pos = approx_local + delta as f64 + f64::from(k) * beat_frames;
+            // Downbeat (every bar) weighs more; other on-beats still count.
+            let w = if k % BEATS_PER_BAR == 0 {
+                2.0
+            } else {
+                1.0
+            };
+            kick_sum += w * band_peak(&kick, pos);
+            hat_sum += w * band_peak(&hat, pos);
+            // Off-beat hats are common in Funkot; add a lighter bonus.
+            let off = pos + 0.5 * beat_frames;
+            hat_sum += 0.55 * w * band_peak(&hat, off);
+        }
+        let prior = (-0.5 * (delta as f64 / sigma).powi(2)).exp();
+        let score = (kick_sum + GROOVE_HAT_WEIGHT * hat_sum) * prior;
+        if delta == 0 {
+            center_score = score;
+        }
+        if score > best_score {
+            best_score = score;
+            best_delta = delta;
+        }
+        delta += step;
+    }
+    if !best_score.is_finite() || best_score <= 0.0 {
+        return refine_periodic_phase(
+            interleaved_stereo,
+            sample_rate,
+            approx,
+            beat_frames,
+            n_beats,
+            radius_ms,
+        );
+    }
+    if best_delta.abs() > radius / 3
+        && center_score.is_finite()
+        && center_score > 0.0
+        && best_score < center_score * 1.10
+    {
+        best_delta = 0;
+    }
+
+    let coarse = (approx as i64 + best_delta).max(0) as u64;
+    // Snap to the nearest kick transient for sample accuracy.
+    let refine_lo = (coarse as i64 - hop as i64).max(lo as i64) as usize;
+    let refine_hi = ((coarse as i64 + hop as i64) as usize).min(hi);
+    let mut best_frame = coarse.min(frames as u64 - 1);
+    let mut best_e = f64::NEG_INFINITY;
+    for frame in refine_lo..=refine_hi {
+        let j = frame - lo;
+        if j >= kick.len() {
+            break;
+        }
+        let e = f64::from(kick[j]).abs();
+        if e.is_finite() && e > best_e {
+            best_e = e;
+            best_frame = frame as u64;
+        }
+    }
+    if !best_e.is_finite() || best_e < SILENCE_EPS {
+        return coarse.min(frames as u64 - 1);
+    }
+    best_frame.min(frames as u64 - 1)
+}
+
 /// Refine a downbeat by scoring low-band onset energy across several following beats.
 ///
 /// Unlike [`refine_kick_marker`] (single local peak), this chooses the phase offset

@@ -98,7 +98,7 @@ fn main() {
     let (next_name, ni, _no, nfd, _noutro, _nend, next_s) = prep(&files[1]);
     let plan = plan_transition(options.fade_bars, ni, po);
     let entry = nfd.saturating_add(((f64::from(plan.skip)) * bar_frames).round() as u64);
-    let (entry_grid, score_grid) =
+    let (entry_grid, score_grid, nudge_grid) =
         align_next_entry_scored(&prev_s, poutro, &next_s, entry, out_sr, beat_frames);
     let delta = poutro as i64 - pend as i64;
     let entry_end_nom = if delta >= 0 {
@@ -106,9 +106,9 @@ fn main() {
     } else {
         entry.saturating_sub((-delta) as u64)
     };
-    let (entry_end, score_end) =
+    let (entry_end, score_end, nudge_end) =
         align_next_entry_scored(&prev_s, poutro, &next_s, entry_end_nom, out_sr, beat_frames);
-    let entry_aligned = align_next_entry_with_phase_hypotheses(
+    let (entry_aligned, nudge_chosen) = align_next_entry_with_phase_hypotheses(
         &prev_s, poutro, &next_s, entry, poutro, pend, out_sr, beat_frames,
     );
 
@@ -126,17 +126,17 @@ fn main() {
         plan.skip
     );
     println!(
-        "  hyp_grid: aligned={entry_grid} (Δ={}f / {:.2}ms) score={score_grid:.3}",
+        "  hyp_grid: aligned={entry_grid} (Δ={}f / {:.2}ms) score={score_grid:.3} prev_nudge={nudge_grid}",
         entry_grid as i64 - entry as i64,
         (entry_grid as i64 - entry as i64) as f64 * 1000.0 / f64::from(out_sr),
     );
     println!(
-        "  hyp_end:  aligned={entry_end} (Δ={}f / {:.2}ms vs nominal) score={score_end:.3}",
+        "  hyp_end:  aligned={entry_end} (Δ={}f / {:.2}ms vs nominal) score={score_end:.3} prev_nudge={nudge_end}",
         entry_end as i64 - entry as i64,
         (entry_end as i64 - entry as i64) as f64 * 1000.0 / f64::from(out_sr),
     );
     println!(
-        "  chosen:   aligned={entry_aligned} (Δ={}f / {:.2}ms) [{}]",
+        "  chosen:   aligned={entry_aligned} (Δ={}f / {:.2}ms) prev_nudge={nudge_chosen} [{}]",
         entry_aligned as i64 - entry as i64,
         (entry_aligned as i64 - entry as i64) as f64 * 1000.0 / f64::from(out_sr),
         if entry_aligned == entry_end && entry_end != entry_grid {
@@ -152,12 +152,13 @@ fn main() {
 
     let bars = 16u32;
     let n = ((f64::from(bars)) * bar_frames).round() as usize;
+    let prev_mix = poutro.saturating_add(nudge_chosen);
     println!("--- nominal entry ---");
     measure_pair(&prev_s, poutro, &next_s, entry, out_sr, n, target, beat_frames);
-    println!("--- aligned entry ---");
+    println!("--- aligned entry (prev+nudge) ---");
     measure_pair(
         &prev_s,
-        poutro,
+        prev_mix,
         &next_s,
         entry_aligned,
         out_sr,
