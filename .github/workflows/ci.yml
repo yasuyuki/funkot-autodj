@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system deps
         run: |
@@ -46,7 +46,7 @@ jobs:
           - os: macos-latest
             artifact: macos-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
@@ -111,7 +111,7 @@ jobs:
              include/funkot.h \
              dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: dist/
