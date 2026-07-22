@@ -9,6 +9,9 @@
 # Optional listen/debug WAVs under fixtures/ (golden.json + README are committed)
 funkot-core/tests/fixtures/*.wav
 
+# Local agent handoff (not for public)
+/HANDOFF.md
+
 # OS / editor noise
 .DS_Store
 Thumbs.db
