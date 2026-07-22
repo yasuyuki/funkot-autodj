@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,10 @@ struct Args {
     #[arg(long, value_name = "OUT.wav")]
     render: Option<PathBuf>,
 
+    /// While playing live, also write the stereo mix bus to WAV (debug)
+    #[arg(long, value_name = "OUT.wav")]
+    dump_wav: Option<PathBuf>,
+
     /// Per-transition clip length (seconds) emitted during `--render`.
     /// Generated clips start at each transition start frame and are
     /// capped by the available render duration.
@@ -75,7 +79,7 @@ struct Args {
     #[arg(long, default_value_t = 90.0)]
     transition_clip_seconds: f64,
 
-    /// Offline WAV sample format (default: 32-bit float, no clamp)
+    /// WAV sample format for `--render` / `--dump-wav` (default: 32-bit float)
     #[arg(long, value_enum, default_value_t = WavFormat::F32)]
     wav_format: WavFormat,
 
@@ -140,6 +144,10 @@ fn run() -> Result<()> {
     })
     .context("failed to install Ctrl+C handler")?;
 
+    if args.render.is_some() && args.dump_wav.is_some() {
+        bail!("cannot combine --render and --dump-wav (use one)");
+    }
+
     if let Some(out) = &args.render {
         let mut options = options;
         if !args.no_loop {
@@ -157,7 +165,14 @@ fn run() -> Result<()> {
             &stop,
         )?;
     } else {
-        run_live(options, playlist, args.sample_rate, &stop)?;
+        run_live(
+            options,
+            playlist,
+            args.sample_rate,
+            args.dump_wav.as_deref(),
+            args.wav_format,
+            &stop,
+        )?;
     }
     Ok(())
 }
@@ -593,6 +608,8 @@ fn run_live(
     mut options: EngineOptions,
     playlist: Vec<PathBuf>,
     explicit_sample_rate: Option<u32>,
+    dump_wav: Option<&Path>,
+    wav_format: WavFormat,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
     let playlist_len = playlist.len();
@@ -604,8 +621,24 @@ fn run_live(
 
     let (config, channels) = pick_output_config(&device, explicit_sample_rate)?;
     options.output_sample_rate = config.sample_rate;
+    let sample_rate = config.sample_rate;
 
     let mut engine = Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
+
+    // ponytail: mutex in audio callback; async ringbuf writer if dump underruns
+    let dump_path = dump_wav.map(|p| p.to_path_buf());
+    let dump = match &dump_path {
+        Some(path) => {
+            let w = WavStreamWriter::create(path, sample_rate, wav_format)?;
+            eprintln!(
+                "dumping live mix to {} ({wav_format:?}, {sample_rate} Hz)",
+                path.display()
+            );
+            Some(Arc::new(Mutex::new(w)))
+        }
+        None => None,
+    };
+    let dump_cb = dump.clone();
 
     let (event_tx, event_rx) = mpsc::channel::<EngineEvent>();
     let mut stereo_scratch = Vec::<f32>::new();
@@ -630,6 +663,13 @@ fn run_live(
                         (0.0, 0.0)
                     };
                     write_frame(data, i, channels, l, r);
+                }
+
+                // Same stereo bus that fed write_frame (zeros already filled past n).
+                if let Some(dump) = &dump_cb {
+                    if let Ok(mut w) = dump.lock() {
+                        let _ = w.write_interleaved(stereo);
+                    }
                 }
 
                 for event in engine.poll_events() {
@@ -660,6 +700,19 @@ fn run_live(
     }
 
     drop(stream);
+    if let (Some(dump), Some(path)) = (dump, dump_path) {
+        let w = Arc::try_unwrap(dump)
+            .map_err(|_| anyhow::anyhow!("dump writer still held after stream stop"))?
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        let stats = w.finalize()?;
+        println!(
+            "wrote {} (format {:?}; peak {:.4})",
+            path.display(),
+            wav_format,
+            stats.peak
+        );
+    }
     Ok(())
 }
 
@@ -687,19 +740,32 @@ fn pick_output_config(
         .default_output_config()
         .context("failed to query default output config")?;
 
-    let preferred_rate = explicit_sample_rate.unwrap_or_else(|| default_config.sample_rate());
+    // WASAPI shared mode only accepts the device mix format without conversion
+    // (cpal rejects S_FALSE). Prefer that config; only hunt when --sample-rate
+    // is set or the mix format is not f32.
+    //
+    // Do not clamp into the first supported range: on WASAPI, supported rates
+    // are listed as discrete COMMON_SAMPLE_RATES starting at 8000 Hz, and the
+    // old clamp path opened at 8000 and failed with "not supported in shared mode".
+    if let Some(rate) = explicit_sample_rate {
+        if let Some(cfg) = select_f32_config(device, rate, 2)? {
+            return Ok((cfg, cfg.channels));
+        }
+        if let Some(cfg) = select_f32_config(device, rate, default_config.channels())? {
+            return Ok((cfg, cfg.channels));
+        }
+    }
 
-    // Prefer an f32 config; try stereo when the default is not 2-channel.
-    if let Some(cfg) = select_f32_config(device, preferred_rate, 2)? {
+    if default_config.sample_format() == SampleFormat::F32 {
+        let cfg = default_config.config();
         return Ok((cfg, cfg.channels));
     }
-    if default_config.sample_format() == SampleFormat::F32 {
-        let mut cfg = default_config.config();
-        cfg.sample_rate = preferred_rate;
-        let channels = cfg.channels;
-        return Ok((cfg, channels));
+
+    let rate = default_config.sample_rate();
+    if let Some(cfg) = select_f32_config(device, rate, 2)? {
+        return Ok((cfg, cfg.channels));
     }
-    if let Some(cfg) = select_f32_config(device, preferred_rate, default_config.channels())? {
+    if let Some(cfg) = select_f32_config(device, rate, default_config.channels())? {
         return Ok((cfg, cfg.channels));
     }
 
@@ -721,9 +787,6 @@ fn select_f32_config(
         if let Some(supported) = range.try_with_sample_rate(sample_rate) {
             return Ok(Some(supported.config()));
         }
-        // Prefer max when the exact rate is unavailable within the declared range.
-        let chosen = sample_rate.clamp(range.min_sample_rate(), range.max_sample_rate());
-        return Ok(Some(range.with_sample_rate(chosen).config()));
     }
     Ok(None)
 }

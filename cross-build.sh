@@ -5,7 +5,7 @@
 #   ./cross-build.sh          # Windows x64
 #   ./cross-build.sh windows  # same
 #
-# Output: dist/windows-x64/funkot-autodj.exe
+# Output: dist/windows-x64/funkot-autodj.exe (+ MinGW runtime DLLs)
 set -eu
 cd "$(dirname "$0")"
 
@@ -45,6 +45,15 @@ docker run --rm -i \
         mkdir -p /work/'"$DIST_DIR"'
         cp "/work/'"$CARGO_TARGET_DIR"'/'"$TRIPLE"'/release/funkot-autodj.exe" \
             /work/'"$DIST_DIR"'/funkot-autodj.exe
+        # signalsmith pulls in libstdc++; ship MinGW runtimes next to the exe
+        # (Windows will not find them on PATH when launched from a WSL UNC share).
+        for name in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+            src="$(x86_64-w64-mingw32-g++ -print-file-name="$name")"
+            case "$src" in
+                */*) cp "$src" /work/'"$DIST_DIR"'/"$name" ;;
+                *) echo "missing mingw dll: $name (got: $src)" >&2; exit 1 ;;
+            esac
+        done
         chown -R "$HOST_UID:$HOST_GID" /work/'"$CARGO_TARGET_DIR"' /work/dist 2>/dev/null || true
     '
 
