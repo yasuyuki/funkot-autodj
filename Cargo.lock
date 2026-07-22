@@ -612,6 +612,7 @@ dependencies = [
  "funkot-core",
  "hound",
  "log",
+ "serde_json",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@
 //! mixes pre-rendered buffers and never blocks.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -614,6 +614,52 @@ impl Engine {
         })
     }
 
+    /// Offline engine fed by already-prepared tracks (no background decode/stretch).
+    ///
+    /// Used by CI/`--jobs` renders after [`prepare_tracks_parallel`]. Mix math is
+    /// identical to [`Self::new`]; only preparation scheduling differs.
+    pub fn from_prepared(options: EngineOptions, tracks: Vec<PreparedTrack>) -> Result<Self> {
+        if options.output_sample_rate == 0 {
+            return Err(Error::Engine("output_sample_rate must be > 0".into()));
+        }
+        if !(options.rate.is_finite() && options.rate > 0.0) {
+            return Err(Error::Engine(format!("invalid rate: {}", options.rate)));
+        }
+
+        let bar_frames = options.bar_frames();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
+        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(2);
+        let _ = permit_tx.try_send(());
+        let _ = permit_tx.try_send(());
+
+        let shutdown_flag = Arc::clone(&shutdown);
+        let join = thread::Builder::new()
+            .name("funkot-prepared".into())
+            .spawn(move || prepared_loader_main(tracks, msg_tx, permit_rx, shutdown_flag))
+            .map_err(|e| Error::Engine(format!("spawn prepared loader: {e}")))?;
+
+        Ok(Self {
+            options,
+            bar_frames,
+            shutdown,
+            loader_rx: msg_rx,
+            permit_tx,
+            loader_join: Some(join),
+            next_track: None,
+            active: None,
+            prev: None,
+            transition: None,
+            awaiting_next_at_outro: false,
+            outro_anchor: 0,
+            pending_events: Vec::new(),
+            finished: false,
+            finished_emitted: false,
+            stopped: false,
+            loader_exhausted: false,
+        })
+    }
+
     /// Fill `out` (interleaved stereo at `options.output_sample_rate`).
     /// Returns frames written; 0 means playback finished.
     /// Never blocks: outputs silence while the first track is being prepared.
@@ -1057,6 +1103,26 @@ fn read_deck_frame(deck: &Deck) -> (f32, f32) {
     }
 }
 
+fn prepared_loader_main(
+    tracks: Vec<PreparedTrack>,
+    tx: SyncSender<LoaderMsg>,
+    permit_rx: Receiver<()>,
+    shutdown: Arc<AtomicBool>,
+) {
+    for track in tracks {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        if !wait_permit(&permit_rx, &shutdown) {
+            return;
+        }
+        if !send_msg(&tx, LoaderMsg::Ready(track), &shutdown) {
+            return;
+        }
+    }
+    let _ = send_msg(&tx, LoaderMsg::Exhausted, &shutdown);
+}
+
 fn loader_main(
     options: EngineOptions,
     playlist: Vec<PathBuf>,
@@ -1159,6 +1225,17 @@ fn prepare_one(
     path: &std::path::Path,
     index: usize,
 ) -> Result<PreparedTrack> {
+    prepare_track(options, path, index)
+}
+
+/// Decode, analyze (cached), stretch, and map markers for one playlist entry.
+///
+/// Deterministic for a given file + options; safe to call from a thread pool.
+pub fn prepare_track(
+    options: &EngineOptions,
+    path: &std::path::Path,
+    index: usize,
+) -> Result<PreparedTrack> {
     let buffer = decode::decode_file(path)?;
     let analysis = cache::get_or_analyze(path, &options.cache_dir, &buffer)?;
 
@@ -1222,6 +1299,77 @@ fn prepare_one(
         outro_bars: analysis.outro_bars,
         gain_linear,
     })
+}
+
+/// Prepare every playlist path, optionally in parallel.
+///
+/// `jobs == 0` uses the host CPU count. Does not change decode/analysis/stretch
+/// results versus sequential [`prepare_track`] — only wall-clock time.
+pub fn prepare_tracks_parallel(
+    options: &EngineOptions,
+    paths: &[PathBuf],
+    jobs: usize,
+) -> Result<Vec<PreparedTrack>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let jobs = if jobs == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        jobs.max(1)
+    };
+    let jobs = jobs.min(paths.len());
+    if jobs == 1 {
+        return paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| prepare_track(options, p, i))
+            .collect();
+    }
+
+    let results = std::sync::Mutex::new(
+        (0..paths.len())
+            .map(|_| None::<Result<PreparedTrack>>)
+            .collect::<Vec<_>>(),
+    );
+    let next = AtomicUsize::new(0);
+    let opts = options.clone();
+    let paths_owned = paths.to_vec();
+    thread::scope(|scope| {
+        for _ in 0..jobs {
+            let opts = &opts;
+            let paths = &paths_owned;
+            let results = &results;
+            let next = &next;
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= paths.len() {
+                    break;
+                }
+                let prepared = prepare_track(opts, &paths[i], i);
+                if let Some(slot) = results.lock().expect("results").get_mut(i) {
+                    *slot = Some(prepared);
+                }
+            });
+        }
+    });
+
+    let locked = results
+        .into_inner()
+        .map_err(|_| Error::Engine("prepare results poisoned".into()))?;
+    locked
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            slot.unwrap_or_else(|| {
+                Err(Error::Engine(format!(
+                    "missing prepare result for index {i}"
+                )))
+            })
+        })
+        .collect()
 }
 
 /// Search radius for output-domain phase refine: stretch timing slack, but

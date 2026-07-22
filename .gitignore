@@ -6,6 +6,8 @@
 /testdata/
 *.wav
 !funkot-core/tests/data/*.wav
+# Optional listen/debug WAVs under fixtures/ (golden.json + README are committed)
+funkot-core/tests/fixtures/*.wav
 
 # OS / editor noise
 .DS_Store

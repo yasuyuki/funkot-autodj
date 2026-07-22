@@ -13,7 +13,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use funkot_cli::playlist::{load_playlist_file, validate_paths_exist};
 use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
-use funkot_core::engine::{Engine, EngineEvent};
+use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent};
 use funkot_core::{EngineOptions, PitchMode};
 use log::warn;
 
@@ -85,9 +85,25 @@ struct Args {
 
     /// Offline render speed limit as a multiple of realtime (0 = unlimited).
     /// Pacing gives the loader time to prepare the next track; too fast and
-    /// transitions fall back to extended outros.
-    #[arg(long, default_value_t = 10.0, hide = true)]
+    /// transitions fall back to extended outros. With `--jobs`/`--ci-fast`,
+    /// tracks are prepared up front so `0` is safe for CI.
+    #[arg(long, default_value_t = 10.0)]
     render_speed: f64,
+
+    /// Parallel track prepare workers for `--render` (0 = host CPU count).
+    /// Does not change analysis or mix results — only wall-clock time.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
+
+    /// CI fastest offline mode: `--no-loop`, `--render-speed 0`, `--jobs 0`
+    /// (all CPUs). Safe for audio identity; only preparation is parallelized.
+    #[arg(long)]
+    ci_fast: bool,
+
+    /// Write minimal analysis/downbeat test fixtures (+ golden JSON) to DIR and exit.
+    /// Does not render a playlist mix. See `funkot-core/tests/fixtures/README.md`.
+    #[arg(long = "gen-test-fixtures", value_name = "DIR")]
+    gen_test_fixtures: Option<PathBuf>,
 }
 
 fn main() {
@@ -100,7 +116,20 @@ fn main() {
 fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.ci_fast {
+        args.no_loop = true;
+        args.render_speed = 0.0;
+        args.jobs = 0;
+        if args.render.is_none() {
+            bail!("--ci-fast requires --render OUT.wav");
+        }
+    }
+
+    if let Some(dir) = &args.gen_test_fixtures {
+        return gen_test_fixtures(dir);
+    }
+
     let playlist = resolve_playlist(&args)?;
     let options = build_options(&args)?;
 
@@ -124,6 +153,7 @@ fn run() -> Result<()> {
             args.wav_format,
             args.render_speed,
             args.transition_clip_seconds,
+            args.jobs,
             &stop,
         )?;
     } else {
@@ -233,11 +263,24 @@ fn run_render(
     wav_format: WavFormat,
     render_speed: f64,
     transition_clip_seconds: f64,
+    jobs: usize,
     stop: &AtomicBool,
 ) -> Result<()> {
     let playlist_len = playlist.len();
     let sample_rate = options.output_sample_rate;
-    let mut engine = Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
+    let mut engine = if jobs == 1 {
+        Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?
+    } else {
+        let jobs_label = if jobs == 0 {
+            "all CPUs".to_string()
+        } else {
+            format!("{jobs}")
+        };
+        eprintln!("preparing {playlist_len} tracks with --jobs {jobs_label}...");
+        let tracks = prepare_tracks_parallel(&options, &playlist, jobs)
+            .map_err(|e| anyhow::anyhow!("parallel prepare: {e}"))?;
+        Engine::from_prepared(options, tracks).map_err(|e| anyhow::anyhow!("engine: {e}"))?
+    };
 
     let mut writer = WavStreamWriter::create(out_path, sample_rate, wav_format)?;
 
@@ -683,4 +726,138 @@ fn select_f32_config(
         return Ok(Some(range.with_sample_rate(chosen).config()));
     }
     Ok(None)
+}
+
+
+fn gen_test_fixtures(dir: &Path) -> Result<()> {
+    use funkot_core::analysis::analyze;
+    use funkot_core::testutil::{synth_track, synth_track_with_options, write_wav, SynthOptions};
+    use serde_json::json;
+
+    std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let sr = 44_100u32;
+
+    // Short sections: enough for 8/16 detection, small enough for optional on-disk WAV.
+    let specs: Vec<(&str, SynthOptions, serde_json::Value)> = vec![
+        (
+            "classic_180_i8_m8_o8.wav",
+            SynthOptions {
+                bpm: 180.0,
+                intro_bars: 8,
+                main_bars: 8,
+                outro_bars: 8,
+                sample_rate: sr,
+                ..SynthOptions::default()
+            },
+            json!({
+                "intro_bars": 8,
+                "outro_bars": 8,
+                "first_downbeat_secs": 0.0,
+                "first_downbeat_tol_secs": 0.05,
+                "intro_bpm": 180.0,
+                "bpm_tol": 0.3,
+                "outro_start_bars_from_fd": 16,
+                "outro_start_tol_secs": 0.12
+            }),
+        ),
+        (
+            "leadin_180_i8_m8_o8.wav",
+            SynthOptions {
+                bpm: 180.0,
+                intro_bars: 8,
+                main_bars: 8,
+                outro_bars: 8,
+                sample_rate: sr,
+                lead_in_secs: 0.25,
+                ..SynthOptions::default()
+            },
+            json!({
+                "intro_bars": 8,
+                "outro_bars": 8,
+                "first_downbeat_secs": 0.25,
+                "first_downbeat_tol_secs": 0.05,
+                "intro_bpm": 180.0,
+                "bpm_tol": 0.3,
+                "outro_start_bars_from_fd": 16,
+                "outro_start_tol_secs": 0.12
+            }),
+        ),
+        (
+            "unequal_178_i16_m8_o8.wav",
+            SynthOptions {
+                bpm: 178.0,
+                intro_bars: 16,
+                main_bars: 8,
+                outro_bars: 8,
+                sample_rate: sr,
+                ..SynthOptions::default()
+            },
+            json!({
+                "intro_bars_min": 8,
+                "outro_bars_max": 16,
+                "require_intro_ge_outro": true,
+                "first_downbeat_secs": 0.0,
+                "first_downbeat_tol_secs": 0.05,
+                "intro_bpm": 178.0,
+                "bpm_tol": 0.3,
+                "outro_start_tol_secs": 0.20
+            }),
+        ),
+    ];
+
+    let mut golden = Vec::new();
+    for (name, opt, expect) in specs {
+        let path = dir.join(name);
+        let buf = synth_track_with_options(opt.clone());
+        write_wav(&path, &buf).with_context(|| format!("write {}", path.display()))?;
+        let a = analyze(&buf, name).map_err(|e| anyhow::anyhow!("analyze {name}: {e}"))?;
+        println!(
+            "wrote {} ({} bytes, fd={} bars={}/{} bpm={:.3})",
+            path.display(),
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            a.first_downbeat,
+            a.intro_bars,
+            a.outro_bars,
+            a.intro_bpm
+        );
+        golden.push(json!({
+            "file": name,
+            "synth": {
+                "bpm": opt.bpm,
+                "intro_bars": opt.intro_bars,
+                "main_bars": opt.main_bars,
+                "outro_bars": opt.outro_bars,
+                "sample_rate": opt.sample_rate,
+                "lead_in_secs": opt.lead_in_secs,
+            },
+            "expect": expect,
+        }));
+    }
+
+    let demo = dir.join("synth_classic_short.wav");
+    write_wav(&demo, &synth_track(180.0, 8, 8, 8, sr))?;
+    println!("wrote {}", demo.display());
+
+    let golden_path = dir.join("golden.json");
+    let doc = json!({
+        "version": 1,
+        "sample_rate": sr,
+        "regen": "./dev.sh cargo run -p funkot-cli --release -- --gen-test-fixtures funkot-core/tests/fixtures",
+        "note": "Tests synthesize from each track.synth recipe; WAV files are optional listen/debug artifacts and are gitignored.",
+        "tracks": golden,
+    });
+    std::fs::write(&golden_path, serde_json::to_string_pretty(&doc)?)?;
+    println!("wrote {}", golden_path.display());
+
+    std::fs::write(
+        dir.join("README.md"),
+        "# Analysis CI fixtures\n\n\
+`golden.json` holds synth recipes + tolerances for downbeat / section tests.\n\
+WAV files are optional (gitignored); tests synthesize in memory from `synth`.\n\n\
+```sh\n\
+./dev.sh cargo run -p funkot-cli --release -- --gen-test-fixtures funkot-core/tests/fixtures\n\
+./dev.sh cargo test -p funkot-core --release --test analysis_golden\n\
+```\n",
+    )?;
+    Ok(())
 }

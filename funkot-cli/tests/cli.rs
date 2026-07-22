@@ -257,6 +257,19 @@ fn missing_playlist_entry_fails() {
     );
 }
 
+#[test]
+fn gen_test_fixtures_writes_golden() {
+    let dir = temp_dir("gen_fixtures");
+    let status = bin()
+        .args(["--gen-test-fixtures", dir.to_str().unwrap()])
+        .status()
+        .expect("spawn");
+    assert!(status.success(), "exit status {status}");
+    assert!(dir.join("golden.json").is_file());
+    assert!(dir.join("classic_180_i8_m8_o8.wav").is_file());
+    assert!(dir.join("README.md").is_file());
+}
+
 fn write_minimal_wav(path: &Path) {
     // Tiny valid WAV so path existence checks pass; render tests use synth tracks.
     write_wav(path, &synth_track(180.0, 1, 1, 1, 8_000)).expect("minimal wav");

@@ -55,8 +55,25 @@ funkot-autodj -l playlist.txt \
 書き出し完了時にピークレベルと `|x|>1` のサンプル/フレーム数を表示する（リミッタは掛けない）。
 
 `--render` 時はローダー(次曲のデコード・解析・ストレッチ)が追いつけるよう
-既定で最大10倍速にペースする(`--render-speed 0` で無制限。ただし速すぎると
-次曲の準備が間に合わず、アウトロを延長するフォールバック遷移になる)。
+既定で最大10倍速にペースする。CI / バッチでは前準備を並列化できる:
+
+```sh
+# 最速オフライン（解析・ストレッチ結果は単スレッドと同じ。壁時計だけ短縮）
+./dev.sh cargo run -p funkot-cli --release -- \
+  -l playlist.txt --render out.wav --wav-format f32 --ci-fast
+
+# 同等の明示指定: --no-loop --render-speed 0 --jobs 0（0 = 全CPU）
+./dev.sh cargo run -p funkot-cli --release -- \
+  -l playlist.txt --render out.wav --jobs 0 --render-speed 0 --no-loop
+```
+
+解析ゴールデン用の最小フィクスチャ生成（フルミックスは作らない）:
+
+```sh
+./dev.sh cargo run -p funkot-cli --release -- \
+  --gen-test-fixtures funkot-core/tests/fixtures
+./dev.sh cargo test -p funkot-core --release --test analysis_golden
+```
 
 終了は Ctrl+C または kill。
 

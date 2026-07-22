@@ -1,0 +1,71 @@
+{
+  "note": "Tests synthesize from each track.synth recipe; WAV files are optional listen/debug artifacts and are gitignored.",
+  "regen": "./dev.sh cargo run -p funkot-cli --release -- --gen-test-fixtures funkot-core/tests/fixtures",
+  "sample_rate": 44100,
+  "tracks": [
+    {
+      "expect": {
+        "bpm_tol": 0.3,
+        "first_downbeat_secs": 0.0,
+        "first_downbeat_tol_secs": 0.05,
+        "intro_bars": 8,
+        "intro_bpm": 180.0,
+        "outro_bars": 8,
+        "outro_start_bars_from_fd": 16,
+        "outro_start_tol_secs": 0.12
+      },
+      "file": "classic_180_i8_m8_o8.wav",
+      "synth": {
+        "bpm": 180.0,
+        "intro_bars": 8,
+        "lead_in_secs": 0.0,
+        "main_bars": 8,
+        "outro_bars": 8,
+        "sample_rate": 44100
+      }
+    },
+    {
+      "expect": {
+        "bpm_tol": 0.3,
+        "first_downbeat_secs": 0.25,
+        "first_downbeat_tol_secs": 0.05,
+        "intro_bars": 8,
+        "intro_bpm": 180.0,
+        "outro_bars": 8,
+        "outro_start_bars_from_fd": 16,
+        "outro_start_tol_secs": 0.12
+      },
+      "file": "leadin_180_i8_m8_o8.wav",
+      "synth": {
+        "bpm": 180.0,
+        "intro_bars": 8,
+        "lead_in_secs": 0.25,
+        "main_bars": 8,
+        "outro_bars": 8,
+        "sample_rate": 44100
+      }
+    },
+    {
+      "expect": {
+        "bpm_tol": 0.3,
+        "first_downbeat_secs": 0.0,
+        "first_downbeat_tol_secs": 0.05,
+        "intro_bars_min": 8,
+        "intro_bpm": 178.0,
+        "outro_bars_max": 16,
+        "outro_start_tol_secs": 0.2,
+        "require_intro_ge_outro": true
+      },
+      "file": "unequal_178_i16_m8_o8.wav",
+      "synth": {
+        "bpm": 178.0,
+        "intro_bars": 16,
+        "lead_in_secs": 0.0,
+        "main_bars": 8,
+        "outro_bars": 8,
+        "sample_rate": 44100
+      }
+    }
+  ],
+  "version": 1
+}

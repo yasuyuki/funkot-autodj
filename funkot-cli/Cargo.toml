@@ -14,7 +14,7 @@ name = "funkot_cli"
 path = "src/lib.rs"
 
 [dependencies]
-funkot-core = { path = "../funkot-core" }
+funkot-core = { path = "../funkot-core", features = ["testutil"] }
 cpal = "0.18"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
@@ -22,6 +22,7 @@ env_logger = "0.11"
 log = "0.4"
 anyhow = "1"
 hound = "3.5"
+serde_json = "1"
 
 [dev-dependencies]
 funkot-core = { path = "../funkot-core", features = ["testutil"] }
