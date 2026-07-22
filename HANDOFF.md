@@ -1,6 +1,6 @@
 # funkot-autodj — チャット引き継ぎメモ
 
-最終更新: 2026-07-22（v13: アウトロをイントロ小節格子に統一、聴感確認待ち）
+最終更新: 2026-07-22（v14: 遷移時に intro格子 / end-anchored を選択、聴感確認待ち）
 
 関連会話: [Funkot自動DJ実装](9dbb7172-b71e-4cf1-98d7-b518a8087a0e)
 
@@ -14,7 +14,7 @@
   - `funkot-core` — 解析・ストレッチ・2デッキエンジン・C ABI
   - `funkot-cli` — cpal 再生 / `--render` WAV 書き出し
 - **開発**: Docker + `./dev.sh cargo …`（ホスト cargo は使わない）
-- **git**: 未初期化
+- **git**: あり（`master`）。**変更後は毎回コミット**する方針
 - **計画ファイル**: 編集禁止（既存の plan があれば触らない）
 
 ---
@@ -51,27 +51,26 @@
 - `gain==0` のフレームはバスに加算しない
 - `fade_out_end` 到達直後に `drop_prev`
 
-### アウトロマーカー（v13 更新）
+### アウトロマーカー（v14）
 
-- イントロ側: 解析 `first_downbeat` → scale → ±半拍 refine（従来どおり）
-- **アウトロ側: 解析 `first_downbeat`→`outro_start` の小節数をイントロ格子へ propagate**（`legacy_intro_propagated_outro`）し、末尾 scale だけの独立格子は使わない
-  - 理由: v12 では末尾 scale の outro がイントロ格子から **~0.9〜3.3拍**ずれ、1→2 / 2→3 で小節 identity が崩れた（キック相関 ±1拍）
-- ±半拍 refine はアウトロには適用しない（中盤ドリフトで隣接キックへ吸われるため）
-- 入口: `prepare_output_markers`（`engine.rs`）
+- イントロ側: 解析 `first_downbeat` → scale → ±半拍 refine
+- アウトロは **2候補**を保持:
+  - `outro_start_out` = intro-propagated 格子（遷移トリガ・小節スケジュール）
+  - `outro_end_anchored_out` = 末尾 scale → ±半拍 refine（局所キック位相）
+- 入口: `prepare_output_markers` → `(fd, intro_grid, end_anchored)`
 
-### 遷移時位相ロック（現行方針 = v12）
+### 遷移時位相ロック（v14）
 
-- `align_next_entry_to_prev`（`engine.rs`）
-- **±0.5拍の微調整のみ**（キック帯エネルギー相互相関）
-- **±1/±2拍の coarse 探索は廃止**
-  - 理由: Funkot は毎拍キックがあり、相関が mod-4 小節identityを取り違える
-  - 2→3 で「拍は合うが小節がずれる」症状の直接原因だった
-- 端クランプで `entry=0` になる調整は却下（v9 系の別バグ）
+- `align_next_entry_with_phase_hypotheses`（`engine.rs`）
+- 各仮説を **±0.5拍のみ**で micro-align（`align_next_entry_scored`）
+- intro格子が end-anchored より **遅い**（`Δ > 0.35拍`）ときは end 仮説を優先（キック相関が僅差で誤るため slack あり）
+- それ以外は intro格子を維持し、end が明確に勝つときだけ切替（2→3 / 4→5 を壊さない）
+- **±1/±2拍の coarse 探索は禁止**（v10: 拍は合うが小節ずれ）
 
 ### 診断用 example
 
 - `funkot-core/examples/marker_phase_diag.rs` — マーカー比較
-- `funkot-core/examples/transition_phase_diag.rs` — 2曲の遷移位相（nominal vs aligned）
+- `funkot-core/examples/transition_phase_diag.rs` — 2曲の遷移位相（両仮説の score も表示）
 
 ```sh
 ./dev.sh cargo run -p funkot-core --example transition_phase_diag --release -- \
@@ -106,6 +105,7 @@
 ```
 
 - `--render` 既定は約10倍速ペース（ローダー追いつき用）。`--render-speed 0` は無制限だがアウトロ延長フォールバックのリスクあり
+- `--transition-clip-seconds`（既定90）で遷移WAVを同時出力
 - ピークが +3 dBFS 程度になることあり（リミッター未実装）
 
 ### 遷移クリップ抽出（尺 ~2194s のとき）
@@ -133,35 +133,41 @@
 | v9 | `real_mix_v9_phase_lock_f32.wav` | 位相ロック（±2拍含む） | 3→4ほか改善。**2→3が大幅ずれ**（entry→0） |
 | v10 | `real_mix_v10_phase_lock2_f32.wav` | 2段ロック＋端却下。2→3は+1拍 | **2→3: 拍は合うが小節ずれ**。他は正常 |
 | v11 | `real_mix_v11_bar_preserve_f32.wav` | **微調整±0.5拍のみ** | **聴感確認待ち** |
-| **v12** | **`real_mix_v12_simplified_strict_f32.wav`** | アウトロ/小節は解析粗位置→±半拍 refine のみ（bar identity 投影を廃止） | ダウンビート OK。**1→2 / 2→3 小節ずれ** |
-| **v13** | **`real_mix_v13_intro_grid_f32.wav`** | **アウトロをイントロ小節格子に統一**（末尾 scale 格子を廃止） | レンダー完了（~2194s）。聴感確認待ち |
+| v12 | `real_mix_v12_simplified_strict_f32.wav` | アウトロ/小節は解析粗位置→±半拍 refine のみ | ダウンビート OK。**1→2 / 2→3 小節ずれ** |
+| v13 | `real_mix_v13_intro_grid_f32.wav` | アウトロをイントロ小節格子に統一 | **1→2 / 3→4 ダウンビートずれ**。2→3 / 4→5 は正しい |
+| **v14** | **`real_mix_v14_phase_hyp_f32.wav`** | 遷移時に intro格子 vs end-anchored を選択 | 診断上 1→2 / 3→4 改善。**聴感確認待ち** |
 
 遷移ディレクトリ: `testdata/real_mix_vN_transitions/`（特に `02_…` が 2→3）
 
 ### 計測メモ（transition_phase_diag）
 
-v12（末尾 scale outro）:
+v13（intro格子のみ）:
 
-- **1→2**: kick xcorr **+1.0拍** → 小節ずれ（ユーザー確認）
-- **2→3**: kick xcorr **-1.0拍** → 小節ずれ（ユーザー確認）
+- **1→2**: mid **-0.73拍** / kick +0.25拍（帯域不一致）。ユーザー: ダウンビートずれ
+- **2→3**: aligned **-0.02拍**（正しい）
+- **3→4**: kick **-0.84拍**（正しいピークが ±0.5 外）。ユーザー: ダウンビートずれ
+- **4→5**: aligned **0.00拍**（正しい）
 
-v13 修正後（イントロ格子 outro）:
+v14（両仮説選択後）:
 
-- **1→2**: kick xcorr **+0.25拍**（+75ms）。大幅改善、要聴感確認
-- **2→3**: aligned entry **-0.02拍**（-5.8ms）
-- **3→4 / 4→5**: 未再計測（レンダー後確認）
+- **1→2**: chosen **end-anchored**（+227ms）。mid **+0.02拍**
+- **2→3**: chosen **intro-grid**。kick **-0.02拍**（維持）
+- **3→4**: chosen **end-anchored**（+257ms）。kick **0.00拍**
+- **4→5**: chosen **intro-grid**。kick **0.00拍**（維持）
+
+根因メモ: 解析の `first_downbeat`（先頭）と end-on-bar の `outro_start`（末尾）が整数 intro小節で繋がらず、`bars_f` の端数 ~0.22小節 ≒ **~0.85拍** の格子不一致になる曲がある（KazuyaP / Eternal は grid>end、Totsumal は grid\<end）。
 
 ---
 
 ## 6. 次チャットでやること候補
 
-1. **v13（`real_mix_v13_intro_grid_f32.wav` + `real_mix_v13_transitions/`）を聴感確認**  
-   v12 フィードバック: ダウンビート OK、**1→2 / 2→3 小節ずれ**。v13 で 2→3 は診断上ほぼ解消、1→2 は残差 ~0.25拍
-2. 問題がなければ 1→2 / 4→5 も通しで再確認
-3. 残課題（未着手・低優先）:
+1. **v14（`real_mix_v14_phase_hyp_f32.wav` + `real_mix_v14_transitions/`）を聴感確認**  
+   特に **1→2** と **3→4**（v13 でダウンビートずれ指摘）。2→3 / 4→5 が崩れていないかも確認
+2. 残課題（未着手・低優先）:
+   - 解析側で末尾ダウンビートを明示検出し、intro/outro 格子不一致そのものを減らす
    - ミックスピーク超過（ヘッドルーム／リミッター）
-   - ハイパス重なり中は設計上ハットが両デッキから聞こえる（300Hz HPF）— 位相が合えば一体に聞こえる想定
-   - git 初期化・CI
+   - ハイパス重なり中は設計上ハットが両デッキから聞こえる（300Hz HPF）
+   - CI
    - コンテナ内 rustfmt/clippy が DNS 失敗することがある
 
 ---
@@ -182,7 +188,7 @@ v13 修正後（イントロ格子 outro）:
 
 - ユーザー向け応答は **日本語**
 - 計画ファイルは編集しない
-- コミットは依頼があるまでしない（現状 git なし）
+- **変更後は毎回コミット**（本チャットで方針変更済み）
 - `testdata/` の実音源・巨大 WAV は成果物確認用；リポジトリには載せない想定
 - 「ミッドハイパス」= ハイパス（低域カット）。ローパスに戻さない
 - 小節identityをキック相関の ±N拍で取らない（v10 の失敗を繰り返さない）
