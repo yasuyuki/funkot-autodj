@@ -321,7 +321,7 @@ pub unsafe extern "C" fn funkot_engine_poll_event(
     result.unwrap_or(0)
 }
 
-/// Stop playback and join the loader thread.
+/// Stop playback and detach the loader thread (prepare in flight may finish in background).
 ///
 /// # Safety
 /// `engine` must be null or a pointer from [`funkot_engine_new`].

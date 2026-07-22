@@ -588,8 +588,11 @@ impl Engine {
 
         let opts = options.clone();
         let shutdown_flag = Arc::clone(&shutdown);
+        // Windows default thread stack (~2 MiB) is tight for decode/stretch; overflow
+        // was observed on long m4a prepares ("thread 'funkot-loader' has overflowed its stack").
         let join = thread::Builder::new()
             .name("funkot-loader".into())
+            .stack_size(8 * 1024 * 1024)
             .spawn(move || loader_main(opts, playlist, msg_tx, permit_rx, shutdown_flag))
             .map_err(|e| Error::Engine(format!("spawn loader: {e}")))?;
 
@@ -636,6 +639,7 @@ impl Engine {
         let shutdown_flag = Arc::clone(&shutdown);
         let join = thread::Builder::new()
             .name("funkot-prepared".into())
+            .stack_size(8 * 1024 * 1024)
             .spawn(move || prepared_loader_main(tracks, msg_tx, permit_rx, shutdown_flag))
             .map_err(|e| Error::Engine(format!("spawn prepared loader: {e}")))?;
 
@@ -749,9 +753,9 @@ impl Engine {
         // Unblock loader waiting on a permit.
         let _ = self.permit_tx.try_send(());
         let _ = self.permit_tx.try_send(());
-        if let Some(handle) = self.loader_join.take() {
-            let _ = handle.join();
-        }
+        // Detach: prepare_track ignores shutdown and can take minutes (decode/stretch).
+        // Joining here made Ctrl+C hang until the in-flight prepare finished or crashed.
+        drop(self.loader_join.take());
         self.finished = true;
     }
 
@@ -1087,9 +1091,8 @@ impl Drop for Engine {
         let _ = self.permit_tx.try_send(());
         let _ = self.permit_tx.try_send(());
         while self.loader_rx.try_recv().is_ok() {}
-        if let Some(handle) = self.loader_join.take() {
-            let _ = handle.join();
-        }
+        // Same as stop(): never join on an uncancellable prepare_track.
+        drop(self.loader_join.take());
     }
 }
 
