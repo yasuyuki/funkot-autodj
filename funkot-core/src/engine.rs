@@ -282,7 +282,10 @@ pub fn align_next_entry_scored(
 /// Transition still triggers on the intro-grid playhead (`prev_start`). When that
 /// grid disagrees with the end-anchored outro by a substantial fraction of a beat,
 /// the matching next entry is near `nominal + (grid - end_anchored)`. Both
-/// hypotheses are micro-aligned (±0.5 beat) and the higher kick-energy score wins.
+/// hypotheses are micro-aligned (±0.5 beat); end wins only when its kick-energy
+/// score is clearly better. Ties / near-ties keep intro-grid so bar identity
+/// stays with the analysis markers (v14 `GRID_LATER_SLACK` stole a beat on
+/// KazuyaP→Totsumal: mid looked locked, kick sat ~+1 beat).
 /// Does not search ±1/±2 beats of bar identity (v10 failure mode).
 pub fn align_next_entry_with_phase_hypotheses(
     prev_interleaved: &[f32],
@@ -326,21 +329,13 @@ pub fn align_next_entry_with_phase_hypotheses(
         beat_frames,
     );
 
-    // When the intro-grid trigger sits later than the end-anchored kick (common when
-    // bars_between rounds up), prefer the end hypothesis. Kick-only scores can
-    // slightly favor the wrong (grid) peak on dense Funkot kicks — allow a small
-    // deficit. When the grid sits earlier (Totsumal-style), keep intro-grid unless
-    // end scores clearly better.
+    // End must clearly beat intro-grid on kick micro-align score. A prior
+    // "grid-later slack" preferred end on KazuyaP→Totsumal even when grid
+    // scored higher, shifting entry ~0.75 beat and locking mid while leaving
+    // kick ~1 beat off (bar identity wrong). Eternal→Sekaiichi still flips to
+    // end because its end score wins by a wide margin (~0.92 vs ~0.55).
     const SCORE_EPS: f64 = 0.02;
-    const GRID_LATER_SLACK: f64 = 0.05;
-    let grid_later = delta as f64 > 0.35 * beat_frames;
-    if grid_later {
-        if score_end + GRID_LATER_SLACK >= score_grid {
-            entry_end
-        } else {
-            entry_grid
-        }
-    } else if score_end > score_grid + SCORE_EPS {
+    if score_end > score_grid + SCORE_EPS {
         entry_end
     } else {
         entry_grid
@@ -1738,6 +1733,89 @@ mod tests {
         assert!(
             chosen_beats.abs() < 0.5,
             "phase hypothesis pick must stay sub-beat, got {chosen_beats:.3} beats"
+        );
+    }
+
+    #[test]
+    fn phase_hypotheses_prefer_grid_unless_end_clearly_wins() {
+        let sr = 44_100u32;
+        let bpm = 198.0;
+        let beat = f64::from(sr) * 60.0 / bpm;
+        let n_beats = 64u32;
+        let n = (f64::from(n_beats) * beat).round() as usize;
+        let kick_len = ((0.06 * f64::from(sr)) as usize).max(1);
+
+        // Accent beat 0 of each bar so a ~¾-beat / wrong-beat lock scores worse
+        // than plain 4-on-the-floor (which is ambiguous under kick xcorr).
+        let make = |phase_frames: i64| {
+            let mut mono = vec![0.0f32; n];
+            for b in 0..n_beats {
+                let start = (f64::from(b) * beat).round() as i64 + phase_frames;
+                if start < 0 {
+                    continue;
+                }
+                let start = start as usize;
+                if start >= n {
+                    break;
+                }
+                let accent = if b % 4 == 0 { 1.0 } else { 0.35 };
+                let end = (start + kick_len).min(n);
+                for (i, frame) in (start..end).enumerate() {
+                    let t = i as f64 / f64::from(sr);
+                    let env = (-t / 0.03).exp() as f32;
+                    mono[frame] += accent
+                        * 0.9
+                        * env
+                        * (2.0 * std::f64::consts::PI * 60.0 * t).sin() as f32;
+                }
+            }
+            let mut stereo = Vec::with_capacity(n * 2);
+            for &s in &mono {
+                stereo.push(s);
+                stereo.push(s);
+            }
+            stereo
+        };
+
+        let prev = make(0);
+        let next = make(0);
+        let entry = (8.0 * beat).round() as u64;
+        let prev_start = entry;
+        // ~0.73 beat grid-later disagreement (KazuyaP-style), but both hyps see
+        // the same bar accents → scores nearly equal → must keep intro-grid.
+        let delta = (0.73 * beat).round() as u64;
+        let chosen_tie = align_next_entry_with_phase_hypotheses(
+            &prev,
+            prev_start,
+            &next,
+            entry,
+            prev_start + delta,
+            prev_start,
+            sr,
+            beat,
+        );
+        let tie_beats = (chosen_tie as i64 - entry as i64) as f64 / beat;
+        assert!(
+            tie_beats.abs() < 0.35,
+            "near-tie must keep intro-grid (not jump ~0.73 beat), got {tie_beats:.3} beats"
+        );
+
+        // Next bar accents sit on the end-anchored phase: end score must win.
+        let next_end = make(delta as i64);
+        let chosen_end = align_next_entry_with_phase_hypotheses(
+            &prev,
+            prev_start,
+            &next_end,
+            entry,
+            prev_start + delta,
+            prev_start,
+            sr,
+            beat,
+        );
+        let end_beats = (chosen_end as i64 - entry as i64) as f64 / beat;
+        assert!(
+            (end_beats - 0.73).abs() < 0.35,
+            "clear end win should adopt ~+0.73 beat entry, got {end_beats:.3} beats"
         );
     }
 
