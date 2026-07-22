@@ -1,0 +1,29 @@
+# Cross-build container: Linux host → Windows x86_64 (mingw-gnu).
+#
+# Build the image:
+#   docker build -f Dockerfile.cross -t funkot-autodj-cross .
+# Prefer:
+#   ./cross-build.sh
+FROM rust:1.93-slim-trixie
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Host C++ + libclang for bindgen (signalsmith-stretch)
+    g++ \
+    libclang-dev \
+    # MinGW for x86_64-pc-windows-gnu (Rust + C++ native code)
+    g++-mingw-w64-x86-64 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-pc-windows-gnu
+
+ENV CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++ \
+    CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+    AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar
+
+# bindgen uses host libclang; point it at mingw headers (incl. GCC builtins).
+RUN GCCINC="$(ls -d /usr/lib/gcc/x86_64-w64-mingw32/*/include | head -1)" \
+    && printf "export BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu='%s'\n" \
+        "--target=x86_64-w64-mingw32 -isystem/usr/x86_64-w64-mingw32/include -isystem${GCCINC}" \
+        > /etc/funkot-bindgen.env
+
+WORKDIR /work

@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+/target-cross/
+/dist/
 
 # Local cache and large generated audio
 /funkot-cache/
