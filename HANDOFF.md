@@ -1,6 +1,6 @@
 # funkot-autodj — チャット引き継ぎメモ
 
-最終更新: 2026-07-22（v15: end は kick score が明確に勝つときだけ採用、1→2 小節 identity 修正）
+最終更新: 2026-07-22（v16: 端の kick+hat groove / prev nudge で 1→2 ダウンビートロック）
 
 関連会話: [Funkot自動DJ実装](9dbb7172-b71e-4cf1-98d7-b518a8087a0e)
 
@@ -51,27 +51,28 @@
 - `gain==0` のフレームはバスに加算しない
 - `fade_out_end` 到達直後に `drop_prev`
 
-### アウトロマーカー（v14+）
+### アウトロマーカー（v14+ / v16 強化）
 
-- イントロ側: 解析 `first_downbeat` → scale → ±半拍 refine
+- イントロ側: 解析 `first_downbeat` → scale → ±半拍 **kick+hat groove** refine（疎な intro head）
 - アウトロは **2候補**を保持:
   - `outro_start_out` = intro-propagated 格子（遷移トリガ・小節スケジュール）
-  - `outro_end_anchored_out` = 末尾 scale → ±半拍 refine（局所キック位相）
+  - `outro_end_anchored_out` = **outro tail**（末尾数小節）で groove refine → `outro_bars` 分だけ戻す
 - 入口: `prepare_output_markers` → `(fd, intro_grid, end_anchored)`
+- 解析キャッシュ形状は不変（`real-cache-v4` / `CACHE_VERSION=4` のまま）。出力ドメインの refine のみ変更
 
-### 遷移時位相ロック（v15）
+### 遷移時位相ロック（v16）
 
 - `align_next_entry_with_phase_hypotheses`（`engine.rs`）
 - 各仮説を **±0.5拍のみ**で micro-align（`align_next_entry_scored`）
-- **end-anchored は kick score が intro格子より明確に高いときだけ採用**（`SCORE_EPS=0.02`）
-- v14 の `GRID_LATER_SLACK` は廃止（1→2 で kick 劣勢の end を選び、mid は合うが kick ~+1拍＝小節ずれ）
+- スコアは **kick + 0.4×hat**。kick/hat が ¼拍以上食い違うときは **kick（ダウンビート）優先**
+- next がファイル先頭でこれ以上早められないとき、同じ位相補正を **`prev_nudge`（≤½拍の prev スキップ）** で適用（1→2: ~0.25拍）
+- **end-anchored は kick/groove score が intro格子より明確に高いときだけ採用**（`SCORE_EPS=0.02`）
 - **±1/±2拍の coarse 探索は禁止**（v10: 拍は合うが小節ずれ）
-- ダウンビート検出（`first_downbeat` / outro refine）自体は正しい前提。格子不一致は intro↔end の伝播差
 
 ### 診断用 example
 
 - `funkot-core/examples/marker_phase_diag.rs` — マーカー比較
-- `funkot-core/examples/transition_phase_diag.rs` — 2曲の遷移位相（両仮説の score も表示）
+- `funkot-core/examples/transition_phase_diag.rs` — 2曲の遷移位相（両仮説の score / prev_nudge も表示）
 
 ```sh
 ./dev.sh cargo run -p funkot-core --example transition_phase_diag --release -- \
@@ -93,7 +94,7 @@
 | 4 | `Nicho - Gakumas no Remix - 03 Sekaiichi Kawaii Watashi.flac` |
 | 5 | `Nicho - Gakumas no Remix 2 - 04 Boom Boom Pow.flac` |
 
-- キャッシュ: `testdata/real-cache-v4`（全曲 intro/outro **64/64** 寄り）
+- キャッシュ: `testdata/real-cache-v4`（全曲 intro/outro **64/64** 寄り）。v16 でも再生成不要
 - 再レンダー例:
 
 ```sh
@@ -137,25 +138,12 @@
 | v12 | `real_mix_v12_simplified_strict_f32.wav` | アウトロ/小節は解析粗位置→±半拍 refine のみ | ダウンビート OK。**1→2 / 2→3 小節ずれ** |
 | v13 | `real_mix_v13_intro_grid_f32.wav` | アウトロをイントロ小節格子に統一 | **1→2 / 3→4 ダウンビートずれ**。2→3 / 4→5 は正しい |
 | v14 | `real_mix_v14_phase_hyp_f32.wav` | 遷移時に intro格子 vs end-anchored を選択 | **1→2 小節ずれ**（他は正しい）。ダウンビート検出自体は正しい |
-| **v15** | **`real_mix_v15_grid_prefer_f32.wav`** | end は kick score 明確勝ちのみ（slack 廃止） | **聴感確認待ち** |
+| v15 | `real_mix_v15_grid_prefer_f32.wav` | end は kick score 明確勝ちのみ（slack 廃止） | **1→2 ダウンビートずれ**。2→3 / 3→4 / 4→5 は正しい |
+| **v16** | **`real_mix_v16_edge_groove_f32.wav`** | 端 groove refine + kick優先 + prev_nudge | **聴感確認待ち** |
 
 遷移ディレクトリ: `testdata/real_mix_vN_transitions/`（`01_…` = 1→2）
 
 ### 計測メモ（transition_phase_diag）
-
-v13（intro格子のみ）:
-
-- **1→2**: mid **-0.73拍** / kick +0.25拍（帯域不一致）。ユーザー: ダウンビートずれ
-- **2→3**: aligned **-0.02拍**（正しい）
-- **3→4**: kick **-0.84拍**（正しいピークが ±0.5 外）。ユーザー: ダウンビートずれ
-- **4→5**: aligned **0.00拍**（正しい）
-
-v14（両仮説 + `GRID_LATER_SLACK`）:
-
-- **1→2**: chosen **end-anchored**（+227ms）。mid **+0.02拍** だが kick energy **+1.02拍** → 小節 identity ずれ。grid score 0.792 > end 0.754 なのに slack で end 採用
-- **2→3**: chosen **intro-grid**。kick **-0.02拍**（正しい）
-- **3→4**: chosen **end-anchored**（+257ms）。kick **0.00拍**（正しい）
-- **4→5**: chosen **intro-grid**。kick **0.00拍**（正しい）
 
 v15（slack 廃止、end は明確勝ちのみ）:
 
@@ -163,17 +151,29 @@ v15（slack 廃止、end は明確勝ちのみ）:
 - **3→4**: chosen **end-anchored** 維持（score 0.916 ≫ 0.549）。kick **0.00拍**
 - **2→3 / 4→5**: intro-grid 維持
 
-根因メモ: 解析の `first_downbeat`（先頭）と end-on-bar の `outro_start`（末尾）が整数 intro小節で繋がらず、`bars_f` の端数 ~0.22小節 ≒ **~0.85拍** の格子不一致になる曲がある（KazuyaP / Eternal は grid>end、Totsumal は grid\<end）。KazuyaP→Totsumal は mid と kick の最適位相が ~1拍食い違うため、mid 合わせの end 仮説は小節を壊す。
+v16（edge groove + kick優先 + prev_nudge）:
+
+- **1→2**: chosen **intro-grid** + **prev_nudge≈3328f (~0.25拍)**。kick **+0.019拍**（ロック）。hat は配置差で ~−0.48拍のまま（KazuyaP=offbeat hat / Totsumal=onbeat hat）
+- **2→3**: intro-grid。kick/hat **~0**
+- **3→4**: end-anchored 維持。kick/hat/mid **0.00**
+- **4→5**: intro-grid。kick/hat **0.00**
+
+根因メモ（1→2）:
+
+1. KazuyaP の intro格子と end-anchored が ~0.72拍ずれる（ソース領域の小節数えと末尾位相の差）
+2. 遷移区間で **kick は +¼拍、hat は −¼拍**と食い違う（アレンジ差）。合成スコアだと 0 に張り付く
+3. Totsumal の `first_downbeat` がファイル先頭付近のため、kick が要求する「entry を早める」補正がクランプされ、v15 では残差 +0.25拍のまま
+4. v16: kick 優先で位相を決め、クランプ時は同等の相対位相を **prev を ¼拍スキップ**して実現
 
 ---
 
 ## 6. 次チャットでやること候補
 
-1. **v15（`real_mix_v15_grid_prefer_f32.wav` + `real_mix_v15_transitions/`）を聴感確認**  
-   特に **1→2**（v14 小節ずれ修正）。2→3 / 3→4 / 4→5 が崩れていないかも確認
+1. **v16（`real_mix_v16_edge_groove_f32.wav` + `real_mix_v16_transitions/`）を聴感確認**  
+   特に **1→2**（`01_KazuyaP_to_Totsumal`）。2→3 / 3→4 / 4→5 が崩れていないかも確認
 2. 残課題（未着手・低優先）:
-   - 1→2 の mid/kick 帯域不一致（~0.73拍）自体の扱い — 現状は kick/小節優先
-   - 解析側で末尾ダウンビートを明示検出し、intro/outro 格子不一致そのものを減らす
+   - 1→2 の hat 配置差（onbeat vs offbeat）自体はアレンジ差 — ダウンビート（kick）優先で許容
+   - 解析側で intro/outro 格子不一致そのものを減らす（キャッシュ v5 候補）
    - ミックスピーク超過（ヘッドルーム／リミッター）
    - ハイパス重なり中は設計上ハットが両デッキから聞こえる（300Hz HPF）
    - CI
