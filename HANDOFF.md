@@ -169,7 +169,7 @@ v15（slack 廃止、end は明確勝ちのみ）:
 
 ## 6. 次チャットでやること候補
 
-1. **v15（`real_mix_v15_grid_prefer_f32.wav` + `real_mix_v15_grid_prefer_transitions/`）を聴感確認**  
+1. **v15（`real_mix_v15_grid_prefer_f32.wav` + `real_mix_v15_transitions/`）を聴感確認**  
    特に **1→2**（v14 小節ずれ修正）。2→3 / 3→4 / 4→5 が崩れていないかも確認
 2. 残課題（未着手・低優先）:
    - 1→2 の mid/kick 帯域不一致（~0.73拍）自体の扱い — 現状は kick/小節優先
