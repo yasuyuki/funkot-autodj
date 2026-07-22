@@ -135,15 +135,20 @@ fn main() {
         entry_end as i64 - entry as i64,
         (entry_end as i64 - entry as i64) as f64 * 1000.0 / f64::from(out_sr),
     );
+    let chosen_beats = (entry_aligned as i64 - entry as i64) as f64 / beat_frames;
+    let bar_off = ((chosen_beats / 1.0).round() as i64).rem_euclid(4);
+    let phase_tag = if (entry_aligned as i64 - entry_end as i64).unsigned_abs()
+        < (entry_aligned as i64 - entry_grid as i64).unsigned_abs()
+        && entry_end != entry_grid
+    {
+        "end-anchored"
+    } else {
+        "intro-grid"
+    };
     println!(
-        "  chosen:   aligned={entry_aligned} (Δ={}f / {:.2}ms) prev_nudge={nudge_chosen} [{}]",
+        "  chosen:   aligned={entry_aligned} (Δ={}f / {:.2}ms / {chosen_beats:+.3} beats) prev_nudge={nudge_chosen} [{phase_tag} bar_off≈{bar_off}]",
         entry_aligned as i64 - entry as i64,
         (entry_aligned as i64 - entry as i64) as f64 * 1000.0 / f64::from(out_sr),
-        if entry_aligned == entry_end && entry_end != entry_grid {
-            "end-anchored"
-        } else {
-            "intro-grid"
-        }
     );
     println!(
         "plan: f_eff={} m={} fadeout={}..{} (bars)",

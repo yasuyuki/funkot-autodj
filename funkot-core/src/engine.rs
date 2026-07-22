@@ -327,16 +327,20 @@ pub fn align_next_entry_scored(
     }
 }
 
-/// Align next entry, choosing between intro-grid and end-anchored outro phase.
+/// Align next entry: sub-beat phase hypotheses, then mod-4 bar identity.
 ///
 /// Transition still triggers on the intro-grid playhead (`prev_start`). When that
 /// grid disagrees with the end-anchored outro by a substantial fraction of a beat,
-/// the matching next entry is near `nominal + (grid - end_anchored)`. Both
-/// hypotheses are micro-aligned (±0.5 beat); end wins only when its kick/groove
-/// score is clearly better. Ties / near-ties keep intro-grid so bar identity
-/// stays with the analysis markers (v14 `GRID_LATER_SLACK` stole a beat on
-/// KazuyaP→Totsumal: mid looked locked, kick sat ~+1 beat).
-/// Does not search ±1/±2 beats of bar identity (v10 failure mode).
+/// the matching next entry is near `nominal + (grid - end_anchored)`.
+///
+/// Stage 1 — phase: both hypotheses are micro-aligned (±0.5 beat); end wins only
+/// when its kick/groove score is clearly better. Ties keep intro-grid (v14
+/// `GRID_LATER_SLACK` stole a beat on KazuyaP→Totsumal).
+///
+/// Stage 2 — bar identity: from each phase nominal, try whole-beat offsets
+/// `{0,1,2,3}` and re-micro-align. Kick-only coarse ±1/±2 search is forbidden
+/// (v10: beats locked, bars wrong on 2→3). Scoring uses the same kick+hat
+/// groove as micro-align; a non-zero offset must clearly beat `(grid,0)`.
 ///
 /// Returns `(next_entry, prev_nudge_frames)` — the nudge skips a few frames of
 /// the previous deck when next cannot move earlier (intro already at head).
@@ -350,7 +354,25 @@ pub fn align_next_entry_with_phase_hypotheses(
     sample_rate: u32,
     beat_frames: f64,
 ) -> (u64, u64) {
-    let (entry_grid, score_grid, nudge_grid) = align_next_entry_scored(
+    const SCORE_EPS: f64 = 0.02;
+
+    let next_frames = (next_interleaved.len() / 2) as u64;
+    let mut phase_nominals = vec![nominal_entry];
+    let delta = outro_intro_grid as i64 - outro_end_anchored as i64;
+    if delta.abs() >= 48 {
+        let nominal_end = if delta >= 0 {
+            nominal_entry.saturating_add(delta as u64)
+        } else {
+            nominal_entry.saturating_sub((-delta) as u64)
+        }
+        .min(next_frames.saturating_sub(1));
+        if nominal_end != nominal_entry {
+            phase_nominals.push(nominal_end);
+        }
+    }
+
+    // Baseline: intro-grid at bar offset 0 (preserves marker bar identity).
+    let (mut best_entry, mut best_score, mut best_nudge) = align_next_entry_scored(
         prev_interleaved,
         prev_start,
         next_interleaved,
@@ -359,40 +381,37 @@ pub fn align_next_entry_with_phase_hypotheses(
         beat_frames,
     );
 
-    let delta = outro_intro_grid as i64 - outro_end_anchored as i64;
-    // Ignore tiny disagreements (same phase within ~1ms).
-    if delta.abs() < 48 {
-        return (entry_grid, nudge_grid);
+    for (hyp_i, &base) in phase_nominals.iter().enumerate() {
+        for bar_off in 0u32..BEATS_PER_BAR {
+            // (grid, 0) already scored as baseline.
+            if hyp_i == 0 && bar_off == 0 {
+                continue;
+            }
+            let cand = base
+                .saturating_add(((f64::from(bar_off)) * beat_frames).round() as u64)
+                .min(next_frames.saturating_sub(1));
+            if cand == base && bar_off > 0 {
+                continue;
+            }
+            let (entry, score, nudge) = align_next_entry_scored(
+                prev_interleaved,
+                prev_start,
+                next_interleaved,
+                cand,
+                sample_rate,
+                beat_frames,
+            );
+            // Must clearly beat the current best (and therefore grid+0). Near-ties
+            // keep the earlier choice so ambiguous 4-on-floor never steals a bar.
+            if score > best_score + SCORE_EPS {
+                best_entry = entry;
+                best_score = score;
+                best_nudge = nudge;
+            }
+        }
     }
 
-    let next_frames = (next_interleaved.len() / 2) as u64;
-    let nominal_end = if delta >= 0 {
-        nominal_entry.saturating_add(delta as u64)
-    } else {
-        nominal_entry.saturating_sub((-delta) as u64)
-    }
-    .min(next_frames.saturating_sub(1));
-
-    let (entry_end, score_end, nudge_end) = align_next_entry_scored(
-        prev_interleaved,
-        prev_start,
-        next_interleaved,
-        nominal_end,
-        sample_rate,
-        beat_frames,
-    );
-
-    // End must clearly beat intro-grid on micro-align score. A prior
-    // "grid-later slack" preferred end on KazuyaP→Totsumal even when grid
-    // scored higher, shifting entry ~0.75 beat and locking mid while leaving
-    // kick ~1 beat off (bar identity wrong). Eternal→Sekaiichi still flips to
-    // end because its end score wins by a wide margin (~0.92 vs ~0.55).
-    const SCORE_EPS: f64 = 0.02;
-    if score_end > score_grid + SCORE_EPS {
-        (entry_end, nudge_end)
-    } else {
-        (entry_grid, nudge_grid)
-    }
+    (best_entry, best_nudge)
 }
 
 fn mono_slice(interleaved: &[f32], start: usize, n: usize) -> Vec<f32> {
@@ -836,7 +855,7 @@ impl Engine {
             .first_downbeat_out
             .saturating_add(bar_to_frames(plan.skip, self.bar_frames));
         let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
-        // ±0.5 beat micro-align, choosing intro-grid vs end-anchored outro phase.
+        // Sub-beat phase hyp + mod-4 kick+hat groove bar identity.
         let (entry, prev_nudge) = align_next_entry_with_phase_hypotheses(
             &active.track.samples,
             active.playhead,
@@ -1818,7 +1837,8 @@ mod tests {
             align_next_entry_to_prev(&prev, near_start, &next_late, near_start, sr, beat);
         assert!(aligned0 > 0, "must not clamp entry to 0 (got {aligned0})");
 
-        // Intro-grid vs end-anchored disagreement: still stay within half a beat.
+        // Intro-grid vs end-anchored disagreement on kick-only audio: ambiguous
+        // mod-4 must not steal a bar (SCORE_EPS keeps grid+0).
         let phase_delta = (0.08 * f64::from(sr)).round() as u64;
         let (chosen, _nudge) = align_next_entry_with_phase_hypotheses(
             &prev,
@@ -1833,7 +1853,82 @@ mod tests {
         let chosen_beats = (chosen as i64 - entry as i64) as f64 / beat;
         assert!(
             chosen_beats.abs() < 0.5,
-            "phase hypothesis pick must stay sub-beat, got {chosen_beats:.3} beats"
+            "kick-only phase hyp must stay sub-beat, got {chosen_beats:.3} beats"
+        );
+    }
+
+    #[test]
+    fn bar_identity_groove_corrects_two_beat_marker_error() {
+        let sr = 44_100u32;
+        let bpm = 198.0;
+        let beat = f64::from(sr) * 60.0 / bpm;
+        let n_beats = 64u32;
+        let n = (f64::from(n_beats) * beat).round() as usize;
+        let kick_len = ((0.06 * f64::from(sr)) as usize).max(1);
+        let hat_len = ((0.025 * f64::from(sr)) as usize).max(1);
+
+        // Bar-unique groove: strong kick on beat 0, off-beat hat on beats 1+3.
+        // Plain 4-on-floor cannot resolve mod-4; this pattern can.
+        let make = |phase_frames: i64| {
+            let mut mono = vec![0.0f32; n];
+            for b in 0..n_beats {
+                let start = (f64::from(b) * beat).round() as i64 + phase_frames;
+                if start < 0 {
+                    continue;
+                }
+                let start = start as usize;
+                if start >= n {
+                    break;
+                }
+                let beat_in_bar = b % BEATS_PER_BAR;
+                let kick_amp = if beat_in_bar == 0 { 1.0 } else { 0.30 };
+                let end = (start + kick_len).min(n);
+                for (i, frame) in (start..end).enumerate() {
+                    let t = i as f64 / f64::from(sr);
+                    let env = (-t / 0.03).exp() as f32;
+                    mono[frame] += kick_amp
+                        * 0.9
+                        * env
+                        * (2.0 * std::f64::consts::PI * 60.0 * t).sin() as f32;
+                }
+                if beat_in_bar == 1 || beat_in_bar == 3 {
+                    let hat_start = start + (0.5 * beat).round() as usize;
+                    let hat_end = (hat_start + hat_len).min(n);
+                    for (i, frame) in (hat_start..hat_end).enumerate() {
+                        let t = i as f64 / f64::from(sr);
+                        let env = (-t / 0.008).exp() as f32;
+                        mono[frame] += 0.55 * env * (2.0 * std::f64::consts::PI * 9000.0 * t).sin() as f32;
+                    }
+                }
+            }
+            let mut stereo = Vec::with_capacity(n * 2);
+            for &s in &mono {
+                stereo.push(s);
+                stereo.push(s);
+            }
+            stereo
+        };
+
+        let prev = make(0);
+        let next = make(0);
+        let true_entry = (8.0 * beat).round() as u64;
+        let prev_start = true_entry;
+        // Markers claim an entry two beats early (wrong bar identity, downbeats OK).
+        let wrong_entry = true_entry.saturating_sub((2.0 * beat).round() as u64);
+        let (chosen, _) = align_next_entry_with_phase_hypotheses(
+            &prev,
+            prev_start,
+            &next,
+            wrong_entry,
+            prev_start,
+            prev_start,
+            sr,
+            beat,
+        );
+        let err_beats = (chosen as i64 - true_entry as i64) as f64 / beat;
+        assert!(
+            err_beats.abs() < 0.35,
+            "groove bar search should recover +2 beat marker error, got {err_beats:.3} beats (chosen={chosen} true={true_entry} wrong={wrong_entry})"
         );
     }
 
