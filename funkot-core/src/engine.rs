@@ -2,9 +2,9 @@
 //!
 //! Pull-based: a loader thread prepares tracks offline; [`Engine::render`] only
 //! mixes pre-rendered buffers. It does not block on first-track prepare (silence
-//! until Ready), but if a head preview is exhausted before the full-buffer
-//! Upgrade arrives it waits for that Upgrade instead of emitting unbounded
-//! silence — needed when callers pull faster than realtime (tests / offline).
+//! until Ready). If a head preview is exhausted before Upgrade: offline/tests
+//! spin-wait (default); realtime hosts ([`Engine::set_realtime`]) emit silence
+//! so the audio callback never sleeps.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -574,6 +574,10 @@ pub struct Engine {
     stopped: bool,
     /// Playlist exhausted signal from loader (no more tracks coming).
     loader_exhausted: bool,
+    /// When true, [`Self::render`] spin-waits if the first-track head preview
+    /// ends before Upgrade (CPU-speed pulls / offline). Realtime hosts set
+    /// this false via [`Self::set_realtime`] so the audio callback never sleeps.
+    block_on_preview_upgrade: bool,
 }
 
 impl Engine {
@@ -621,6 +625,7 @@ impl Engine {
             finished_emitted: false,
             stopped: false,
             loader_exhausted: false,
+            block_on_preview_upgrade: true,
         })
     }
 
@@ -668,14 +673,25 @@ impl Engine {
             finished_emitted: false,
             stopped: false,
             loader_exhausted: false,
+            block_on_preview_upgrade: true,
         })
+    }
+
+    /// Realtime hosts (cpal / FFI audio callbacks): never sleep inside [`Self::render`].
+    ///
+    /// When the first-track head preview ends before Upgrade, emit silence until
+    /// the full buffer arrives instead of spin-waiting. Offline/`--render` and
+    /// CPU-speed tests leave the default (blocking) so WAV/output has no gap.
+    pub fn set_realtime(&mut self, realtime: bool) {
+        self.block_on_preview_upgrade = !realtime;
     }
 
     /// Fill `out` (interleaved stereo at `options.output_sample_rate`).
     /// Returns frames written; 0 means playback finished.
     /// Outputs silence while the first track is being prepared. If a head
-    /// preview runs out before Upgrade, waits for the full buffer (see module
-    /// docs) rather than padding CPU-speed pulls with silence.
+    /// preview runs out before Upgrade, waits for the full buffer when
+    /// [`Self::set_realtime`] is off (see module docs); realtime hosts get
+    /// silence until Upgrade instead of blocking the audio callback.
     pub fn render(&mut self, out: &mut [f32]) -> usize {
         if !out.len().is_multiple_of(2) {
             return 0;
@@ -845,13 +861,29 @@ impl Engine {
             .unwrap_or(false)
     }
 
-    /// Block until Upgrade replaces an exhausted head preview.
+    /// Wait (or not) until Upgrade replaces an exhausted head preview.
     ///
-    /// Realtime hosts finish the full stretch during the ~20s head, so this is a
-    /// no-op for them. CPU-speed pullers (tests, offline render) would otherwise
-    /// accumulate unbounded silence and never reach Finished.
+    /// Realtime hosts (`set_realtime(true)`) must not sleep here — under CPU
+    /// load the full stretch can exceed the ~20s head and a sleep in the audio
+    /// callback causes underruns. They get silence until Upgrade arrives.
+    /// CPU-speed pullers (tests, offline render) keep the spin-wait so they do
+    /// not insert a gap into the rendered timeline.
     fn await_preview_upgrade(&mut self) {
         if !self.preview_exhausted_awaiting_upgrade() {
+            return;
+        }
+        if !self.block_on_preview_upgrade {
+            // Realtime: never sleep. If the loader already gave up, end the deck
+            // the same way the blocking path does; otherwise silence until Upgrade.
+            if self.loader_exhausted {
+                if self.active.take().is_some() {
+                    self.release_permit();
+                }
+                self.drop_prev();
+                if self.next_track.is_none() {
+                    self.mark_finished();
+                }
+            }
             return;
         }
         loop {

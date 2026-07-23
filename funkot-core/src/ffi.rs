@@ -245,10 +245,14 @@ pub unsafe extern "C" fn funkot_engine_new(
             }
         };
         match Engine::new(engine_opts, playlist) {
-            Ok(engine) => Box::into_raw(Box::new(FunkotEngine {
-                engine,
-                events: VecDeque::new(),
-            })),
+            Ok(mut engine) => {
+                // Match cpal live path: audio hosts must not sleep in render.
+                engine.set_realtime(true);
+                Box::into_raw(Box::new(FunkotEngine {
+                    engine,
+                    events: VecDeque::new(),
+                }))
+            }
             Err(e) => {
                 write_err(err, err_len, &e.to_string());
                 ptr::null_mut()

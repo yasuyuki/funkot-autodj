@@ -2,14 +2,24 @@
 # Cross-build release binaries for non-Linux targets (Docker + mingw).
 #
 # Usage:
-#   ./cross-build.sh          # Windows x64
-#   ./cross-build.sh windows  # same
+#   ./cross-build.sh                 # Windows x64
+#   ./cross-build.sh windows         # same
+#   ./cross-build.sh --clean         # wipe target-cross + dist, then build
+#   ./cross-build.sh windows --clean # same
 #
 # Output: dist/windows-x64/funkot-autodj.exe (+ MinGW runtime DLLs)
 set -eu
 cd "$(dirname "$0")"
 
-TARGET_ARG="${1:-windows}"
+CLEAN=0
+TARGET_ARG=windows
+for arg in "$@"; do
+    case "$arg" in
+        --clean|clean) CLEAN=1 ;;
+        *) TARGET_ARG=$arg ;;
+    esac
+done
+
 IMAGE=funkot-autodj-cross
 TRIPLE=x86_64-pc-windows-gnu
 DIST_DIR=dist/windows-x64
@@ -22,6 +32,10 @@ case "$TARGET_ARG" in
         exit 1
         ;;
 esac
+
+if [ "$CLEAN" = 1 ]; then
+    rm -rf "$CARGO_TARGET_DIR" "$DIST_DIR"
+fi
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker build -f Dockerfile.cross -t "$IMAGE" .

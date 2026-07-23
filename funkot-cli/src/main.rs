@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
+use cpal::{BufferSize, SampleFormat, StreamConfig, SupportedBufferSize};
 use funkot_cli::playlist::{load_playlist_file, validate_paths_exist};
 use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
 use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent};
@@ -736,8 +736,10 @@ fn run_live(
     let sample_rate = config.sample_rate;
 
     let mut engine = Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
+    // Audio callback must never sleep (preview→Upgrade wait would underrun under load).
+    engine.set_realtime(true);
 
-    // ponytail: mutex in audio callback; async ringbuf writer if dump underruns
+    // ponytail: try_lock dump; async ringbuf writer if dump still underruns
     let dump_path = dump_wav.map(|p| p.to_path_buf());
     let dump = match &dump_path {
         Some(path) => {
@@ -757,6 +759,16 @@ fn run_live(
     // Skip engine.render while paused so playheads / transitions stay put.
     let paused = Arc::new(AtomicBool::new(false));
     let paused_cb = Arc::clone(&paused);
+
+    match &config.buffer_size {
+        BufferSize::Fixed(n) => eprintln!(
+            "output {sample_rate} Hz, {channels} ch, ring buffer {n} frames (~{:.0} ms)",
+            1000.0 * f64::from(*n) / f64::from(sample_rate)
+        ),
+        BufferSize::Default => {
+            eprintln!("output {sample_rate} Hz, {channels} ch, buffer default")
+        }
+    }
 
     let stream = device
         .build_output_stream(
@@ -786,8 +798,9 @@ fn run_live(
                 }
 
                 // Same stereo bus that fed write_frame (zeros already filled past n).
+                // try_lock: never block the audio thread on dump I/O.
                 if let Some(dump) = &dump_cb {
-                    if let Ok(mut w) = dump.lock() {
+                    if let Ok(mut w) = dump.try_lock() {
                         let _ = w.write_interleaved(stereo);
                     }
                 }
@@ -887,7 +900,7 @@ fn pick_output_config(
 ) -> Result<(StreamConfig, u16)> {
     let default_config = device
         .default_output_config()
-        .context("failed to query default output config")?;
+        .context("failed to query default audio output config")?;
 
     // WASAPI shared mode only accepts the device mix format without conversion
     // (cpal rejects S_FALSE). Prefer that config; only hunt when --sample-rate
@@ -906,7 +919,8 @@ fn pick_output_config(
     }
 
     if default_config.sample_format() == SampleFormat::F32 {
-        let cfg = default_config.config();
+        let mut cfg = default_config.config();
+        cfg.buffer_size = stable_buffer_size(default_config.buffer_size());
         return Ok((cfg, cfg.channels));
     }
 
@@ -919,6 +933,27 @@ fn pick_output_config(
     }
 
     bail!("no f32 output configuration available on device {device}");
+}
+
+/// ~170 ms @ 48 kHz. Auto-DJ tolerates this latency; small device periods
+/// underrun when the callback is preempted under load.
+const LIVE_BUFFER_FRAMES: u32 = 8192;
+
+fn stable_buffer_size(supported: &SupportedBufferSize) -> BufferSize {
+    match *supported {
+        // Real range (ALSA / some devices): stay inside host limits.
+        SupportedBufferSize::Range { min, max } if min < max => {
+            BufferSize::Fixed(LIVE_BUFFER_FRAMES.clamp(min, max))
+        }
+        // WASAPI shared software stacks advertise min==max==GetDevicePeriod()
+        // (~480 @ 48 kHz). That is the *callback* period, not an Initialize
+        // ceiling — cpal still enlarges the ring buffer from Fixed(n). Clamping
+        // to max here previously forced Fixed(480) and undid the whole point.
+        SupportedBufferSize::Range { min, .. } => {
+            BufferSize::Fixed(LIVE_BUFFER_FRAMES.max(min))
+        }
+        SupportedBufferSize::Unknown => BufferSize::Fixed(LIVE_BUFFER_FRAMES),
+    }
 }
 
 fn select_f32_config(
@@ -934,7 +969,9 @@ fn select_f32_config(
             continue;
         }
         if let Some(supported) = range.try_with_sample_rate(sample_rate) {
-            return Ok(Some(supported.config()));
+            let mut cfg = supported.config();
+            cfg.buffer_size = stable_buffer_size(supported.buffer_size());
+            return Ok(Some(cfg));
         }
     }
     Ok(None)
