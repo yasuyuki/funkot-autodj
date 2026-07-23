@@ -6,13 +6,13 @@
 //! - Every track is time-stretched by a single constant ratio
 //!   `target_bpm / track_intro_bpm` where `target_bpm = 180 * rate`
 //!   (rate defaults to 1.10 → 198 BPM). Pitch is preserved by default.
-//! - Transition: when the previous track enters its outro, the next track
-//!   starts (high-passed / mid-high-pass, volume 0) and fades in over
-//!   `fade_bars` bars with linear amplitude. When the fade-in
-//!   completes the high-pass switches instantly to the previous track. The
-//!   previous track then fades out with `g = (1-x)²` so that the fade-out
-//!   completes exactly [`MAIN_GAP_BARS`] (8) bars before the next track's
-//!   main section starts; the previous deck is dropped at that endpoint.
+//! - Transition is scheduled backward from the next track's intro end (T0):
+//!   next enters `2·fade_bars + MAIN_GAP_BARS` earlier (HPF, vol 0), fades in
+//!   linearly over `fade_bars`, then HPF flips to the previous track and that
+//!   track fades out linearly so it reaches silence exactly [`MAIN_GAP_BARS`]
+//!   (8) bars before T0; the previous deck is dropped at that endpoint.
+//!   Long intros are entered mid-way (`skip`) so the audible overlap stays the
+//!   fade pair only (~8 bars at default F=4).
 
 pub mod analysis;
 pub mod cache;
@@ -40,9 +40,10 @@ pub const BEATS_PER_BAR: u32 = 4;
 /// fade-out has completed (and before the next main section starts).
 pub const MAIN_GAP_BARS: u32 = 8;
 
-/// Maximum bars the next track's intro may play "solo" (with the previous
-/// track already gone) before its main section starts. Longer intros are
-/// entered mid-way to respect this cap.
+/// Obsolete: the compact schedule always leaves exactly [`MAIN_GAP_BARS`] of
+/// next-intro solo; long intros are entered via `skip` instead of a longer
+/// solo cap. Kept so older callers still compile.
+#[deprecated(note = "solo intro is always MAIN_GAP_BARS; unused by plan_transition")]
 pub const MAX_SOLO_INTRO_BARS: u32 = 16;
 
 /// Fallback intro/outro length when automatic estimation is not confident.
@@ -74,7 +75,8 @@ pub struct TrackAnalysis {
     pub outro_start: u64,
     /// Intro length in bars.
     pub intro_bars: u32,
-    /// Outro length in bars.
+    /// Outro mix-trigger length in bars (from file end). Full energy-drop
+    /// boundary plus ~16 bars of lead-in so DJ mixing starts before collapse.
     pub outro_bars: u32,
     /// `true` when either intro or outro bar count is low-confidence
     /// (compat aggregate of the per-side flags).

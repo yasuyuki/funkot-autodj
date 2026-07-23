@@ -1,5 +1,5 @@
 {
-  "note": "Tests synthesize from each track.synth recipe; WAV files are optional listen/debug artifacts and are gitignored.",
+  "note": "Tests synthesize from each track.synth recipe; WAV files are optional listen/debug artifacts and are gitignored. Outro bars = full-drop + 16 lead when the scan is long enough.",
   "regen": "./dev.sh cargo run -p funkot-cli --release -- --gen-test-fixtures funkot-core/tests/fixtures",
   "sample_rate": 44100,
   "tracks": [
@@ -52,7 +52,7 @@
         "first_downbeat_tol_secs": 0.05,
         "intro_bars_min": 8,
         "intro_bpm": 178.0,
-        "outro_bars_max": 16,
+        "outro_bars_max": 48,
         "outro_start_tol_secs": 0.2,
         "require_intro_ge_outro": true
       },

@@ -45,17 +45,19 @@ fn classic_180_16_32_16() {
         "outro_bpm {} not within 0.3 of {bpm}",
         a.outro_bpm
     );
-    // Sharp boundaries → 16; reconciliation keeps equal lengths.
-    assert_eq!(a.intro_bars, 16);
-    assert_eq!(a.outro_bars, 16);
-    assert!(!a.bars_estimated_low_confidence);
-    assert!(!a.intro_bars_low_confidence);
+    // Sharp synth outro collapses at 16; mix trigger walks back OUTRO_LEAD (→32).
+    // Intro detector still sees 16; reconcile raises intro to match outro.
+    assert_eq!(a.intro_bars, 32);
+    assert_eq!(a.outro_bars, 32);
+    assert!(a.intro_bars_low_confidence);
     assert!(!a.outro_bars_low_confidence);
+    assert!(a.bars_estimated_low_confidence);
 
     let fd_secs = a.first_downbeat as f64 / f64::from(sr);
     assert!(fd_secs.abs() < 0.05, "first_downbeat {fd_secs}s not near 0");
 
-    let expected_outro = (16 + 32) as f64 * bar_len_frames(bpm, sr);
+    // outro_start = end − outro_bars; with lead, that is 16 bars into the old main.
+    let expected_outro = (16 + 32 + 16 - 32) as f64 * bar_len_frames(bpm, sr);
     let outro_secs = a.outro_start as f64 / f64::from(sr);
     let expected_secs = expected_outro / f64::from(sr);
     assert!(
@@ -81,12 +83,12 @@ fn bpm_178_intro32_outro8_keeps_intro_ge_outro() {
         a.outro_bars
     );
     assert!(
-        matches!(a.intro_bars, 8 | 16 | 32),
+        matches!(a.intro_bars, 8 | 16 | 24 | 32 | 48),
         "unexpected intro length {}",
         a.intro_bars
     );
     assert!(
-        matches!(a.outro_bars, 8 | 16 | 32),
+        matches!(a.outro_bars, 8 | 16 | 24 | 32 | 40 | 48),
         "unexpected outro length {}",
         a.outro_bars
     );
@@ -150,11 +152,10 @@ fn bright_intro_outro_still_detects() {
         ..SynthOptions::default()
     });
     let a = analyze(&buf, "bright_io.wav").expect("analyze");
-    assert_eq!(a.intro_bars, 16);
-    assert_eq!(a.outro_bars, 16);
-    assert!(!a.intro_bars_low_confidence);
+    // Drop at 16 + lead → 32; intro raised to match.
+    assert_eq!(a.outro_bars, 32);
+    assert!(a.intro_bars >= a.outro_bars);
     assert!(!a.outro_bars_low_confidence);
-    assert!(!a.bars_estimated_low_confidence);
 }
 
 #[test]
@@ -186,7 +187,7 @@ fn gradual_intro_layering_detects_and_reconciles() {
         a.intro_bars
     );
     assert!(
-        matches!(a.outro_bars, 8 | 16 | 32 | 64),
+        matches!(a.outro_bars, 8 | 16 | 24 | 32 | 40 | 48 | 64),
         "unexpected outro bars {}",
         a.outro_bars
     );
@@ -217,12 +218,12 @@ fn main_body_energy_without_hf_ratio_jump() {
         a.outro_bars
     );
     assert!(
-        matches!(a.intro_bars, 8 | 16 | 32 | 64),
+        matches!(a.intro_bars, 8 | 16 | 24 | 32 | 48 | 64),
         "unexpected intro bars {}",
         a.intro_bars
     );
     assert!(
-        matches!(a.outro_bars, 8 | 16 | 32),
+        matches!(a.outro_bars, 8 | 16 | 24 | 32 | 40 | 48),
         "unexpected outro bars {}",
         a.outro_bars
     );

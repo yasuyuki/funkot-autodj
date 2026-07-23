@@ -8,10 +8,13 @@
 //! 4. Anchor the first downbeat at the first strong low-band energy peak,
 //!    then refine to sample accuracy (hop quantization is not enough for DJ phase).
 //! 5. Anchor the outro grid from the track end (production ends on a bar).
-//! 6. Detect intro/outro length via boundary contrast + edge sharpness at
+//! 6. Detect intro length via boundary contrast + edge sharpness at
 //!    {8,16,32,64}. Short lengths require a sharp step; gradual layering ramps
-//!    must not be called short with high confidence. Fall back to
-//!    [`FALLBACK_BARS`] (64) when ambiguous. Mid-song material is never inspected.
+//!    must not be called short with high confidence.
+//!    Outro mix trigger = full mid/high-ratio drop boundary (same snap set)
+//!    plus 16 bars so DJ mixing starts before the collapse (~48 bars from end
+//!    on typical Funkot). Fall back to [`FALLBACK_BARS`] (64) when ambiguous.
+//!    Mid-song material is never inspected.
 //! 7. Reconcile intro/outro with invariant `intro >= outro` (intro may be longer).
 //! 8. Measure full-track mono RMS and derive a clamped gain.
 
@@ -60,6 +63,9 @@ const MIN_SHARP_SHORT: f64 = 2.2;
 const MIN_SHARP_SHORT_GRADUAL: f64 = 3.6;
 /// Before-window RMS spread (dB) treated as a gradual layering ramp.
 const GRADUAL_SPREAD_DB: f64 = 2.5;
+/// Bars before the full energy-drop to place the DJ outro / mix trigger.
+/// Real Funkot full-drop ≈ end−32; mix trigger ≈ end−48.
+const OUTRO_LEAD_BARS: u32 = 16;
 /// Default search radius for sample-accurate kick refinement (ms).
 const KICK_REFINE_RADIUS_MS: f64 = 40.0;
 /// Fine hop for kick envelope inside the refine window.
@@ -963,7 +969,220 @@ fn detect_section_bars(
         .collect();
 
     let feats = bar_features(buffer, &starts, bar_len_frames);
-    Ok(pick_section_bars(&feats))
+    Ok(match dir {
+        SectionDir::Forward => pick_section_bars(&feats),
+        SectionDir::Backward => pick_outro_bars(&feats),
+    })
+}
+
+/// Outro mix-trigger length: full mid-energy drop + [`OUTRO_LEAD_BARS`].
+///
+/// Mixing at the collapse itself is too late; walking back 16 bars lands near
+/// the mid-energy DJ outro (~end−48 when the drop is ~end−32). Falls back to
+/// candidate scoring without the "prefer longer" bias used on intros.
+fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
+    if let Some(drop) = pick_outro_full_drop(feats) {
+        let can_lead = drop.bars < FALLBACK_BARS
+            && feats.len()
+                >= drop.bars as usize + OUTRO_LEAD_BARS as usize + AFTER_WIN_BARS;
+        let bars = if can_lead {
+            snap_to_bar_grid(drop.bars.saturating_add(OUTRO_LEAD_BARS)).min(FALLBACK_BARS)
+        } else {
+            drop.bars
+        }
+        .max(SNAP_CANDIDATES[0]);
+        return SectionEstimate {
+            bars,
+            low_confidence: false,
+            score: drop.score,
+            sharpness: drop.sharpness,
+        };
+    }
+    if let Some(hit) = pick_by_candidate_scores_outro(feats) {
+        return hit;
+    }
+    SectionEstimate {
+        bars: FALLBACK_BARS,
+        low_confidence: true,
+        score: 0.0,
+        sharpness: 0.0,
+    }
+}
+
+/// Full energy-drop boundary from the file end, snapped to {8,16,32,64}.
+///
+/// Funkot outros often keep the kick, so RMS/mid body stay up; the collapse that
+/// DJs hear is mid/high content. Detect that via [`BarFeat::midhigh_ratio`]
+/// (earliest sustained rise above the near-end floor). Mixing at this boundary
+/// is too late — callers add [`OUTRO_LEAD_BARS`].
+fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
+    if feats.len() < 16 + AFTER_WIN_BARS {
+        return None;
+    }
+
+    // Skip near-silent trailing bars when sampling the outro floor.
+    let mut floor_lo = 0usize;
+    while floor_lo + 8 < feats.len() && amp_to_db(feats[floor_lo].rms) < -30.0 {
+        floor_lo += 1;
+    }
+    let floor_hi = (floor_lo + 12).min(feats.len());
+    if floor_hi <= floor_lo + 4 {
+        return None;
+    }
+
+    // Silence pads often have unstable HF ratios; treat them as 0.
+    let ratio: Vec<f64> = feats
+        .iter()
+        .map(|f| {
+            if amp_to_db(f.rms) < -30.0 {
+                0.0
+            } else {
+                f.midhigh_ratio.max(1e-6)
+            }
+        })
+        .collect();
+
+    let mut floor_vals: Vec<f64> = ratio[floor_lo..floor_hi].to_vec();
+    floor_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = floor_vals[floor_vals.len() / 2];
+
+    let far_lo = (feats.len() / 2).max(floor_hi + 4);
+    if far_lo >= ratio.len() {
+        return None;
+    }
+    let peak = ratio[far_lo..]
+        .iter()
+        .copied()
+        .fold(0.0f64, f64::max);
+    // Need a clear mid/high recovery past the drop floor (≈0.06–0.1 → 0.15+).
+    if peak < floor * 1.35 && (peak - floor) < 0.03 {
+        return None;
+    }
+    // Light threshold: a brief layer-add spike should not wait for a long smooth.
+    let enter = (floor * 1.25).max(floor + (peak - floor) * 0.25);
+    let soft = enter * 0.85;
+    const SUSTAIN: usize = 3;
+
+    let last = ratio.len().saturating_sub(SUSTAIN);
+    for i in floor_hi..last {
+        if ratio[i] < enter {
+            continue;
+        }
+        let win = &ratio[i..i + SUSTAIN];
+        if !win.iter().all(|&v| v >= soft) {
+            continue;
+        }
+        // Reject a single-bar spike (common mid-outro hat fills).
+        let above_enter = win.iter().filter(|&&v| v >= enter).count();
+        if above_enter < 2 {
+            continue;
+        }
+        let (bars, snap_low) = snap_bars(i as u32);
+        if snap_low {
+            continue;
+        }
+        let c = bars as usize;
+        if c + 4 > feats.len() {
+            continue;
+        }
+        let after_n = AFTER_WIN_BARS.min(feats.len() - c).max(4);
+        let before = &feats[..c];
+        let after = &feats[c..c + after_n];
+        return Some(SectionEstimate {
+            bars,
+            low_confidence: false,
+            score: peak / floor.max(1e-6),
+            sharpness: edge_sharpness(before, after),
+        });
+    }
+    None
+}
+
+/// Like [`pick_by_candidate_scores`] but without preferring longer near-ties
+/// (that bias pushed real Funkot outros to 64).
+fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> {
+    let mut scored: Vec<SectionEstimate> = Vec::with_capacity(SNAP_CANDIDATES.len());
+    for &cand in &SNAP_CANDIDATES {
+        let c = cand as usize;
+        if c < 4 || c + 4 > feats.len() {
+            continue;
+        }
+        let after_n = AFTER_WIN_BARS.min(feats.len() - c).max(4);
+        let before = &feats[..c];
+        let after = &feats[c..c + after_n];
+        let score = boundary_score(before, after);
+        let sharpness = edge_sharpness(before, after);
+        if score < MIN_BOUNDARY_SCORE {
+            continue;
+        }
+        if !passes_short_sharpness_gate(cand, before, sharpness) {
+            continue;
+        }
+        scored.push(SectionEstimate {
+            bars: cand,
+            low_confidence: false,
+            score,
+            sharpness,
+        });
+    }
+    if scored.is_empty() {
+        return None;
+    }
+
+    let best_score = scored
+        .iter()
+        .map(|s| s.score)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !best_score.is_finite() || best_score < MIN_BOUNDARY_SCORE * 1.15 {
+        return None;
+    }
+
+    let best = scored.iter().max_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Near ties: prefer shorter (mix earlier from end is worse than late).
+            .then_with(|| b.bars.cmp(&a.bars))
+    })?;
+    let runner_up = scored
+        .iter()
+        .filter(|s| s.bars != best.bars)
+        .map(|s| s.score)
+        .fold(0.0f64, f64::max);
+    let margin = best_score - runner_up;
+
+    if best.bars == 8 && margin < MIN_SCORE_MARGIN * 2.0 {
+        return None;
+    }
+
+    let accept = margin >= MIN_SCORE_MARGIN || best_score >= MIN_BOUNDARY_SCORE * 2.0;
+    if accept {
+        // Fallback path: still walk back from a credible boundary when short.
+        let bars = if best.bars < FALLBACK_BARS
+            && feats.len() >= best.bars as usize + OUTRO_LEAD_BARS as usize + AFTER_WIN_BARS
+        {
+            snap_to_bar_grid(best.bars.saturating_add(OUTRO_LEAD_BARS)).min(FALLBACK_BARS)
+        } else {
+            best.bars
+        };
+        Some(SectionEstimate {
+            bars,
+            low_confidence: false,
+            score: best.score,
+            sharpness: best.sharpness,
+        })
+    } else {
+        None
+    }
+}
+
+/// Round to the nearest multiple of 8 bars (Funkot phrase grid).
+fn snap_to_bar_grid(bars: u32) -> u32 {
+    if bars <= 8 {
+        return 8;
+    }
+    let q = ((bars + 4) / 8) * 8;
+    q.max(8)
 }
 
 /// Choose a snap length from per-bar features, or fall back when ambiguous.

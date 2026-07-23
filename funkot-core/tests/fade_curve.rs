@@ -274,7 +274,7 @@ fn linear_fade_full_span_constant_signal() {
 
     let sr = 44_100u32;
     let bpm = 180.0;
-    // Long enough that fade-out starts well after fade-in (HPF already settled).
+    // Compact schedule: fade-out starts when fade-in / HPF switch completes.
     let intro = 32u32;
     let main = 16u32;
     let outro = 32u32;
@@ -298,9 +298,9 @@ fn linear_fade_full_span_constant_signal() {
     let plan = plan_transition(4, intro, outro);
     assert_eq!(plan.f_eff, 4, "fade must remain 4 bars");
     assert_eq!(MAIN_GAP_BARS, 8);
-    assert!(
-        plan.fadeout_start > plan.f_eff,
-        "fade-out must start after fade-in/HPF switch: {plan:?}"
+    assert_eq!(
+        plan.fadeout_start, plan.f_eff,
+        "fade-out starts when fade-in/HPF switch completes: {plan:?}"
     );
     let bar_frames = options_base.bar_frames();
     let fade_n = (f64::from(plan.f_eff) * bar_frames).round() as u64;

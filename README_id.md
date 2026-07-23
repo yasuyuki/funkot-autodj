@@ -19,18 +19,19 @@ sebagai BGM tanpa putus dengan crossfade ala DJ.
 
 ## Langkah transisi
 
-1. Saat track sebelumnya masuk outro, track berikutnya mulai diputar dari
-   intro (path MID/HIGH high-pass ~300 Hz, volume 0)
-2. Fade-in linear selama 4 bar (`--fade-bars`) (frame pertama volume 0,
-   frame terakhir 1)
-3. Saat fade-in selesai, high-pass segera dialihkan ke track sebelumnya
-4. Track sebelumnya di-fade-out linear selama 4 bar (frame terakhir volume 0).
-   Selesainya fade-out dijadwalkan mundur agar jatuh "8 bar sebelum main
-   track berikutnya" (setelah fade-out, intro track berikutnya masih menyisakan
-   8 bar = `MAIN_GAP_BARS`). Segera setelah volume 0, deck sebelumnya dibuang
-   dan tidak diputar lagi
-5. Intro yang terlalu panjang dipotong dari tengah agar segmen intro saja
-   maksimal 16 bar. Outro panjang terpotong alami oleh fade-out
+Acuan: **akhir intro track berikutnya (awal main) T0**. Panjang transisi default
+16 bar (`2 × fade_bars + MAIN_GAP_BARS`). Overlap yang terdengar hanya 8 bar
+(pasangan fade).
+
+1. T0−16 bar: track berikutnya mulai (high-pass ~300 Hz, volume 0); fade-in linear 4 bar
+2. T0−12 bar: fade-in selesai, high-pass pindah ke track sebelumnya; fade-out 4 bar mulai
+3. T0−8 bar: volume track sebelumnya 0 → deck sebelumnya dibuang segera
+4. T0: main track berikutnya mulai
+5. Intro panjang dimasuki di tengah (`skip = intro − 16`). Titik outro = batas
+   drop energi mid penuh dikurangi 16 bar (~akhir−48 bar pada Funkot nyata;
+   64 terlalu panjang, 32 = drop penuh terlalu pendek)
+
+Jika `F` / intro / outro pendek, fade diperkecil dengan bentuk yang sama.
 
 ## Cara pakai
 
@@ -96,6 +97,10 @@ manual untuk override (jika estimasi kurang yakin, fallback ke 64 bar dengan
 `bars_estimated_low_confidence: true`. Flag per sisi
 `intro_bars_low_confidence` / `outro_bars_low_confidence` juga dicatat.
 Intro diselaraskan agar tidak lebih pendek dari outro: `intro >= outro`).
+Jika hanya mengubah `outro_bars`, sesuaikan juga `outro_start` =
+`total_frames − outro_bars × bar_len` (tidak dihitung ulang saat load).
+Perubahan format cache menaikkan `version` dan menonaktifkan JSON lama
+(saat ini v5).
 
 ## Struktur
 

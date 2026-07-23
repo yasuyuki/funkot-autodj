@@ -16,9 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::analysis::refine_groove_phase;
 use crate::filter::StereoHighPass;
 use crate::stretch::{self, position_scale};
-use crate::{
-    cache, decode, EngineOptions, Error, Result, BEATS_PER_BAR, MAIN_GAP_BARS, MAX_SOLO_INTRO_BARS,
-};
+use crate::{cache, decode, EngineOptions, Error, Result, BEATS_PER_BAR, MAIN_GAP_BARS};
 
 /// Events emitted by the engine (and loader failures).
 #[derive(Debug, Clone)]
@@ -58,13 +56,15 @@ pub struct PreparedTrack {
     pub preview: bool,
 }
 
-/// Pure transition schedule in bars relative to T = previous track's outro start.
+/// Pure transition schedule in bars relative to T = previous track's outro start
+/// (= next entry). Anchored so the next track's main (intro end, T0) falls at
+/// `T + m`, with a compact fade pair and [`MAIN_GAP_BARS`] of next-intro solo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransitionPlan {
     pub f_eff: u32,
-    /// Bars from T until the next track's main section starts.
+    /// Bars from T until the next track's main section starts (`2·f_eff + MAIN_GAP`).
     pub m: u32,
-    /// Bars of the next track's intro skipped before entry.
+    /// Bars of the next track's intro skipped before entry (`I − m`).
     pub skip: u32,
     pub fadeout_start: u32,
     pub fadeout_end: u32,
@@ -72,26 +72,33 @@ pub struct TransitionPlan {
 
 /// Compute the bar-grid transition schedule.
 ///
+/// Timeline relative to next-intro end T0 (main start):
+/// - T0−`m`: next enters (HPF, vol 0); `m = 2·F + MAIN_GAP` when it fits
+/// - T0−`m`+`F`: next fade-in done; HPF flips to prev; prev fade-out starts
+/// - T0−[`MAIN_GAP_BARS`]: prev at vol 0 → deck dropped
+/// - T0: next main
+///
 /// `F` = requested fade bars, `I` = next intro bars, `O` = previous outro bars.
+/// Short `I`/`O` shrink `F` so the compact window still fits; `m` is never
+/// stretched to fill a long intro (long intros are entered mid-way via `skip`).
 pub fn plan_transition(fade_bars: u32, intro_bars: u32, outro_bars: u32) -> TransitionPlan {
     let f = fade_bars;
     let i = intro_bars;
     let o = outro_bars;
 
+    // Need 2·F bars of outro (fade-in+out) and F+(F)+MAIN_GAP of intro.
     let f_eff = {
         let from_intro = i.saturating_sub(MAIN_GAP_BARS) / 2;
         let from_outro = o / 2;
         f.min(from_intro).min(from_outro).max(1)
     };
 
-    let mut m = (2 * f_eff + MAIN_GAP_BARS).max(i.min(o.saturating_add(MAX_SOLO_INTRO_BARS)));
-    m = m.min(i);
+    let m = (2 * f_eff + MAIN_GAP_BARS).min(i);
     let skip = i.saturating_sub(m);
 
-    // fadeout_end = M - MAIN_GAP_BARS (intro remaining after prev fade-out completes).
-    let fadeout_end = (m.saturating_sub(MAIN_GAP_BARS)).min(o);
-    // Keep fade-out from starting before fade-in ends, but never past fadeout_end
-    // (short intros with MAIN_GAP_BARS can yield fadeout_end == 0).
+    // Ideal: fade-out occupies [f_eff, 2·f_eff]. Clamp when m is short so
+    // MAIN_GAP still remains after fade-out (may yield a zero-length fade).
+    let fadeout_end = (2 * f_eff).min(m.saturating_sub(MAIN_GAP_BARS)).min(o);
     let fadeout_start = fadeout_end
         .saturating_sub(f_eff)
         .max(f_eff.min(fadeout_end));
@@ -997,7 +1004,22 @@ impl Engine {
         };
 
         let o_remaining = active.track.outro_bars.saturating_sub(bars_into);
-        if o_remaining < 2 {
+        let next_intro = self
+            .next_track
+            .as_ref()
+            .map(|t| t.intro_bars)
+            .unwrap_or(0);
+        // Compact schedule needs 2·f_eff bars of outro; f_eff ≥ 1 → at least 2.
+        let f_eff = {
+            let from_intro = next_intro.saturating_sub(MAIN_GAP_BARS) / 2;
+            let from_outro = o_remaining / 2;
+            self.options
+                .fade_bars
+                .min(from_intro)
+                .min(from_outro)
+                .max(1)
+        };
+        if o_remaining < 2 * f_eff {
             // Let prev finish; start next solo when active ends.
             self.awaiting_next_at_outro = false;
             return;
@@ -1869,16 +1891,16 @@ mod tests {
 
     #[test]
     fn plan_worked_examples_f4_main_gap8() {
-        // Default fade=4, MAIN_GAP_BARS=8.
+        // Default fade=4, MAIN_GAP_BARS=8 → compact m=16.
         let p = plan_transition(4, 64, 64);
         assert_eq!(
             p,
             TransitionPlan {
                 f_eff: 4,
-                m: 64,
-                skip: 0,
-                fadeout_start: 52,
-                fadeout_end: 56,
+                m: 16,
+                skip: 48,
+                fadeout_start: 4,
+                fadeout_end: 8,
             }
         );
 
@@ -1887,10 +1909,10 @@ mod tests {
             p,
             TransitionPlan {
                 f_eff: 4,
-                m: 32,
-                skip: 32,
-                fadeout_start: 12,
-                fadeout_end: 16,
+                m: 16,
+                skip: 48,
+                fadeout_start: 4,
+                fadeout_end: 8,
             }
         );
 
@@ -1906,6 +1928,7 @@ mod tests {
             }
         );
 
+        // I=O=8: fade shrinks; no room for MAIN_GAP after a real fade.
         let p = plan_transition(4, 8, 8);
         assert_eq!(
             p,
@@ -1915,6 +1938,19 @@ mod tests {
                 skip: 0,
                 fadeout_start: 0,
                 fadeout_end: 0,
+            }
+        );
+
+        // Outro shorter than 2·F shrinks fade.
+        let p = plan_transition(4, 64, 4);
+        assert_eq!(
+            p,
+            TransitionPlan {
+                f_eff: 2,
+                m: 12,
+                skip: 52,
+                fadeout_start: 2,
+                fadeout_end: 4,
             }
         );
     }
@@ -1930,6 +1966,13 @@ mod tests {
                     assert!(p.m <= i);
                     assert!(p.fadeout_start <= p.fadeout_end);
                     assert!(p.fadeout_end - p.fadeout_start <= p.f_eff);
+                    // Compact: never longer than 2·f_eff + MAIN_GAP.
+                    assert!(
+                        p.m <= 2 * p.f_eff + MAIN_GAP_BARS,
+                        "m stretched I={i} O={o} F={f}: {p:?}"
+                    );
+                    // Audible overlap is the fade pair only (≤ 2·f_eff).
+                    assert!(p.fadeout_end <= 2 * p.f_eff);
                 }
             }
         }

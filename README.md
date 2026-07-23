@@ -48,6 +48,9 @@ Supported formats: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV.
   uses only the start and end of each track
 - Default playback is 10% faster (198 BPM), pitch-preserved unless
   `--pitch-shift` is set
+- Transition is scheduled from the **next track’s intro end (T0)**: next enters
+  16 bars earlier (default), 4-bar linear fade-in, HPF flip + 4-bar fade-out,
+  previous deck dropped 8 bars before T0 (audible overlap ≈ 8 bars)
 
 Full transition rules, cache format, C ABI, and Docker-based development notes
 are in [README_ja.md](README_ja.md).
