@@ -7,7 +7,9 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::decode::AudioBuffer;
-use crate::{Error, Result, TrackAnalysis};
+use crate::{
+    Error, Result, TrackAnalysis, BEATS_PER_BAR, FALLBACK_BARS, NOMINAL_BPM, TARGET_RMS_DBFS,
+};
 
 /// Cache format version; bump when the analyzer changes incompatibly.
 pub const CACHE_VERSION: u32 = 4;
@@ -106,4 +108,56 @@ pub fn get_or_analyze(
     let analysis = crate::analysis::analyze(buffer, file_name)?;
     store(cache_dir, &hash, &analysis)?;
     Ok(analysis)
+}
+
+/// Cache hit, else provisional markers — never runs the analyzer.
+///
+/// Returns `(analysis, used_provisional)`. Used so the first live track can
+/// start without waiting on analysis; subsequent prepares / offline render
+/// still use [`get_or_analyze`].
+pub fn get_cached_or_provisional(
+    path: &Path,
+    cache_dir: &Path,
+    buffer: &AudioBuffer,
+) -> Result<(TrackAnalysis, bool)> {
+    let hash = content_hash(path)?;
+    if let Some(cached) = load(cache_dir, &hash) {
+        return Ok((cached, false));
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    Ok((provisional(buffer, file_name), true))
+}
+
+/// Nominal-BPM / [`FALLBACK_BARS`] stand-in until a real analysis is cached.
+pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
+    let sr = f64::from(buffer.sample_rate);
+    let bar_len = (60.0 / NOMINAL_BPM * sr * f64::from(BEATS_PER_BAR))
+        .round()
+        .max(1.0) as u64;
+    let total_bars = (buffer.frames / bar_len) as u32;
+    // Don't claim a 64-bar outro on a shorter file (would put outro_start at 0).
+    let section_bars = FALLBACK_BARS.min(total_bars / 3).max(1);
+    let outro_start = buffer
+        .frames
+        .saturating_sub(u64::from(section_bars) * bar_len);
+    TrackAnalysis {
+        version: CACHE_VERSION,
+        file_name: file_name.to_string(),
+        sample_rate: buffer.sample_rate,
+        total_frames: buffer.frames,
+        intro_bpm: NOMINAL_BPM,
+        outro_bpm: NOMINAL_BPM,
+        first_downbeat: 0,
+        outro_start,
+        intro_bars: section_bars,
+        outro_bars: section_bars,
+        bars_estimated_low_confidence: true,
+        intro_bars_low_confidence: true,
+        outro_bars_low_confidence: true,
+        rms_dbfs: TARGET_RMS_DBFS,
+        gain_db: 0.0,
+    }
 }

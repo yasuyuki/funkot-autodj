@@ -51,6 +51,8 @@ pub struct PreparedTrack {
     pub outro_bars: u32,
     /// Linear gain from analysis (`10^(gain_db/20)`), or 1.0 when disabled.
     pub gain_linear: f32,
+    /// Head-only preview for first live track; full buffer arrives via loader upgrade.
+    pub preview: bool,
 }
 
 /// Pure transition schedule in bars relative to T = previous track's outro start.
@@ -525,6 +527,8 @@ fn energy_xcorr_at_win(a: &[f64], b: &[f64], lag: i64, win: usize) -> f64 {
 
 enum LoaderMsg {
     Ready(PreparedTrack),
+    /// Replace the playing (or queued) first-track preview with the full stretch.
+    Upgrade(PreparedTrack),
     Failed { path: PathBuf, message: String },
     Exhausted,
 }
@@ -789,6 +793,9 @@ impl Engine {
                         self.release_permit();
                     }
                 }
+                Ok(LoaderMsg::Upgrade(track)) => {
+                    self.apply_upgrade(track);
+                }
                 Ok(LoaderMsg::Failed { path, message }) => {
                     self.pending_events
                         .push(EngineEvent::TrackFailed { path, message });
@@ -805,6 +812,23 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Swap preview samples/markers for the full first track without restarting.
+    fn apply_upgrade(&mut self, track: PreparedTrack) {
+        if let Some(deck) = self.active.as_mut() {
+            if deck.track.path == track.path {
+                deck.playhead = deck.playhead.min(track.frames.saturating_sub(1));
+                deck.track = track;
+                return;
+            }
+        }
+        if let Some(next) = self.next_track.as_mut() {
+            if next.path == track.path {
+                *next = track;
+            }
+        }
+        // Else: already left this track; drop upgrade (no permit — same slot).
     }
 
     fn start_first(&mut self, track: PreparedTrack) {
@@ -1064,7 +1088,7 @@ impl Engine {
         let active_done = self
             .active
             .as_ref()
-            .map(|d| d.playhead >= d.track.frames)
+            .map(|d| d.playhead >= d.track.frames && !d.track.preview)
             .unwrap_or(true);
         if active_done && self.transition.is_none() {
             if self.active.is_some() {
@@ -1139,6 +1163,8 @@ fn loader_main(
     }
 
     let mut rng = Rng::from_time();
+    // First live track: head stretch → play, then full stretch upgrades in place.
+    let mut first_live = true;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -1161,22 +1187,27 @@ fn loader_main(
             }
 
             let path = playlist[idx].clone();
-            match prepare_one(&options, &path, idx) {
-                Ok(track) => {
-                    if !send_msg(&tx, LoaderMsg::Ready(track), &shutdown) {
-                        return;
-                    }
+            let is_first = first_live;
+            first_live = false;
+            if is_first {
+                if !prepare_first_live(&options, &path, idx, &tx, &shutdown) {
+                    return;
                 }
-                Err(e) => {
-                    // Release the permit we consumed; engine also releases on Failed,
-                    // but if send fails we must not leak. Prefer single release here
-                    // by not double-freeing: engine releases on Failed recv.
-                    let msg = LoaderMsg::Failed {
-                        path: path.clone(),
-                        message: e.to_string(),
-                    };
-                    if !send_msg(&tx, msg, &shutdown) {
-                        return;
+            } else {
+                match prepare_one(&options, &path, idx) {
+                    Ok(track) => {
+                        if !send_msg(&tx, LoaderMsg::Ready(track), &shutdown) {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = LoaderMsg::Failed {
+                            path: path.clone(),
+                            message: e.to_string(),
+                        };
+                        if !send_msg(&tx, msg, &shutdown) {
+                            return;
+                        }
                     }
                 }
             }
@@ -1231,6 +1262,117 @@ fn prepare_one(
     prepare_track(options, path, index)
 }
 
+/// Seconds of *input* audio stretched before first live playback starts.
+/// Full-track Preserve stretch is ~8s on a 7–8 min FLAC; a 20s head is ~0.3s.
+const FIRST_LIVE_HEAD_SECS: f64 = 20.0;
+
+/// Decode + head stretch → Ready, then full stretch → Upgrade.
+/// Returns false if the loader should stop (shutdown / channel closed).
+fn prepare_first_live(
+    options: &EngineOptions,
+    path: &std::path::Path,
+    index: usize,
+    tx: &SyncSender<LoaderMsg>,
+    shutdown: &AtomicBool,
+) -> bool {
+    let buffer = match decode::decode_file(path) {
+        Ok(b) => b,
+        Err(e) => {
+            return send_msg(
+                tx,
+                LoaderMsg::Failed {
+                    path: path.to_path_buf(),
+                    message: e.to_string(),
+                },
+                shutdown,
+            );
+        }
+    };
+
+    let (analysis, used_provisional) =
+        match cache::get_cached_or_provisional(path, &options.cache_dir, &buffer) {
+            Ok(v) => v,
+            Err(e) => {
+                return send_msg(
+                    tx,
+                    LoaderMsg::Failed {
+                        path: path.to_path_buf(),
+                        message: e.to_string(),
+                    },
+                    shutdown,
+                );
+            }
+        };
+
+    // Head preview so audio starts before full Preserve stretch finishes.
+    let head_frames = ((FIRST_LIVE_HEAD_SECS * f64::from(buffer.sample_rate)).round() as u64)
+        .min(buffer.frames)
+        .max(1);
+    if head_frames < buffer.frames {
+        let head = decode::AudioBuffer {
+            sample_rate: buffer.sample_rate,
+            frames: head_frames,
+            samples: buffer.samples[..head_frames as usize * 2].to_vec(),
+        };
+        match finish_prepare(options, path, index, &head, &analysis, true) {
+            Ok(preview) => {
+                if !send_msg(tx, LoaderMsg::Ready(preview), shutdown) {
+                    return false;
+                }
+            }
+            Err(e) => {
+                return send_msg(
+                    tx,
+                    LoaderMsg::Failed {
+                        path: path.to_path_buf(),
+                        message: e.to_string(),
+                    },
+                    shutdown,
+                );
+            }
+        }
+    }
+
+    let full = match finish_prepare(options, path, index, &buffer, &analysis, false) {
+        Ok(t) => t,
+        Err(e) => {
+            return send_msg(
+                tx,
+                LoaderMsg::Failed {
+                    path: path.to_path_buf(),
+                    message: e.to_string(),
+                },
+                shutdown,
+            );
+        }
+    };
+
+    // Short file: only one Ready (no separate preview). Long file: Upgrade.
+    let msg = if head_frames < buffer.frames {
+        LoaderMsg::Upgrade(full)
+    } else {
+        LoaderMsg::Ready(full)
+    };
+    if !send_msg(tx, msg, shutdown) {
+        return false;
+    }
+
+    // Warm cache in background when we skipped analyze.
+    if used_provisional {
+        let path_bg = path.to_path_buf();
+        let cache_dir = options.cache_dir.clone();
+        let _ = thread::Builder::new()
+            .name("funkot-analyze".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                if let Ok(buf) = decode::decode_file(&path_bg) {
+                    let _ = cache::get_or_analyze(&path_bg, &cache_dir, &buf);
+                }
+            });
+    }
+    true
+}
+
 /// Decode, analyze (cached), stretch, and map markers for one playlist entry.
 ///
 /// Deterministic for a given file + options; safe to call from a thread pool.
@@ -1241,7 +1383,17 @@ pub fn prepare_track(
 ) -> Result<PreparedTrack> {
     let buffer = decode::decode_file(path)?;
     let analysis = cache::get_or_analyze(path, &options.cache_dir, &buffer)?;
+    finish_prepare(options, path, index, &buffer, &analysis, false)
+}
 
+fn finish_prepare(
+    options: &EngineOptions,
+    path: &std::path::Path,
+    index: usize,
+    buffer: &decode::AudioBuffer,
+    analysis: &crate::TrackAnalysis,
+    preview: bool,
+) -> Result<PreparedTrack> {
     // Stretch so intro BPM lands on target_bpm. For Funkot, outro_bpm ≈ intro_bpm.
     let intro_bpm = if analysis.intro_bpm.is_finite() && analysis.intro_bpm > 0.0 {
         analysis.intro_bpm
@@ -1263,21 +1415,32 @@ pub fn prepare_track(
     let scale = position_scale(in_frames, out_frames);
     let bar_frames = options.bar_frames();
 
-    let mapped_fd = (analysis.first_downbeat as f64 * scale).round() as u64;
+    let mapped_fd = if preview && analysis.first_downbeat >= in_frames {
+        0
+    } else {
+        (analysis.first_downbeat as f64 * scale).round() as u64
+    };
     let mapped_outro = (analysis.outro_start as f64 * scale).round() as u64;
-    let (first_downbeat_out, outro_start_out, outro_end_anchored_out) = prepare_output_markers(
-        &rendered,
-        options.output_sample_rate,
-        out_frames,
-        analysis.first_downbeat,
-        analysis.outro_start,
-        intro_bpm,
-        buffer.sample_rate,
-        mapped_fd,
-        mapped_outro,
-        analysis.outro_bars,
-        bar_frames,
-    );
+
+    let (first_downbeat_out, outro_start_out, outro_end_anchored_out) = if preview {
+        // Hold transitions until the full Upgrade arrives.
+        let fd = mapped_fd.min(out_frames.saturating_sub(1));
+        (fd, out_frames, out_frames)
+    } else {
+        prepare_output_markers(
+            &rendered,
+            options.output_sample_rate,
+            out_frames,
+            analysis.first_downbeat,
+            analysis.outro_start,
+            intro_bpm,
+            buffer.sample_rate,
+            mapped_fd,
+            mapped_outro,
+            analysis.outro_bars,
+            bar_frames,
+        )
+    };
 
     let gain_linear = if options.gain_normalize {
         let g = (10.0f64).powf(analysis.gain_db / 20.0) as f32;
@@ -1301,6 +1464,7 @@ pub fn prepare_track(
         intro_bars: analysis.intro_bars,
         outro_bars: analysis.outro_bars,
         gain_linear,
+        preview,
     })
 }
 

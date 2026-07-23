@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use funkot_core::cache;
 use funkot_core::engine::{plan_transition, Engine, EngineEvent};
 use funkot_core::testutil::{synth_track, write_wav};
 use funkot_core::{EngineOptions, PitchMode};
@@ -176,6 +177,10 @@ fn two_track_transition_tempo_and_envelope() {
     let b = synth_track(178.0, 16, 32, 16, sr);
     write_wav(&path_a, &a).expect("write a");
     write_wav(&path_b, &b).expect("write b");
+    // Seed cache so track A isn't prepared with provisional markers (live first
+    // track skips blocking analyze on a cold cache).
+    cache::get_or_analyze(&path_a, &cache, &a).expect("seed a");
+    cache::get_or_analyze(&path_b, &cache, &b).expect("seed b");
 
     let options = EngineOptions {
         rate: 1.10,

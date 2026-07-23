@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::analysis::{analyze, reconcile_intro_outro, refine_kick_marker, SectionEstimate};
-use crate::cache::{self, get_or_analyze};
+use crate::cache::{self, get_cached_or_provisional, get_or_analyze};
 use crate::decode::AudioBuffer;
 use crate::stretch::{self, position_scale};
 use crate::testutil::{synth_track, synth_track_with_options, write_wav, SynthOptions};
@@ -418,6 +418,40 @@ fn cache_roundtrip_and_hand_edit() {
 
     let a3 = get_or_analyze(&wav_path, &cache_dir, &buf).expect("edited load");
     assert_eq!(a3.intro_bars, 8);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn provisional_skips_analyze_and_cache_write() {
+    let dir = temp_dir("cache_provisional");
+    let wav_path = dir.join("track.wav");
+    let cache_dir = dir.join("cache");
+
+    let buf = synth_track(180.0, 16, 16, 16, 44_100);
+    write_wav(&wav_path, &buf).expect("write wav");
+
+    let (a, provisional) =
+        get_cached_or_provisional(&wav_path, &cache_dir, &buf).expect("provisional");
+    assert!(provisional);
+    assert_eq!(a.intro_bpm, crate::NOMINAL_BPM);
+    assert!(a.intro_bars >= 1);
+    assert_eq!(a.outro_bars, a.intro_bars);
+    assert_eq!(a.first_downbeat, 0);
+    assert!(a.bars_estimated_low_confidence);
+    // 16+16+16 bars → section = min(64, 48/3) = 16
+    assert_eq!(a.intro_bars, 16);
+    assert!(
+        !cache_dir.exists() || cache_dir.read_dir().unwrap().next().is_none(),
+        "provisional must not write cache"
+    );
+
+    // After a real analyze, provisional path must honor the cache.
+    let real = get_or_analyze(&wav_path, &cache_dir, &buf).expect("analyze");
+    let (cached, was_provisional) =
+        get_cached_or_provisional(&wav_path, &cache_dir, &buf).expect("cached");
+    assert!(!was_provisional);
+    assert_eq!(cached, real);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
