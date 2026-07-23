@@ -633,6 +633,11 @@ impl Engine {
     ///
     /// Used by CI/`--jobs` renders after [`prepare_tracks_parallel`]. Mix math is
     /// identical to [`Self::new`]; only preparation scheduling differs.
+    ///
+    /// The first two tracks are installed synchronously. A `sync_channel(1)` loader
+    /// alone is unsafe for CPU-speed pullers: `send_msg` sleeps 50ms when the
+    /// channel is full, and release-mode render can burn past outro before the
+    /// next `Ready` is delivered (GitHub CI flake; local Docker often "wins").
     pub fn from_prepared(options: EngineOptions, tracks: Vec<PreparedTrack>) -> Result<Self> {
         if options.output_sample_rate == 0 {
             return Err(Error::Engine("output_sample_rate must be > 0".into()));
@@ -645,24 +650,34 @@ impl Engine {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
         let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(2);
-        let _ = permit_tx.try_send(());
-        let _ = permit_tx.try_send(());
+
+        let mut tracks = tracks;
+        let first = (!tracks.is_empty()).then(|| tracks.remove(0));
+        let second = (!tracks.is_empty()).then(|| tracks.remove(0));
+        let rest = tracks;
+        let rest_empty = rest.is_empty();
+
+        // Slots already filled by first/second are not free for the loader.
+        let initial_permits = 2 - usize::from(first.is_some()) - usize::from(second.is_some());
+        for _ in 0..initial_permits {
+            let _ = permit_tx.try_send(());
+        }
 
         let shutdown_flag = Arc::clone(&shutdown);
         let join = thread::Builder::new()
             .name("funkot-prepared".into())
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || prepared_loader_main(tracks, msg_tx, permit_rx, shutdown_flag))
+            .spawn(move || prepared_loader_main(rest, msg_tx, permit_rx, shutdown_flag))
             .map_err(|e| Error::Engine(format!("spawn prepared loader: {e}")))?;
 
-        Ok(Self {
+        let mut engine = Self {
             options,
             bar_frames,
             shutdown,
             loader_rx: msg_rx,
             permit_tx,
             loader_join: Some(join),
-            next_track: None,
+            next_track: second,
             active: None,
             prev: None,
             transition: None,
@@ -672,9 +687,15 @@ impl Engine {
             finished: false,
             finished_emitted: false,
             stopped: false,
-            loader_exhausted: false,
+            loader_exhausted: rest_empty,
             block_on_preview_upgrade: true,
-        })
+        };
+        if let Some(track) = first {
+            engine.start_first(track);
+        } else {
+            engine.loader_exhausted = true;
+        }
+        Ok(engine)
     }
 
     /// Realtime hosts (cpal / FFI audio callbacks): never sleep inside [`Self::render`].
