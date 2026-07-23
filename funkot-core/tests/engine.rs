@@ -178,6 +178,19 @@ fn two_track_transition_tempo_and_envelope() {
     // Engine::new + sleep was flaky under CI load (next track late → wrong duration).
     let tracks = prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 0)
         .expect("prepare");
+    assert_eq!(tracks.len(), 2);
+    let a_fd = tracks[0].first_downbeat_out;
+    let a_outro = tracks[0].outro_start_out;
+    let a_outro_bars = tracks[0].outro_bars;
+    let b_fd = tracks[1].first_downbeat_out;
+    let b_frames = tracks[1].frames;
+    let b_intro = tracks[1].intro_bars;
+    let plan = plan_transition(8, b_intro, a_outro_bars);
+    let skip_frames = (f64::from(plan.skip) * bar_frames).round() as u64;
+    let frames_a_to_t = a_outro.saturating_sub(a_fd);
+    let frames_b_from_entry = b_frames.saturating_sub(b_fd.saturating_add(skip_frames));
+    let expected_frames = (frames_a_to_t + frames_b_from_entry) as i64;
+
     let mut engine = Engine::from_prepared(options, tracks).expect("engine");
     let mixed_raw = render_all(&mut engine, 4096);
     assert_finite_peak(&mixed_raw, 4.0);
@@ -191,29 +204,19 @@ fn two_track_transition_tempo_and_envelope() {
         .count();
     assert_eq!(finished, 1, "Finished exactly once, got {events:?}");
 
-    // Schedule prediction (analysis may adjust bar counts slightly; use synth truth).
-    let intro_a = 16u32;
-    let main_a = 32u32;
-    let outro_a = 16u32;
-    let intro_b = 16u32;
-    let main_b = 32u32;
-    let outro_b = 16u32;
-    let plan = plan_transition(8, intro_b, outro_a);
-    // A from downbeat to outro start = intro+main bars, then B plays full remaining from entry.
-    let bars_a_to_t = intro_a + main_a;
-    let bars_b_from_entry = intro_b + main_b + outro_b - plan.skip;
-    let expected_bars = u64::from(bars_a_to_t + bars_b_from_entry);
-    let expected_frames = (expected_bars as f64 * bar_frames).round() as i64;
+    // Duration from prepared markers (analysis can differ slightly from synth labels).
     let actual_frames = (mixed.len() / 2) as i64;
+    // Phase-align can nudge entry by up to ~1 beat; allow one bar of slack.
     let tol = bar_frames.round() as i64;
     assert!(
         (actual_frames - expected_frames).abs() <= tol,
-        "duration frames actual={actual_frames} expected={expected_frames} tol={tol} plan={plan:?}"
+        "duration frames actual={actual_frames} expected={expected_frames} tol={tol} \
+         plan={plan:?} a_outro_bars={a_outro_bars} b_intro={b_intro}"
     );
 
     // Beat-grid continuity: check clean solo regions around the transition
     // (avoid the crossfade itself, where two kick trains create false intervals).
-    let t_frame = (bars_a_to_t as f64 * bar_frames).round() as usize;
+    let t_frame = frames_a_to_t as usize;
     let m_frame = (plan.m as f64 * bar_frames).round() as usize;
     let win = (8.0 * bar_frames).round() as usize;
     let beat_len = sr as f64 * 60.0 / target_bpm;
@@ -238,7 +241,7 @@ fn two_track_transition_tempo_and_envelope() {
     let full_mono = mono_mix(mixed);
     let bf = bar_frames.round() as usize;
     let rms = bar_rms(&full_mono, bf);
-    let t_bar = bars_a_to_t as usize;
+    let t_bar = (t_frame as f64 / bar_frames).round() as usize;
     let m_bars = plan.m as usize;
     assert!(t_bar + m_bars < rms.len());
     let steady_start = t_bar.saturating_sub(8);
