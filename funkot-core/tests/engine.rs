@@ -1,11 +1,9 @@
 //! Integration tests for the pull-based mixing engine.
 
 use std::path::PathBuf;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use funkot_core::cache;
-use funkot_core::engine::{plan_transition, Engine, EngineEvent};
+use funkot_core::engine::{plan_transition, prepare_tracks_parallel, Engine, EngineEvent};
 use funkot_core::testutil::{synth_track, write_wav};
 use funkot_core::{EngineOptions, PitchMode};
 
@@ -25,21 +23,9 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 fn render_all(engine: &mut Engine, chunk_frames: usize) -> Vec<f32> {
-    render_all_with_options(engine, chunk_frames, Duration::ZERO)
-}
-
-/// Like [`render_all`], but after the first audible chunk pauses so the loader
-/// can finish the next track. Needed because tests pull faster than realtime;
-/// without a pause the current track is consumed before the next is prepared.
-fn render_all_with_options(
-    engine: &mut Engine,
-    chunk_frames: usize,
-    pause_after_first_audio: Duration,
-) -> Vec<f32> {
     let mut out = Vec::new();
     let mut buf = vec![0.0f32; chunk_frames * 2];
     let mut started = false;
-    let mut paused = pause_after_first_audio.is_zero();
     let mut spins = 0u64;
     loop {
         let n = engine.render(&mut buf);
@@ -59,10 +45,6 @@ fn render_all_with_options(
                 continue;
             }
             started = true;
-            if !paused {
-                thread::sleep(pause_after_first_audio);
-                paused = true;
-            }
         }
         // Do not skip "silent" chunks after start: kick-only material can have
         // whole pulldown blocks between hits that are near zero.
@@ -177,10 +159,6 @@ fn two_track_transition_tempo_and_envelope() {
     let b = synth_track(178.0, 16, 32, 16, sr);
     write_wav(&path_a, &a).expect("write a");
     write_wav(&path_b, &b).expect("write b");
-    // Seed cache so track A isn't prepared with provisional markers (live first
-    // track skips blocking analyze on a cold cache).
-    cache::get_or_analyze(&path_a, &cache, &a).expect("seed a");
-    cache::get_or_analyze(&path_b, &cache, &b).expect("seed b");
 
     let options = EngineOptions {
         rate: 1.10,
@@ -196,10 +174,12 @@ fn two_track_transition_tempo_and_envelope() {
     let target_bpm = options.target_bpm(); // 198
     let bar_frames = options.bar_frames();
 
-    let mut engine = Engine::new(options, vec![path_a.clone(), path_b.clone()]).expect("engine");
-    // Pause after first audio so track B can finish offline prep before we
-    // consume A's outro at CPU speed (hosts pull in realtime; tests do not).
-    let mixed_raw = render_all_with_options(&mut engine, 4096, Duration::from_secs(120));
+    // Pre-prepare both tracks so this asserts mix math, not loader timing.
+    // Engine::new + sleep was flaky under CI load (next track late → wrong duration).
+    let tracks = prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 0)
+        .expect("prepare");
+    let mut engine = Engine::from_prepared(options, tracks).expect("engine");
+    let mixed_raw = render_all(&mut engine, 4096);
     assert_finite_peak(&mixed_raw, 4.0);
     let mixed = trim_leading_silence(&mixed_raw, 1e-5);
     assert!(!mixed.is_empty(), "expected non-silent output");
