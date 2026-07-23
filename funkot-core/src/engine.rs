@@ -1,7 +1,10 @@
 //! Two-deck mixing engine and bar-grid transition scheduler.
 //!
 //! Pull-based: a loader thread prepares tracks offline; [`Engine::render`] only
-//! mixes pre-rendered buffers and never blocks.
+//! mixes pre-rendered buffers. It does not block on first-track prepare (silence
+//! until Ready), but if a head preview is exhausted before the full-buffer
+//! Upgrade arrives it waits for that Upgrade instead of emitting unbounded
+//! silence — needed when callers pull faster than realtime (tests / offline).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -670,7 +673,9 @@ impl Engine {
 
     /// Fill `out` (interleaved stereo at `options.output_sample_rate`).
     /// Returns frames written; 0 means playback finished.
-    /// Never blocks: outputs silence while the first track is being prepared.
+    /// Outputs silence while the first track is being prepared. If a head
+    /// preview runs out before Upgrade, waits for the full buffer (see module
+    /// docs) rather than padding CPU-speed pulls with silence.
     pub fn render(&mut self, out: &mut [f32]) -> usize {
         if !out.len().is_multiple_of(2) {
             return 0;
@@ -712,6 +717,7 @@ impl Engine {
             }
 
             self.drain_loader();
+            self.await_preview_upgrade();
             self.maybe_start_or_update_transition();
 
             if self.active.is_none() && self.prev.is_none() {
@@ -829,6 +835,46 @@ impl Engine {
             }
         }
         // Else: already left this track; drop upgrade (no permit — same slot).
+    }
+
+    /// True when the active deck has consumed its head preview and still needs Upgrade.
+    fn preview_exhausted_awaiting_upgrade(&self) -> bool {
+        self.active
+            .as_ref()
+            .map(|d| d.track.preview && d.playhead >= d.track.frames)
+            .unwrap_or(false)
+    }
+
+    /// Block until Upgrade replaces an exhausted head preview.
+    ///
+    /// Realtime hosts finish the full stretch during the ~20s head, so this is a
+    /// no-op for them. CPU-speed pullers (tests, offline render) would otherwise
+    /// accumulate unbounded silence and never reach Finished.
+    fn await_preview_upgrade(&mut self) {
+        if !self.preview_exhausted_awaiting_upgrade() {
+            return;
+        }
+        loop {
+            if self.stopped || self.finished {
+                return;
+            }
+            self.drain_loader();
+            if !self.preview_exhausted_awaiting_upgrade() {
+                return;
+            }
+            // Full stretch failed or loader quit without Upgrade: end the deck.
+            if self.loader_exhausted {
+                if self.active.take().is_some() {
+                    self.release_permit();
+                }
+                self.drop_prev();
+                if self.next_track.is_none() {
+                    self.mark_finished();
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn start_first(&mut self, track: PreparedTrack) {

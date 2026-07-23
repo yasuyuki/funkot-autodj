@@ -55,17 +55,26 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             g++ libclang-dev pkg-config libasound2-dev
 
+      # Avoid KyleMayes/install-llvm-action@v2 (still declares Node.js 20; GitHub
+      # forces Node 24 and emits a deprecation warning). Install the same LLVM 18
+      # win64 package the action would fetch, for bindgen's libclang only.
       - name: Install LLVM (Windows, for bindgen)
-        if: runner.os == 'Windows'
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "18"
-
-      - name: Set LIBCLANG_PATH (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$env:LLVM_PATH\bin"
+          $ver = "18.1.8"
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$ver-win64.exe"
+          $dest = Join-Path $env:RUNNER_TEMP "llvm-$ver"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-win64.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          # NSIS: /D= must be last and unquoted; use a path without spaces.
+          Start-Process -FilePath $installer -ArgumentList "/S","/D=$dest" -Wait
+          $llvmBin = Join-Path $dest "bin"
+          if (-not (Test-Path (Join-Path $llvmBin "libclang.dll"))) {
+            throw "libclang.dll not found under $llvmBin after LLVM install"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvmBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
 
       - uses: dtolnay/rust-toolchain@master
         with:
