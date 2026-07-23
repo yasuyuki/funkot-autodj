@@ -1,0 +1,44 @@
+---
+description: 曲のつなぎ・解析変更時は testdata 実FLACで遷移WAVを生成し接続を必ず検証する
+globs: funkot-core/src/engine.rs,funkot-core/src/analysis.rs,funkot-core/src/analysis_tests.rs,funkot-core/src/cache.rs,funkot-core/examples/**/*.rs,funkot-cli/src/**/*.rs
+alwaysApply: false
+---
+
+# 実音源によるつなぎ検証（必須）
+
+曲のつなぎ（遷移・位相ロック・フェード・マーカー）またはデータ解析（intro/outro・ダウンビート・キャッシュ形状）を変更したら、合成トラックや単体テストだけでは不十分。**必ず** `testdata/` 内の実 FLAC を解析し、つなぎ部分の WAV を生成して正しく接続されているか確認する。
+
+ユニットテスト通過だけでは完了扱いにしない。変更をコミット／PR する前に本手順を実行する。
+
+## 手順
+
+1. 実プレイリストでオフラインレンダー（遷移クリップ同時出力）:
+
+```sh
+./dev.sh cargo run -p funkot-cli --release -- \
+  -l testdata/real_playlist.txt \
+  --cache-dir testdata/real-cache-v4 \
+  --render testdata/real_mix_vXX.wav \
+  --wav-format f32 \
+  --ci-fast
+```
+
+- `vXX` は未使用の版番号に更新する
+- `--transition-clip-seconds` は既定 90。遷移 WAV は `testdata/real_mix_vXX_transitions/`（`01_…` = 1→2）
+- 解析ロジック自体を変えた場合はキャッシュを再生成してからレンダーする（形状不変なら `real-cache-v4` を再利用可）
+
+2. 必要なら 2 曲の位相診断:
+
+```sh
+./dev.sh cargo run -p funkot-core --example transition_phase_diag --release -- \
+  --sr 44100 --cache-dir testdata/real-cache-v4 --rate 1.10 \
+  PREV.flac NEXT.flac
+```
+
+3. **接続チェック**（遷移クリップを聴く／診断出力を見る）:
+   - ダウンビートが揃っているか
+   - 小節頭（mod-4）がずれていないか
+   - フェード端で前曲が残っていないか・無音ドロップがないか
+   - 全遷移（1→2 / 2→3 / 3→4 / 4→5）を確認する
+
+詳細・版履歴は `HANDOFF.md` の「実音源テストセット」「ミックス版履歴」を参照。
