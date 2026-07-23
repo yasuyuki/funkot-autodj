@@ -1,6 +1,6 @@
 # funkot-autodj
 
-[English](README.md) | 日本語
+[English](README.md) | 日本語 | [Bahasa Indonesia](README_id.md)
 
 インドネシアのダンスミュージック Funkot 専用の自動DJ再生ツール。
 プレイリストを渡すと、各曲のイントロ/アウトロを解析し、DJ式のクロスフェードで

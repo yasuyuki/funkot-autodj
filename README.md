@@ -1,6 +1,6 @@
 # funkot-autodj
 
-[English](README.md) | [日本語](README_ja.md)
+[English](README.md) | [日本語](README_ja.md) | [Bahasa Indonesia](README_id.md)
 
 Auto-DJ playback for Indonesian Funkot dance music. Give it a playlist and it
 analyzes each track’s intro/outro, then crossfades DJ-style for continuous BGM.
