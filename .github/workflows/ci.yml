@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master]
+    tags: ["v*"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +34,7 @@ jobs:
 
   build:
     name: build (${{ matrix.artifact }})
+    needs: [test]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -53,7 +55,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            g++ libclang-dev pkg-config libasound2-dev
+            g++ libclang-dev pkg-config libasound2-dev zip
 
       # Avoid KyleMayes/install-llvm-action@v2 (still declares Node.js 20; GitHub
       # forces Node 24 and emits a deprecation warning). Install the same LLVM 18
@@ -87,41 +89,72 @@ jobs:
       - name: cargo build --workspace --release
         run: cargo build --workspace --release
 
-      - name: Collect artifacts (Linux)
+      - name: Package CLI and SDK (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          cp target/release/libfunkot_core.so \
-             target/release/libfunkot_core.a \
-             target/release/funkot-autodj \
-             include/funkot.h \
-             dist/
+          zip -j "dist/funkot-autodj-${{ matrix.artifact }}.zip" \
+            target/release/funkot-autodj
+          zip -j "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip" \
+            target/release/libfunkot_core.so \
+            target/release/libfunkot_core.a \
+            include/funkot.h
 
-      - name: Collect artifacts (Windows)
+      - name: Package CLI and SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $src = "target/release"
-          Copy-Item "$src/funkot_core.dll" dist/
-          Copy-Item "$src/funkot-autodj.exe" dist/
-          Copy-Item "include/funkot.h" dist/
+          $cli = "dist/cli"
+          $sdk = "dist/sdk"
+          New-Item -ItemType Directory -Force -Path $cli, $sdk | Out-Null
+          Copy-Item "$src/funkot-autodj.exe" $cli/
+          Copy-Item "$src/funkot_core.dll" $sdk/
+          Copy-Item "include/funkot.h" $sdk/
           foreach ($f in @("funkot_core.dll.lib", "funkot_core.lib")) {
-            if (Test-Path "$src/$f") { Copy-Item "$src/$f" dist/ }
+            if (Test-Path "$src/$f") { Copy-Item "$src/$f" $sdk/ }
           }
+          Compress-Archive -Path "$cli/*" -DestinationPath "dist/funkot-autodj-${{ matrix.artifact }}.zip"
+          Compress-Archive -Path "$sdk/*" -DestinationPath "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip"
+          Remove-Item -Recurse -Force $cli, $sdk
 
-      - name: Collect artifacts (macOS)
+      - name: Package CLI and SDK (macOS)
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist
-          cp target/release/libfunkot_core.dylib \
-             target/release/libfunkot_core.a \
-             target/release/funkot-autodj \
-             include/funkot.h \
-             dist/
+          zip -j "dist/funkot-autodj-${{ matrix.artifact }}.zip" \
+            target/release/funkot-autodj
+          zip -j "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip" \
+            target/release/libfunkot_core.dylib \
+            target/release/libfunkot_core.a \
+            include/funkot.h
 
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
-          path: dist/
+          path: dist/*.zip
           if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Collect zip assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -name '*.zip' -exec cp -t release-assets {} +
+          ls -la release-assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*
