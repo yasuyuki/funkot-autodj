@@ -3,9 +3,12 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use funkot_core::engine::{plan_transition, prepare_tracks_parallel, Engine, EngineEvent};
+use funkot_core::engine::{
+    align_next_entry_with_phase_hypotheses, plan_transition, prepare_tracks_parallel, Engine,
+    EngineEvent,
+};
 use funkot_core::testutil::{synth_track, write_wav};
-use funkot_core::{EngineOptions, PitchMode};
+use funkot_core::{EngineOptions, PitchMode, BEATS_PER_BAR};
 
 fn temp_dir(label: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -176,19 +179,36 @@ fn two_track_transition_tempo_and_envelope() {
 
     // Pre-prepare both tracks so this asserts mix math, not loader timing.
     // Engine::new + sleep was flaky under CI load (next track late → wrong duration).
-    let tracks = prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 0)
+    // jobs=1: avoid any cross-platform scheduling noise while preparing.
+    let tracks = prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1)
         .expect("prepare");
     assert_eq!(tracks.len(), 2);
     let a_fd = tracks[0].first_downbeat_out;
     let a_outro = tracks[0].outro_start_out;
+    let a_outro_end = tracks[0].outro_end_anchored_out;
     let a_outro_bars = tracks[0].outro_bars;
     let b_fd = tracks[1].first_downbeat_out;
     let b_frames = tracks[1].frames;
     let b_intro = tracks[1].intro_bars;
     let plan = plan_transition(8, b_intro, a_outro_bars);
     let skip_frames = (f64::from(plan.skip) * bar_frames).round() as u64;
+    let nominal_entry = b_fd.saturating_add(skip_frames);
+    let beat_frames = bar_frames / f64::from(BEATS_PER_BAR);
+    // Same phase-align the mixer runs at transition start. Scores can differ
+    // across hosts (libm/SIMD), so expected duration must use this entry —
+    // not nominal — or CI drifts by whole bars while local stays green.
+    let (entry, _nudge) = align_next_entry_with_phase_hypotheses(
+        &tracks[0].samples,
+        a_outro,
+        &tracks[1].samples,
+        nominal_entry,
+        a_outro,
+        a_outro_end,
+        sr,
+        beat_frames,
+    );
     let frames_a_to_t = a_outro.saturating_sub(a_fd);
-    let frames_b_from_entry = b_frames.saturating_sub(b_fd.saturating_add(skip_frames));
+    let frames_b_from_entry = b_frames.saturating_sub(entry);
     let expected_frames = (frames_a_to_t + frames_b_from_entry) as i64;
 
     let mut engine = Engine::from_prepared(options, tracks).expect("engine");
@@ -204,14 +224,15 @@ fn two_track_transition_tempo_and_envelope() {
         .count();
     assert_eq!(finished, 1, "Finished exactly once, got {events:?}");
 
-    // Duration from prepared markers (analysis can differ slightly from synth labels).
     let actual_frames = (mixed.len() / 2) as i64;
-    // Phase-align can nudge entry by up to ~1 beat; allow one bar of slack.
-    let tol = bar_frames.round() as i64;
+    // Micro phase refine can still move a few frames vs the pre-mix call.
+    let tol = (beat_frames * 2.0).ceil() as i64;
     assert!(
         (actual_frames - expected_frames).abs() <= tol,
         "duration frames actual={actual_frames} expected={expected_frames} tol={tol} \
-         plan={plan:?} a_outro_bars={a_outro_bars} b_intro={b_intro}"
+         plan={plan:?} entry={entry} nominal={nominal_entry} \
+         a_outro_bars={a_outro_bars} b_intro={b_intro} \
+         a_outro={a_outro} a_outro_end={a_outro_end}"
     );
 
     // Beat-grid continuity: check clean solo regions around the transition
