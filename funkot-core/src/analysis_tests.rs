@@ -46,12 +46,12 @@ fn classic_180_16_32_16() {
         a.outro_bpm
     );
     // Sharp synth outro collapses at 16; mix trigger walks back OUTRO_LEAD (→32).
-    // Intro detector still sees 16; reconcile raises intro to match outro.
-    assert_eq!(a.intro_bars, 32);
+    // Both sides high-confidence: keep intro 16 < outro 32.
+    assert_eq!(a.intro_bars, 16);
     assert_eq!(a.outro_bars, 32);
-    assert!(a.intro_bars_low_confidence);
+    assert!(!a.intro_bars_low_confidence);
     assert!(!a.outro_bars_low_confidence);
-    assert!(a.bars_estimated_low_confidence);
+    assert!(!a.bars_estimated_low_confidence);
 
     let fd_secs = a.first_downbeat as f64 / f64::from(sr);
     assert!(fd_secs.abs() < 0.05, "first_downbeat {fd_secs}s not near 0");
@@ -67,7 +67,7 @@ fn classic_180_16_32_16() {
 }
 
 #[test]
-fn bpm_178_intro32_outro8_keeps_intro_ge_outro() {
+fn bpm_178_intro32_outro8_keeps_sides() {
     let sr = 44_100;
     let bpm = 178.0;
     let buf = synth_track(bpm, 32, 32, 8, sr);
@@ -75,13 +75,6 @@ fn bpm_178_intro32_outro8_keeps_intro_ge_outro() {
 
     assert!((a.intro_bpm - bpm).abs() < 0.3, "intro_bpm {}", a.intro_bpm);
     assert!((a.outro_bpm - bpm).abs() < 0.3, "outro_bpm {}", a.outro_bpm);
-    // Confident unequal sides: keep intro >= outro (may stay 32/8).
-    assert!(
-        a.intro_bars >= a.outro_bars,
-        "intro {} < outro {}",
-        a.intro_bars,
-        a.outro_bars
-    );
     assert!(
         matches!(a.intro_bars, 8 | 16 | 24 | 32 | 48),
         "unexpected intro length {}",
@@ -109,6 +102,74 @@ fn long_track_64_bar_sections() {
     assert_eq!(a.outro_bars, 64);
     assert!(!a.bars_estimated_low_confidence);
     assert!(!a.intro_bars_low_confidence);
+    assert!(!a.outro_bars_low_confidence);
+}
+
+#[test]
+fn long_intro_80_sharp_main() {
+    let sr = 44_100;
+    let bpm = 180.0;
+    // Kick-only intro → bright main: long path sharp-rise gate at 80.
+    let buf = synth_track(bpm, 80, 32, 32, sr);
+    let a = analyze(&buf, "intro80.wav").expect("analyze");
+    assert_eq!(a.intro_bars, 80);
+    assert!(!a.intro_bars_low_confidence);
+}
+
+#[test]
+fn long_intro_96_sharp_main() {
+    let sr = 44_100;
+    let bpm = 180.0;
+    // At 80 the after-window is still kick-only intro; sharp main lands at 96.
+    let buf = synth_track(bpm, 96, 32, 32, sr);
+    let a = analyze(&buf, "intro96.wav").expect("analyze");
+    assert_eq!(a.intro_bars, 96);
+    assert!(!a.intro_bars_low_confidence);
+}
+
+#[test]
+fn intro_48_sharp_main() {
+    let sr = 44_100;
+    let bpm = 180.0;
+    let buf = synth_track(bpm, 48, 32, 32, sr);
+    let a = analyze(&buf, "intro48.wav").expect("analyze");
+    assert_eq!(a.intro_bars, 48);
+    assert!(!a.intro_bars_low_confidence);
+}
+
+#[test]
+fn short_intro_16_short_outro_keeps_unequal() {
+    let sr = 44_100;
+    let bpm = 180.0;
+    // Intro 16 / collapse at 16 → mix trigger 32; both confident → keep 16/32.
+    let buf = synth_track(bpm, 16, 48, 16, sr);
+    let a = analyze(&buf, "short_io.wav").expect("analyze");
+    assert_eq!(a.intro_bars, 16);
+    assert_eq!(a.outro_bars, 32);
+    assert!(!a.intro_bars_low_confidence);
+    assert!(!a.outro_bars_low_confidence);
+}
+
+#[test]
+fn outro_mid_plateau_rejects_early_drop_to_48() {
+    // IVY-like: sparse floor (16) + mid-outro plateau (16) before main.
+    // Early floor→plateau recovery must not become the mix trigger (32);
+    // true collapse is at 32 → +lead → 48.
+    let sr = 44_100;
+    let bpm = 180.0;
+    let buf = synth_track_with_options(SynthOptions {
+        bpm,
+        intro_bars: 16,
+        main_bars: 64,
+        outro_bars: 32,
+        sample_rate: sr,
+        outro_mid_plateau_bars: 16,
+        // Near-main brightness so after/far ≥ mid-plateau reject threshold.
+        outro_mid_plateau_level: 0.92,
+        ..SynthOptions::default()
+    });
+    let a = analyze(&buf, "ivy_outro.wav").expect("analyze");
+    assert_eq!(a.outro_bars, 48, "got intro={} outro={}", a.intro_bars, a.outro_bars);
     assert!(!a.outro_bars_low_confidence);
 }
 
@@ -152,10 +213,14 @@ fn bright_intro_outro_still_detects() {
         ..SynthOptions::default()
     });
     let a = analyze(&buf, "bright_io.wav").expect("analyze");
-    // Drop at 16 + lead → 32; intro raised to match.
+    // Drop at 16 + lead → 32; short intro may stay below outro when both confident.
     assert_eq!(a.outro_bars, 32);
-    assert!(a.intro_bars >= a.outro_bars);
     assert!(!a.outro_bars_low_confidence);
+    assert!(
+        matches!(a.intro_bars, 16 | 32 | 48 | 64),
+        "unexpected intro {}",
+        a.intro_bars
+    );
 }
 
 #[test]
@@ -174,15 +239,8 @@ fn gradual_intro_layering_detects_and_reconciles() {
         ..SynthOptions::default()
     });
     let a = analyze(&buf, "gradual.wav").expect("analyze");
-    // Intro may be longer than outro; never shorter after reconciliation.
     assert!(
-        a.intro_bars >= a.outro_bars,
-        "intro {} < outro {}",
-        a.intro_bars,
-        a.outro_bars
-    );
-    assert!(
-        matches!(a.intro_bars, 16 | 32 | 64),
+        matches!(a.intro_bars, 16 | 32 | 48 | 64 | 80 | 96),
         "unexpected intro bars {}",
         a.intro_bars
     );
@@ -211,12 +269,6 @@ fn main_body_energy_without_hf_ratio_jump() {
         ..SynthOptions::default()
     });
     let a = analyze(&buf, "body_main.wav").expect("analyze");
-    assert!(
-        a.intro_bars >= a.outro_bars,
-        "intro {} < outro {}",
-        a.intro_bars,
-        a.outro_bars
-    );
     assert!(
         matches!(a.intro_bars, 8 | 16 | 24 | 32 | 48 | 64),
         "unexpected intro bars {}",
@@ -317,10 +369,14 @@ fn reconcile_rules_unit() {
     assert_eq!((i, o), (32, 32));
     assert!(!il && !ol);
 
-    // Both confident, intro < outro → raise intro to outro; mark intro inferred.
+    // Both confident, intro < outro → keep both (short-intro tracks).
     let (i, o, il, ol) = reconcile_intro_outro(hi(32, 8.0, 4.0), hi(64, 3.0, 2.5));
-    assert_eq!((i, o), (64, 64));
-    assert!(il && !ol);
+    assert_eq!((i, o), (32, 64));
+    assert!(!il && !ol);
+
+    let (i, o, il, ol) = reconcile_intro_outro(hi(16, 5.0, 3.0), hi(32, 4.0, 2.5));
+    assert_eq!((i, o), (16, 32));
+    assert!(!il && !ol);
 
     // Intro low + outro credible 32 → max(64, 32)/32, intro stays low.
     let (i, o, il, ol) = reconcile_intro_outro(lo(16), hi(32, 6.0, 2.0));

@@ -10,9 +10,9 @@ sebagai BGM tanpa putus dengan crossfade ala DJ.
 
 - BPM dasar 180. Track yang sedikit melenceng (mis. 178 atau 181) disesuaikan
   dengan time-stretch
-- Intro/outro adalah ritme mesin tetap untuk transisi (8/16/32/64 bar). BPM di
-  tengah lagu tidak tetap/bisa berubah, jadi analisis hanya memakai awal dan
-  akhir track
+- Intro/outro adalah ritme mesin tetap untuk transisi (intro 8/16/32/48/64/80/96
+  bar, outro 8/16/32/64). BPM di tengah lagu tidak tetap/bisa berubah, jadi
+  analisis hanya memakai awal dan akhir track
 - Playback default dipercepat 10% (198 BPM). Default mempertahankan pitch;
   opsi menaikkan pitch seiring rate (gaya turntable) juga tersedia. Rate bisa
   diubah
@@ -96,11 +96,12 @@ estimasi otomatis `intro_bars` / `outro_bars` meleset, edit JSON secara
 manual untuk override (jika estimasi kurang yakin, fallback ke 64 bar dengan
 `bars_estimated_low_confidence: true`. Flag per sisi
 `intro_bars_low_confidence` / `outro_bars_low_confidence` juga dicatat.
-Intro diselaraskan agar tidak lebih pendek dari outro: `intro >= outro`).
+Jika kedua sisi high-confidence, `intro < outro` tetap dipertahankan
+(untuk intro pendek; sisi low-confidence tetap dikoreksi konservatif).
 Jika hanya mengubah `outro_bars`, sesuaikan juga `outro_start` =
 `total_frames − outro_bars × bar_len` (tidak dihitung ulang saat load).
 Perubahan format cache menaikkan `version` dan menonaktifkan JSON lama
-(saat ini v5).
+(saat ini v8).
 
 ## Struktur
 

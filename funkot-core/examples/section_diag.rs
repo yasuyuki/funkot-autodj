@@ -5,7 +5,7 @@
 //!     [--cache-dir DIR] [--no-bars] testdata/*.flac
 //!
 //! Prints mid/high ratio, RMS, and absolute HF energy per bar for the first
-//! and last ~80 bars of each track, plus current analysis results.
+//! and last ~112 bars of each track, plus current analysis results.
 //! With `--cache-dir`, also writes analysis JSON via the normal cache API.
 
 use std::path::PathBuf;

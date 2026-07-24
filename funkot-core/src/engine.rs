@@ -2503,6 +2503,58 @@ mod tests {
     }
 
     #[test]
+    fn transition_trigger_not_before_analysis_outro() {
+        // Intro-grid / end-anchored phase candidates must not pull the mix
+        // trigger earlier than end − outro_bars (analysis outro start).
+        let sr = 44_100u32;
+        let bpm = 180.0;
+        let outro_bars = 48u32;
+        let buf = synth_track(bpm, 16, 64, 32, sr);
+        let analysis = crate::analysis::analyze(&buf, "trigger.wav").expect("analyze");
+        assert_eq!(analysis.outro_bars, outro_bars);
+
+        let speed = 1.10;
+        let rendered = stretch::render_track(&buf.samples, sr, sr, speed, PitchMode::Preserve)
+            .expect("stretch");
+        let out_frames = (rendered.len() / 2) as u64;
+        let scale = position_scale(buf.frames, out_frames);
+        let target_bpm = bpm * speed;
+        let bar = f64::from(sr) * 60.0 / target_bpm * f64::from(BEATS_PER_BAR);
+        let mapped_fd = (analysis.first_downbeat as f64 * scale).round() as u64;
+        let mapped_outro = (analysis.outro_start as f64 * scale).round() as u64;
+        let (_fd, trigger, end_anchored) = prepare_output_markers(
+            &rendered,
+            sr,
+            out_frames,
+            analysis.first_downbeat,
+            analysis.outro_start,
+            analysis.intro_bpm,
+            sr,
+            mapped_fd,
+            mapped_outro,
+            analysis.outro_bars,
+            bar,
+        );
+
+        let expect = out_frames.saturating_sub((f64::from(outro_bars) * bar).round() as u64);
+        let earliest = expect.saturating_sub(bar.round() as u64);
+        assert!(
+            trigger >= earliest,
+            "intro-grid trigger before analysis outro: trigger={trigger} earliest={earliest} expect={expect}"
+        );
+        assert!(
+            end_anchored >= earliest,
+            "end-anchored before analysis outro: end={end_anchored} earliest={earliest}"
+        );
+        // Trigger must not sit far ahead of the end-based outro either.
+        let ahead = expect.saturating_sub(trigger) as f64 / bar;
+        assert!(
+            ahead < 1.5,
+            "trigger too early vs end−outro_bars: ahead={ahead:.2} bars"
+        );
+    }
+
+    #[test]
     fn fixed_tempo_markers_remain_on_grid() {
         let sr = 44_100u32;
         let bpm = 180.0;

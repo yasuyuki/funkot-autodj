@@ -32,6 +32,8 @@ pub fn synth_track(
         intro_outro_midhigh: false,
         intro_bright_level: 0.0,
         outro_bright_level: 0.0,
+        outro_mid_plateau_bars: 0,
+        outro_mid_plateau_level: 0.0,
         gradual_intro_layers: false,
         main_bass_boost: 0.0,
     })
@@ -58,6 +60,12 @@ pub struct SynthOptions {
     pub intro_bright_level: f32,
     /// Extra mid/high level in the outro (same scale as [`Self::intro_bright_level`]).
     pub outro_bright_level: f32,
+    /// Bars of partial mid/high at the start of the outro (nearest the main).
+    /// Remaining outro bars stay sparse — models a mid-outro plateau before the
+    /// final energy floor (IVY-like).
+    pub outro_mid_plateau_bars: u32,
+    /// Brightness for [`Self::outro_mid_plateau_bars`] (0..1 scale).
+    pub outro_mid_plateau_level: f32,
     /// If true, intro mid/high ramps linearly from 0 to `intro_bright_level`
     /// across the intro (gradual layering).
     pub gradual_intro_layers: bool,
@@ -80,6 +88,8 @@ impl Default for SynthOptions {
             intro_outro_midhigh: false,
             intro_bright_level: 0.0,
             outro_bright_level: 0.0,
+            outro_mid_plateau_bars: 0,
+            outro_mid_plateau_level: 0.0,
             gradual_intro_layers: false,
             main_bass_boost: 0.0,
         }
@@ -105,6 +115,10 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
     let intro_end = lead_frames + bar_frames * opt.intro_bars as usize;
     let main_end = intro_end + bar_frames * opt.main_bars as usize;
     let intro_beats = (opt.intro_bars as usize) * BEATS_PER_BAR as usize;
+    let plateau_bars = opt
+        .outro_mid_plateau_bars
+        .min(opt.outro_bars.saturating_sub(1)) as usize;
+    let plateau_end = main_end + bar_frames * plateau_bars;
 
     let mut rng = 0xC0FFEE_u32;
 
@@ -113,6 +127,7 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
         let in_intro = beat_start < intro_end;
         let in_main = beat_start >= intro_end && beat_start < main_end;
         let in_outro = beat_start >= main_end;
+        let in_outro_plateau = in_outro && beat_start < plateau_end && plateau_bars > 0;
 
         // Kick on every beat.
         add_kick(
@@ -133,6 +148,8 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
             } else {
                 bright = opt.intro_bright_level;
             }
+        } else if in_outro_plateau && opt.outro_mid_plateau_level > 0.0 {
+            bright = opt.outro_mid_plateau_level;
         } else if in_outro && opt.outro_bright_level > 0.0 {
             bright = opt.outro_bright_level;
         }

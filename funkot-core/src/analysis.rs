@@ -9,20 +9,27 @@
 //!    then refine to sample accuracy (hop quantization is not enough for DJ phase).
 //! 5. Anchor the outro grid from the track end (production ends on a bar).
 //! 6. Detect intro length via boundary contrast + edge sharpness at
-//!    {8,16,32,64}. Short lengths require a sharp step; gradual layering ramps
-//!    must not be called short with high confidence.
-//!    Outro mix trigger = full mid/high-ratio drop boundary (same snap set)
+//!    {8,16,32,48,64}, then medium/long cues at {48,80,96} (tension drop,
+//!    pre-boundary fill/shout, sharp rise) when the before-window is still
+//!    intro-like. Prefer the earliest sustained mainization; reject later
+//!    candidates when a clear earlier step already exists. Short lengths need
+//!    a sharp local step (energy or spectral); gradual layering ramps must not
+//!    be called short with high confidence. `bars >= 64` is not a free pass.
+//!    Outro mix trigger = full mid/high-ratio drop boundary at {8,16,32,64}
 //!    plus 16 bars so DJ mixing starts before the collapse (~48 bars from end
-//!    on typical Funkot). Fall back to [`FALLBACK_BARS`] (64) when ambiguous.
+//!    on typical Funkot). Short snaps whose after-window is already a mid-outro
+//!    plateau (near far-body mid/high) are rejected. Fall back to
+//!    [`FALLBACK_BARS`] (64) when ambiguous.
 //!    Mid-song material is never inspected.
-//! 7. Reconcile intro/outro with invariant `intro >= outro` (intro may be longer).
+//! 7. Reconcile intro/outro: low-confidence sides stay conservative; both
+//!    high-confidence sides are kept even when `intro < outro`.
 //! 8. Measure full-track mono RMS and derive a clamped gain.
 
 use crate::cache::CACHE_VERSION;
 use crate::decode::AudioBuffer;
 use crate::{Error, Result, TrackAnalysis, BEATS_PER_BAR, FALLBACK_BARS, TARGET_RMS_DBFS};
 
-/// Head/tail analysis window. Covers a 64-bar intro at 180 BPM (~85.3 s) + margin.
+/// Head/tail analysis window for BPM/downbeat only (section scan uses the full buffer).
 const SEGMENT_SECS: f64 = 110.0;
 /// Reject tracks shorter than this (need enough steady rhythm).
 const MIN_DURATION_SECS: f64 = 30.0;
@@ -33,12 +40,25 @@ const LOWPASS_HZ: f64 = 150.0;
 const HIGHPASS_HZ: f64 = 1500.0;
 /// Onset must exceed this fraction of the segment peak to count as a beat.
 const ONSET_REL_THRESH: f64 = 0.20;
-/// Bars scanned when looking for the intro→main / main→outro boundary.
-const MAX_SCAN_BARS: usize = 80;
-/// Plausible Funkot intro/outro lengths (bars).
+/// Bars scanned for intro→main (covers 96 + after-window).
+const MAX_SCAN_BARS_INTRO: usize = 112;
+/// Bars scanned for main→outro (keep prior 80-bar window; longer scans
+/// shift the full-drop hit and inflate outro_bars).
+const MAX_SCAN_BARS_OUTRO: usize = 80;
+/// Plausible Funkot outro lengths (bars). Intro snapping uses
+/// [`INTRO_SNAP_CANDIDATES`] (adds 48).
 const SNAP_CANDIDATES: [u32; 4] = [8, 16, 32, 64];
+/// Intro snap grid including mid-length 48-bar machine intros.
+const INTRO_SNAP_CANDIDATES: [u32; 5] = [8, 16, 32, 48, 64];
+/// Medium/long intro lengths using fill/shout/tension cues (earliest hit).
+/// 48 is handled separately with stricter cues so long 80/96 tracks are not
+/// stolen by mid-intro layer adds.
+const LONG_INTRO_CANDIDATES: [u32; 2] = [80, 96];
 /// Bars of "main body" sampled after a candidate boundary for contrast checks.
 const AFTER_WIN_BARS: usize = 8;
+/// Absolute snap slack (bars) when relative tolerance alone is too tight
+/// (e.g. raw outro drop at 21 → 16).
+const SNAP_ABS_TOLERANCE: u32 = 6;
 /// Absolute mainness floor (dB-equivalent vs early baseline) to enter the main.
 const MAINNESS_ENTER: f64 = 2.0;
 /// Require this many consecutive bars above a soft mainness floor.
@@ -51,8 +71,6 @@ const MAINNESS_SMOOTH: usize = 2;
 const SNAP_TOLERANCE: f64 = 0.25;
 /// Minimum boundary contrast at the snapped length for confidence.
 const MIN_BOUNDARY_SCORE: f64 = 1.8;
-/// Near-tie band when resolving candidate boundary scores.
-const SCORE_TIE_FRAC: f64 = 0.15;
 /// Minimum score margin for a unique candidate winner.
 const MIN_SCORE_MARGIN: f64 = 0.45;
 /// Minimum edge sharpness for an 8-bar section (must be very crisp).
@@ -66,6 +84,12 @@ const GRADUAL_SPREAD_DB: f64 = 2.5;
 /// Bars before the full energy-drop to place the DJ outro / mix trigger.
 /// Real Funkot full-drop ≈ end−32; mix trigger ≈ end−48.
 const OUTRO_LEAD_BARS: u32 = 16;
+/// Short full-drop snaps (≤16) whose after-window sits in this fraction of the
+/// far-body mid/high median are mid-outro plateaus (recovered vs floor, but not
+/// yet full main). Below the band = still sparse (Sakura); at/above ~1.0 = main
+/// already (classic 16-bar collapse). Reject only the mid band.
+const OUTRO_MID_PLATEAU_FRAC_LO: f64 = 0.75;
+const OUTRO_MID_PLATEAU_FRAC_HI: f64 = 0.98;
 /// Default search radius for sample-accurate kick refinement (ms).
 const KICK_REFINE_RADIUS_MS: f64 = 40.0;
 /// Fine hop for kick envelope inside the refine window.
@@ -181,16 +205,14 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
 
 /// Reconcile independently estimated intro/outro lengths.
 ///
-/// Invariant: `intro >= outro` (intro may be longer than outro, never shorter).
-/// Conservative rules:
+/// Conservative rules (engine already shortens fades when intro/outro are short):
 /// - Both low-confidence → [`FALLBACK_BARS`] (64) for both, both low.
 /// - Intro low / outro credible → intro = `max(FALLBACK_BARS, outro)` (prefer
 ///   longer when ambiguous); keep intro low-confidence; preserve outro.
-/// - Outro low / intro credible → outro = `min(FALLBACK_BARS, intro)` (never
-///   longer than intro); keep outro low-confidence; preserve intro.
-/// - Both confident and `intro >= outro` → keep both even if unequal.
-/// - Both confident and `intro < outro` → raise intro to outro; mark intro as
-///   inferred/low-confidence (never lower the reliable outro).
+/// - Outro low / intro credible → outro = `min(FALLBACK_BARS, intro)` when
+///   intro is the only credible side (avoid inventing a longer outro); keep
+///   outro low-confidence; preserve intro.
+/// - Both confident → keep both even when `intro < outro` (short-intro tracks).
 ///
 /// Per-side confidence flags stay meaningful; the aggregate is their OR.
 pub fn reconcile_intro_outro(
@@ -211,12 +233,8 @@ pub fn reconcile_intro_outro(
         return (intro.bars, outro_bars, false, true);
     }
 
-    // Both confident.
-    if intro.bars >= outro.bars {
-        return (intro.bars, outro.bars, false, false);
-    }
-    // intro < outro: suspicious intro — raise to outro, mark intro inferred.
-    (outro.bars, outro.bars, true, false)
+    // Both confident: trust each side (including intro < outro).
+    (intro.bars, outro.bars, false, false)
 }
 
 /// Refine a kick/downbeat frame on interleaved stereo near `approx_frame`.
@@ -945,11 +963,15 @@ fn detect_section_bars(
     dir: SectionDir,
 ) -> Result<SectionEstimate> {
     let bar_len_frames = bar_len.round().max(1.0) as u64;
+    let max_scan = match dir {
+        SectionDir::Forward => MAX_SCAN_BARS_INTRO,
+        SectionDir::Backward => MAX_SCAN_BARS_OUTRO,
+    };
     let n_bars = match dir {
         SectionDir::Forward => {
-            MAX_SCAN_BARS.min(((buffer.frames.saturating_sub(anchor)) / bar_len_frames) as usize)
+            max_scan.min(((buffer.frames.saturating_sub(anchor)) / bar_len_frames) as usize)
         }
-        SectionDir::Backward => MAX_SCAN_BARS.min((anchor / bar_len_frames) as usize),
+        SectionDir::Backward => max_scan.min((anchor / bar_len_frames) as usize),
     };
     // Need at least one snap candidate + a short after-window.
     if n_bars < SNAP_CANDIDATES[0] as usize + 4 {
@@ -1054,6 +1076,10 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
         .iter()
         .copied()
         .fold(0.0f64, f64::max);
+    let far_hi = (far_lo + 16).min(ratio.len());
+    let mut far_vals = ratio[far_lo..far_hi].to_vec();
+    far_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let far_med = far_vals[far_vals.len() / 2];
     // Need a clear mid/high recovery past the drop floor (≈0.06–0.1 → 0.15+).
     if peak < floor * 1.35 && (peak - floor) < 0.03 {
         return None;
@@ -1088,6 +1114,21 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
         let after_n = AFTER_WIN_BARS.min(feats.len() - c).max(4);
         let before = &feats[..c];
         let after = &feats[c..c + after_n];
+        // Short snap into a mid-outro plateau (after/far in (lo, hi)) is not the
+        // main→outro collapse; keep searching. Sparse after (Sakura) and full-main
+        // after (classic 16-bar floor) are kept.
+        if bars <= 16 {
+            let mut after_vals: Vec<f64> = ratio[c..c + after_n].to_vec();
+            after_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let after_med = after_vals[after_vals.len() / 2];
+            let rel = after_med / far_med.max(1e-9);
+            if after_med >= enter * 0.9
+                && rel >= OUTRO_MID_PLATEAU_FRAC_LO
+                && rel < OUTRO_MID_PLATEAU_FRAC_HI
+            {
+                continue;
+            }
+        }
         return Some(SectionEstimate {
             bars,
             low_confidence: false,
@@ -1115,7 +1156,7 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
         if score < MIN_BOUNDARY_SCORE {
             continue;
         }
-        if !passes_short_sharpness_gate(cand, before, sharpness) {
+        if !passes_short_sharpness_gate(cand, before, after, sharpness) {
             continue;
         }
         scored.push(SectionEstimate {
@@ -1187,9 +1228,19 @@ fn snap_to_bar_grid(bars: u32) -> u32 {
 
 /// Choose a snap length from per-bar features, or fall back when ambiguous.
 ///
-/// Short {8,16,32} lengths require a sharp boundary. Gradual layering ramps
-/// (typical Funkot intros/outros) are not accepted as short with high confidence.
+/// Long {80,96} intros are tried first, then a stricter mid-length {48} cue
+/// path, then the earliest sustained short boundary. Short {8,16,32} lengths
+/// require a sharp boundary; gradual layering ramps are not accepted as short
+/// with high confidence. Mainness and candidate scoring prefer the earliest
+/// sustained boundary and reject later ones that already contain a clear
+/// earlier step.
 fn pick_section_bars(feats: &[BarFeat]) -> SectionEstimate {
+    if let Some(hit) = pick_long_intro_bars(feats) {
+        return hit;
+    }
+    if let Some(hit) = pick_medium_intro_48(feats) {
+        return hit;
+    }
     if let Some(hit) = pick_by_mainness_onset(feats) {
         return hit;
     }
@@ -1202,6 +1253,216 @@ fn pick_section_bars(feats: &[BarFeat]) -> SectionEstimate {
         score: 0.0,
         sharpness: 0.0,
     }
+}
+
+/// Detect 80/96-bar intros using cues that energy-rise scoring alone misses.
+///
+/// Real Funkot often keeps adding layers at 32/64 while the DJ intro continues.
+/// Accept the earliest of {80,96} when the before-window is still intro-like
+/// and one of: sustained tension drop, pre-boundary fill (+ spectral shift),
+/// HF-ratio shout spike, or a sharp classic rise.
+fn pick_long_intro_bars(feats: &[BarFeat]) -> Option<SectionEstimate> {
+    for &cand in &LONG_INTRO_CANDIDATES {
+        if let Some(est) = long_intro_candidate(feats, cand) {
+            return Some(est);
+        }
+    }
+    None
+}
+
+/// 48-bar intros: same family as long cues, but stricter and blocked when an
+/// earlier clear main step already exists (avoids stealing 16/80/96 tracks).
+fn pick_medium_intro_48(feats: &[BarFeat]) -> Option<SectionEstimate> {
+    const CAND: u32 = 48;
+    let c = CAND as usize;
+    if c + AFTER_WIN_BARS > feats.len() {
+        return None;
+    }
+    if before_has_clear_main_step(feats, c) {
+        return None;
+    }
+    if !long_intro_before_is_intro_like(feats, c) {
+        return None;
+    }
+
+    let after_n = AFTER_WIN_BARS.min(feats.len() - c).max(4);
+    let before = &feats[..c];
+    let after = &feats[c..c + after_n];
+    let score = boundary_score(before, after);
+    let sharpness = edge_sharpness(before, after);
+    let pre = &feats[c - 4..c];
+    let post = &feats[c..c + 4];
+    let local_drop = median_db(pre, |f| f.rms) - median_db(post, |f| f.rms);
+    let fill_lo = c.saturating_sub(10).max(c - 8);
+    let fill_base = median_db(&feats[fill_lo..c - 2], |f| f.rms);
+    let fill_peak = feats[c - 2..c]
+        .iter()
+        .map(|f| amp_to_db(f.rms.max(SILENCE_EPS)))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let fill = fill_peak - fill_base;
+    let comp = (median_f(post, |f| f.midhigh_ratio) - median_f(pre, |f| f.midhigh_ratio)).abs();
+    let shout = ratio_anomaly_peak(feats, c);
+    let local_rise = local_boundary_rise(pre, post);
+    let local_ratio = local_ratio_step(pre, post);
+
+    // Stricter than {80,96}: weak tension-drop / mild score must not win.
+    let ok = shout >= 0.08
+        || local_rise >= 3.0
+        || local_ratio >= 3.0
+        || (fill >= 2.0 && comp >= 0.03 && local_drop < 1.0)
+        || (score >= 3.0 && sharpness.max(local_rise).max(local_ratio) >= 3.0);
+    if !ok {
+        return None;
+    }
+
+    Some(SectionEstimate {
+        bars: CAND,
+        low_confidence: false,
+        score: score
+            .max(fill)
+            .max(local_rise)
+            .max(local_ratio)
+            .max(shout * 10.0),
+        sharpness: sharpness.max(local_rise).max(local_ratio),
+    })
+}
+
+fn long_intro_candidate(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate> {
+    let c = cand as usize;
+    // 48 needs a slightly shorter mature window than 80/96.
+    let min_before = if cand <= 48 { 24 } else { 32 };
+    if c < min_before || c + AFTER_WIN_BARS > feats.len() {
+        return None;
+    }
+    if !long_intro_before_is_intro_like(feats, c) {
+        return None;
+    }
+
+    let after_n = AFTER_WIN_BARS.min(feats.len() - c).max(4);
+    let before = &feats[..c];
+    let after = &feats[c..c + after_n];
+    let score = boundary_score(before, after);
+    let sharpness = edge_sharpness(before, after);
+
+    let before8 = &feats[c - 8..c];
+    let after8 = &feats[c..c + 8];
+    let pre = &feats[c - 4..c];
+    let post = &feats[c..c + 4];
+    let drop = median_db(before8, |f| f.rms) - median_db(after8, |f| f.rms);
+    let local_drop = median_db(pre, |f| f.rms) - median_db(post, |f| f.rms);
+    let fill_lo = c.saturating_sub(10).max(c - 8);
+    let fill_base = median_db(&feats[fill_lo..c - 2], |f| f.rms);
+    let fill_peak = feats[c - 2..c]
+        .iter()
+        .map(|f| amp_to_db(f.rms.max(SILENCE_EPS)))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let fill = fill_peak - fill_base;
+    let comp = (median_f(post, |f| f.midhigh_ratio) - median_f(pre, |f| f.midhigh_ratio)).abs();
+    let shout = ratio_anomaly_peak(feats, c);
+    // Local step without full-window variance penalty (gradual intros kill
+    // [`edge_sharpness`] even when the boundary itself is crisp).
+    let local_rise = local_boundary_rise(pre, post);
+    let local_ratio = local_ratio_step(pre, post);
+
+    let ok = drop >= 2.0
+        || (fill >= 1.5 && local_drop < 1.0)
+        || (fill >= 1.5 && comp >= 0.025 && local_drop < 1.5)
+        || shout >= 0.08
+        || local_rise >= 2.5
+        || local_ratio >= 2.5
+        || (score >= 2.0 && sharpness.max(local_rise).max(local_ratio) >= 2.5);
+    if !ok {
+        return None;
+    }
+
+    Some(SectionEstimate {
+        bars: cand,
+        low_confidence: false,
+        score: score
+            .max(drop)
+            .max(fill)
+            .max(local_rise)
+            .max(local_ratio)
+            .max(shout * 10.0),
+        sharpness: sharpness.max(local_rise).max(local_ratio),
+    })
+}
+
+/// Positive dB step across the 4 bars before/after a candidate (no variance penalty).
+fn local_boundary_rise(pre: &[BarFeat], post: &[BarFeat]) -> f64 {
+    let mut step = 0.0;
+    step += (median_db(post, |f| f.rms) - median_db(pre, |f| f.rms)).max(0.0);
+    step += (median_db(post, |f| f.hf_energy.sqrt()) - median_db(pre, |f| f.hf_energy.sqrt())).max(0.0);
+    step += (median_db(post, |f| f.mid_energy.sqrt()) - median_db(pre, |f| f.mid_energy.sqrt())).max(0.0);
+    step
+}
+
+/// Positive mid/high-ratio step in dB across local before/after windows.
+fn local_ratio_step(pre: &[BarFeat], post: &[BarFeat]) -> f64 {
+    let rb = median_f(pre, |f| f.midhigh_ratio).max(1e-8);
+    let ra = median_f(post, |f| f.midhigh_ratio).max(1e-8);
+    (20.0 * (ra / rb).log10()).max(0.0)
+}
+
+/// Before-window still resembles the mature intro (not already in the main body).
+fn long_intro_before_is_intro_like(feats: &[BarFeat], c: usize) -> bool {
+    let early_hi = 32.min(c.saturating_sub(8)).max(20);
+    let early_lo = 16.min(early_hi.saturating_sub(8));
+    if early_hi <= early_lo + 4 {
+        return false;
+    }
+    let mature_lo = (c - 32).max(early_hi);
+    let mature_hi = c - 8;
+    if mature_hi <= mature_lo + 4 {
+        // Short medium intros: compare before-8 to early intro only.
+        let early = median_db(&feats[early_lo..early_hi], |f| f.rms);
+        let early_mid = median_db(&feats[early_lo..early_hi], |f| f.mid_energy.sqrt());
+        let before = median_db(&feats[c - 8..c], |f| f.rms);
+        let before_mid = median_db(&feats[c - 8..c], |f| f.mid_energy.sqrt());
+        if before < early - 1.5 {
+            return false;
+        }
+        if before_mid > early_mid + 4.0 && before > early + 3.0 {
+            return false;
+        }
+        return true;
+    }
+    let early = median_db(&feats[early_lo..early_hi], |f| f.rms);
+    let early_mid = median_db(&feats[early_lo..early_hi], |f| f.mid_energy.sqrt());
+    let mature = median_db(&feats[mature_lo..mature_hi], |f| f.rms);
+    let before = median_db(&feats[c - 8..c], |f| f.rms);
+    let before_mid = median_db(&feats[c - 8..c], |f| f.mid_energy.sqrt());
+    // Still near the preceding intro level (reject post-breakdown quiet).
+    if before < mature - 1.5 || before > mature + 2.0 {
+        return false;
+    }
+    // Not already a clear main-body mid jump vs early intro.
+    if before_mid > early_mid + 4.0 && before > early + 3.0 {
+        return false;
+    }
+    true
+}
+
+fn ratio_anomaly_peak(feats: &[BarFeat], c: usize) -> f64 {
+    [c.saturating_sub(1), c, c + 1]
+        .into_iter()
+        .filter(|&i| i > 1 && i + 1 < feats.len())
+        .map(|i| {
+            let mut neigh = Vec::with_capacity(4);
+            for j in i.saturating_sub(2)..i {
+                neigh.push(feats[j].midhigh_ratio);
+            }
+            for j in (i + 1)..(i + 3).min(feats.len()) {
+                neigh.push(feats[j].midhigh_ratio);
+            }
+            if neigh.is_empty() {
+                return 0.0;
+            }
+            neigh.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let base = neigh[neigh.len() / 2];
+            feats[i].midhigh_ratio - base
+        })
+        .fold(0.0f64, f64::max)
 }
 
 fn pick_by_mainness_onset(feats: &[BarFeat]) -> Option<SectionEstimate> {
@@ -1236,16 +1497,22 @@ fn pick_by_mainness_onset(feats: &[BarFeat]) -> Option<SectionEstimate> {
         return None;
     }
 
-    // Prefer later snap-aligned onsets that pass the sharpness gate (real Funkot
-    // mains sit at 64 after a long ramp; early sustained rises are layer adds).
-    let mut best: Option<SectionEstimate> = None;
-    for &raw in onsets.iter().rev() {
-        let (bars, snap_low) = snap_bars(raw as u32);
+    // Prefer the earliest snap-aligned onset that passes the boundary gate.
+    // Later mid-main builds must not overwrite a true short-intro boundary.
+    for &raw in &onsets {
+        let (bars, snap_low) = snap_intro_bars(raw as u32);
         if snap_low {
             continue;
         }
         let c = bars as usize;
         if c + 4 > feats.len() {
+            continue;
+        }
+        // Mid-ramp 8-bar layer adds are not mains; crisp 8-bar intros are OK.
+        if bars == 8 && still_climbing_after(feats, c) {
+            continue;
+        }
+        if before_has_clear_main_step(feats, c) {
             continue;
         }
         let after_n = AFTER_WIN_BARS.min(feats.len() - c).max(4);
@@ -1256,32 +1523,27 @@ fn pick_by_mainness_onset(feats: &[BarFeat]) -> Option<SectionEstimate> {
         if contrast < MIN_BOUNDARY_SCORE {
             continue;
         }
-        if !passes_short_sharpness_gate(bars, before, sharp) {
+        if !passes_short_sharpness_gate(bars, before, after, sharp) {
             continue;
         }
-        let est = SectionEstimate {
+        return Some(SectionEstimate {
             bars,
             low_confidence: false,
             score: contrast,
             sharpness: sharp,
-        };
-        best = Some(match best {
-            Some(prev) if prev.score >= est.score && prev.bars >= est.bars => prev,
-            _ => est,
         });
-        // First passing candidate from the end is the latest plausible boundary.
-        if best.is_some() {
-            break;
-        }
     }
-    best
+    None
 }
 
 fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
-    let mut scored: Vec<SectionEstimate> = Vec::with_capacity(SNAP_CANDIDATES.len());
-    for &cand in &SNAP_CANDIDATES {
+    let mut scored: Vec<SectionEstimate> = Vec::with_capacity(INTRO_SNAP_CANDIDATES.len());
+    for &cand in &INTRO_SNAP_CANDIDATES {
         let c = cand as usize;
         if c < 4 || c + 4 > feats.len() {
+            continue;
+        }
+        if before_has_clear_main_step(feats, c) {
             continue;
         }
         let after_n = AFTER_WIN_BARS.min(feats.len() - c).max(4);
@@ -1292,7 +1554,13 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
         if score < MIN_BOUNDARY_SCORE {
             continue;
         }
-        if !passes_short_sharpness_gate(cand, before, sharpness) {
+        if !passes_short_sharpness_gate(cand, before, after, sharpness) {
+            continue;
+        }
+        // 8-bar hits that keep climbing afterward are mid-intro layer adds.
+        // (Do not judge gradual on feats[..16] — that includes the after-window
+        // and rejects true crisp 8-bar intros.)
+        if cand == 8 && still_climbing_after(feats, c) {
             continue;
         }
         scored.push(SectionEstimate {
@@ -1314,38 +1582,40 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
         return None;
     }
 
-    let tie_floor = best_score * (1.0 - SCORE_TIE_FRAC);
-    let tied: Vec<&SectionEstimate> = scored.iter().filter(|s| s.score >= tie_floor).collect();
-    let best = scored.iter().max_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.bars.cmp(&b.bars))
-    })?;
-    let runner_up = scored
+    // Prefer earliest credible boundary (short intros over mid-main false hits).
+    // 8-bar is only used when it is the sole survivor (else layer-adds win).
+    let mut pool: Vec<SectionEstimate> = scored
+        .iter()
+        .copied()
+        .filter(|s| s.bars > 8)
+        .collect();
+    if pool.is_empty() {
+        pool = scored;
+    }
+    pool.sort_by(|a, b| {
+        a.bars
+            .cmp(&b.bars)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let best = pool.first()?;
+    let runner_up = pool
         .iter()
         .filter(|s| s.bars != best.bars)
         .map(|s| s.score)
         .fold(0.0f64, f64::max);
-    let margin = best_score - runner_up;
+    let margin = best.score - runner_up;
 
     // Reject early 8-bar hits unless they dominate clearly.
-    if best.bars == 8 && margin < MIN_SCORE_MARGIN * 2.0 {
+    if best.bars == 8 && margin < MIN_SCORE_MARGIN * 2.0 && best.score < MIN_BOUNDARY_SCORE * 2.0 {
         return None;
     }
 
-    // Near-ties among short lengths: prefer longer (avoids mid-intro layer adds).
-    if tied.len() > 1 {
-        let longest = tied.iter().map(|s| s.bars).max()?;
-        if longest == 64 || (longest >= 32 && best.bars < longest && margin < MIN_SCORE_MARGIN) {
-            let long_est = scored.iter().find(|s| s.bars == longest)?;
-            return Some(*long_est);
-        }
-    }
-
-    let accept = (tied.len() == 1
-        && (margin >= MIN_SCORE_MARGIN || best_score >= MIN_BOUNDARY_SCORE * 2.0))
-        || (best.bars == 64 && best_score >= MIN_BOUNDARY_SCORE);
+    let accept = margin >= MIN_SCORE_MARGIN || best.score >= MIN_BOUNDARY_SCORE * 2.0;
     if accept {
         Some(*best)
     } else {
@@ -1353,36 +1623,128 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
     }
 }
 
-fn passes_short_sharpness_gate(bars: u32, before: &[BarFeat], sharpness: f64) -> bool {
-    if bars >= 64 {
+/// True when `[0..c]` already contains an earlier snap candidate with a clear
+/// sustained mainization — later candidates must not overwrite that boundary.
+fn before_has_clear_main_step(feats: &[BarFeat], c: usize) -> bool {
+    for &cand in &INTRO_SNAP_CANDIDATES {
+        let k = cand as usize;
+        if k < 8 || k + AFTER_WIN_BARS > c {
+            continue;
+        }
+        let before = &feats[..k];
+        let after = &feats[k..k + AFTER_WIN_BARS];
+        let score = boundary_score(before, after);
+        let sharp = edge_sharpness(before, after);
+        if score < MIN_BOUNDARY_SCORE * 1.15 {
+            continue;
+        }
+        if !passes_short_sharpness_gate(cand, before, after, sharp) {
+            continue;
+        }
+        // Mid-intro layer adds keep climbing; they must not block later mains.
+        if still_climbing_after(feats, k) {
+            continue;
+        }
+        // Require the after-window to stay elevated vs the early intro baseline.
+        if !after_stays_mainlike(feats, k) {
+            continue;
+        }
         return true;
     }
+    false
+}
+
+fn after_stays_mainlike(feats: &[BarFeat], k: usize) -> bool {
+    if k + MAINNESS_SUSTAIN > feats.len() || k < 4 {
+        return false;
+    }
+    let baseline = &feats[..4.min(k)];
+    let mainness: Vec<f64> = feats[..(k + MAINNESS_SUSTAIN).min(feats.len())]
+        .iter()
+        .map(|f| bar_mainness(f, baseline))
+        .collect();
+    let soft = MAINNESS_ENTER * 0.6;
+    // Spectral sustain: midhi after boundary stays above early intro.
+    let early_r = median_f(&feats[..4.min(k)], |f| f.midhigh_ratio);
+    let after_r = median_f(
+        &feats[k..(k + AFTER_WIN_BARS).min(feats.len())],
+        |f| f.midhigh_ratio,
+    );
+    let spectral_ok = after_r >= early_r + 0.04
+        || (early_r > 1e-8 && after_r / early_r.max(1e-8) >= 1.35);
+    let energy_ok = mainness
+        .get(k..k + MAINNESS_SUSTAIN)
+        .map(|w| w.iter().filter(|&&v| v >= soft).count() >= MAINNESS_SUSTAIN * 2 / 3)
+        .unwrap_or(false);
+    spectral_ok || energy_ok
+}
+
+/// True when energy/spectrum keeps rising after `c` — mid-intro layering, not main.
+fn still_climbing_after(feats: &[BarFeat], c: usize) -> bool {
+    if c + 12 > feats.len() {
+        return false;
+    }
+    let near = median_db(&feats[c..c + 4], |f| f.rms);
+    let later = median_db(&feats[c + 8..c + 12], |f| f.rms);
+    if (later - near) >= GRADUAL_SPREAD_DB * 0.8 {
+        return true;
+    }
+    let near_r = median_f(&feats[c..c + 4], |f| f.midhigh_ratio);
+    let later_r = median_f(&feats[c + 8..c + 12], |f| f.midhigh_ratio);
+    later_r >= near_r + 0.04
+        || (near_r > 1e-8 && later_r / near_r.max(1e-8) >= 1.35)
+}
+
+fn passes_short_sharpness_gate(
+    bars: u32,
+    before: &[BarFeat],
+    after: &[BarFeat],
+    sharpness: f64,
+) -> bool {
+    let n_b = before.len().min(4);
+    let n_a = after.len().min(4);
+    let (local_rise, local_ratio) = if n_b > 0 && n_a > 0 {
+        let pre = &before[before.len() - n_b..];
+        let post = &after[..n_a];
+        (local_boundary_rise(pre, post), local_ratio_step(pre, post))
+    } else {
+        (0.0, 0.0)
+    };
+    // Energy sharpness can be zero on breakdown-into-main (RMS drops); ratio
+    // and local rise still mark a crisp section change.
+    let effective = sharpness.max(local_rise).max(local_ratio);
+
     let gradual = before_is_gradual(before);
     let min_sharp = match bars {
         8 => MIN_SHARP_8,
-        16 | 32 if gradual => MIN_SHARP_SHORT_GRADUAL,
-        16 | 32 => MIN_SHARP_SHORT,
+        16 | 32 | 48 if gradual => MIN_SHARP_SHORT_GRADUAL,
+        16 | 32 | 48 => MIN_SHARP_SHORT,
+        // 64+ used to free-pass; require a real gate so mid-main builds lose.
+        _ if gradual => MIN_SHARP_SHORT_GRADUAL,
         _ => MIN_SHARP_SHORT,
     };
-    sharpness >= min_sharp
+    effective >= min_sharp
 }
 
 fn before_is_gradual(before: &[BarFeat]) -> bool {
     if before.len() < 8 {
         return false;
     }
-    // RMS spread across the before-window: layering intros climb several dB.
-    if window_spread_db(before) >= GRADUAL_SPREAD_DB {
-        return true;
-    }
-    // Monotonic-ish mainness proxy: early quarter vs late quarter RMS.
+    // Monotonic layering: early quarter vs late quarter (RMS or mid/high share).
+    // (Raw min-max spread is too sensitive to single fill spikes.)
     let q = before.len() / 4;
     if q == 0 {
         return false;
     }
     let early = median_db(&before[..q], |f| f.rms);
     let late = median_db(&before[before.len() - q..], |f| f.rms);
-    (late - early) >= GRADUAL_SPREAD_DB * 0.8
+    if (late - early) >= GRADUAL_SPREAD_DB * 0.8 {
+        return true;
+    }
+    let early_r = median_f(&before[..q], |f| f.midhigh_ratio);
+    let late_r = median_f(&before[before.len() - q..], |f| f.midhigh_ratio);
+    late_r >= early_r + 0.04
+        || (early_r > 1e-8 && late_r / early_r.max(1e-8) >= 1.35)
 }
 
 fn bar_mainness(bar: &BarFeat, baseline: &[BarFeat]) -> f64 {
@@ -1413,9 +1775,17 @@ fn smooth_series(vals: &[f64], win: usize) -> Vec<f64> {
 }
 
 fn snap_bars(raw: u32) -> (u32, bool) {
-    let mut best = SNAP_CANDIDATES[0];
+    snap_to_candidates(raw, &SNAP_CANDIDATES)
+}
+
+fn snap_intro_bars(raw: u32) -> (u32, bool) {
+    snap_to_candidates(raw, &INTRO_SNAP_CANDIDATES)
+}
+
+fn snap_to_candidates(raw: u32, candidates: &[u32]) -> (u32, bool) {
+    let mut best = candidates[0];
     let mut best_dist = u32::MAX;
-    for &c in &SNAP_CANDIDATES {
+    for &c in candidates {
         let d = raw.abs_diff(c);
         if d < best_dist {
             best_dist = d;
@@ -1423,7 +1793,8 @@ fn snap_bars(raw: u32) -> (u32, bool) {
         }
     }
     let rel = f64::from(best_dist) / f64::from(best.max(1));
-    if rel > SNAP_TOLERANCE {
+    // Absolute slack covers near-misses like raw=21 → 16 (rel 0.31 > 0.25).
+    if rel > SNAP_TOLERANCE && best_dist > SNAP_ABS_TOLERANCE {
         (FALLBACK_BARS, true)
     } else {
         (best, false)
@@ -1562,11 +1933,15 @@ fn bar_diag_rows(
     dir: SectionDir,
 ) -> Result<Vec<BarDiag>> {
     let bar_len_frames = bar_len.round().max(1.0) as u64;
+    let max_scan = match dir {
+        SectionDir::Forward => MAX_SCAN_BARS_INTRO,
+        SectionDir::Backward => MAX_SCAN_BARS_OUTRO,
+    };
     let n_bars = match dir {
         SectionDir::Forward => {
-            MAX_SCAN_BARS.min(((buffer.frames.saturating_sub(anchor)) / bar_len_frames) as usize)
+            max_scan.min(((buffer.frames.saturating_sub(anchor)) / bar_len_frames) as usize)
         }
-        SectionDir::Backward => MAX_SCAN_BARS.min((anchor / bar_len_frames) as usize),
+        SectionDir::Backward => max_scan.min((anchor / bar_len_frames) as usize),
     };
     let starts: Vec<u64> = (0..n_bars)
         .map(|i| match dir {

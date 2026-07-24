@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Cache format version; bump when the analyzer changes incompatibly.
-pub const CACHE_VERSION: u32 = 5;
+pub const CACHE_VERSION: u32 = 8;
 
 const HASH_CHUNK: u64 = 64 * 1024;
 

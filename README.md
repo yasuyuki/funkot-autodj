@@ -44,8 +44,8 @@ Supported formats: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV.
 ## Funkot assumptions (short)
 
 - Base BPM 180; slight mismatches are time-stretched to match
-- Intro/outro are fixed machine-rhythm sections (8/16/32/64 bars); analysis
-  uses only the start and end of each track
+- Intro/outro are fixed machine-rhythm sections (intro 8/16/32/48/64/80/96 bars,
+  outro 8/16/32/64); analysis uses only the start and end of each track
 - Default playback is 10% faster (198 BPM), pitch-preserved unless
   `--pitch-shift` is set
 - Transition is scheduled from the **next track’s intro end (T0)**: next enters

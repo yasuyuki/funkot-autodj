@@ -53,8 +53,7 @@
         "intro_bars_min": 8,
         "intro_bpm": 178.0,
         "outro_bars_max": 48,
-        "outro_start_tol_secs": 0.2,
-        "require_intro_ge_outro": true
+        "outro_start_tol_secs": 0.2
       },
       "file": "unequal_178_i16_m8_o8.wav",
       "synth": {
