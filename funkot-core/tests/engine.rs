@@ -408,14 +408,25 @@ fn pitch_mode_shift_duration() {
         output_sample_rate: sr,
         cache_dir: cache,
     };
+    // Pre-prepare: Engine::new first-live preview/upgrade raced under CI load
+    // (duration ≈2× expected). Assert Shift math, not loader timing.
     // speed = target/intro ≈ 1.10 when intro analyzes as 180.
-    let mut engine = Engine::new(options, vec![path]).expect("engine");
+    let tracks = prepare_tracks_parallel(&options, &[path], 1).expect("prepare");
+    assert_eq!(tracks.len(), 1);
+    let expected = (original_frames as f64 / 1.10).round() as i64;
+    let prepared = tracks[0].frames as i64;
+    let prep_err = (prepared - expected).abs() as f64 / expected as f64;
+    assert!(
+        prep_err < 0.01,
+        "shift prepare frames={prepared} expected≈{expected} err={prep_err}"
+    );
+
+    let mut engine = Engine::from_prepared(options, tracks).expect("engine");
     let mixed_raw = render_all(&mut engine, 4096);
     assert_finite_peak(&mixed_raw, 4.0);
     let mixed = trim_leading_silence(&mixed_raw, 1e-5);
     let out_frames = mixed.len() / 2;
     // Playback starts at first downbeat (~0); duration ≈ original/speed.
-    let expected = (original_frames as f64 / 1.10).round() as i64;
     let actual = out_frames as i64;
     let err = (actual - expected).abs() as f64 / expected as f64;
     assert!(
