@@ -156,6 +156,84 @@ fn render_two_tracks_end_to_end() {
 }
 
 #[test]
+fn render_transitions_only_is_shorter_than_full_mix() {
+    let dir = temp_dir("render_transitions_only");
+    let cache = dir.join("cache");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    let list = dir.join("list.txt");
+    let full = dir.join("full.wav");
+    let only = dir.join("only.wav");
+
+    let sr = 44_100u32;
+    write_wav(&a, &synth_track(180.0, 8, 8, 48, sr)).expect("a");
+    write_wav(&b, &synth_track(178.0, 8, 8, 48, sr)).expect("b");
+    fs::write(&list, "a.wav\nb.wav\n").expect("list");
+
+    let args_full = [
+        "-l",
+        list.to_str().unwrap(),
+        "--render",
+        full.to_str().unwrap(),
+        "--render-speed",
+        "10",
+        "--transition-clip-seconds",
+        "2",
+        "--sample-rate",
+        "44100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ];
+    assert!(bin().args(args_full).status().expect("full").success());
+
+    let args_only = [
+        "-l",
+        list.to_str().unwrap(),
+        "--render",
+        only.to_str().unwrap(),
+        "--render-speed",
+        "10",
+        "--transition-clip-seconds",
+        "2",
+        "--sample-rate",
+        "44100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--transitions-only",
+    ];
+    assert!(bin().args(args_only).status().expect("only").success());
+
+    let full_frames = hound::WavReader::open(&full).unwrap().len() as u64 / 2;
+    let only_frames = hound::WavReader::open(&only).unwrap().len() as u64 / 2;
+    assert!(
+        only_frames > u64::from(sr) / 2,
+        "transitions-only OUT too short: {only_frames} frames"
+    );
+    assert!(
+        only_frames < full_frames / 2,
+        "transitions-only ({only_frames}) should be much shorter than full ({full_frames})"
+    );
+}
+
+#[test]
+fn transitions_only_rejects_single_track() {
+    let dir = temp_dir("transitions_only_one");
+    let a = dir.join("a.wav");
+    write_minimal_wav(&a);
+
+    let output = bin()
+        .args([a.to_str().unwrap(), "--transitions-only", "--no-loop"])
+        .output()
+        .expect("spawn");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--transitions-only") && stderr.contains("≥ 2"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn render_s16_wav_format() {
     let dir = temp_dir("render_s16");
     let cache = dir.join("cache");

@@ -53,11 +53,19 @@ funkot-autodj -l playlist.txt \
     --sample-rate HZ   # 出力サンプリングレート(ライブはデバイス既定、--render時は44100)
     --render out.wav   # 再生せずWAVに書き出し(聴感テスト用、暗黙で--no-loop)
     --wav-format f32   # オフラインWAV形式: f32(既定) / s24 / s16
+    --transition-clip-seconds 60  # つなぎ窓の長さ(クリップ出力と--transitions-only共通、0で無効)
+    --transitions-only # 開発用: つなぎ窓だけ再生(クリップと同じ条件)。--render時はOUT.wavへ書き出し
 ```
 
 `--render` の既定出力は **32-bit float WAV**（内部 f32 ミックスバスをクランプせず書き出し）。
 整数 PCM が必要なときだけ `--wav-format s24` または `s16`（いずれも TPDF dither 付き）。
 書き出し完了時にピークレベルと `|x|>1` のサンプル/フレーム数を表示する（リミッタは掛けない）。
+
+2曲以上かつ `--transition-clip-seconds > 0`（既定60）のとき、各つなぎ窓は
+`TransitionStarted` の8小節前から始まる。`--render` 時はミックスの横に個別クリップも出す。
+`--transitions-only` はその同じ窓だけをライブ再生する（それ以外は無音）。
+`--render` と併用すると `OUT.wav` に同じ窓を連結して書き出す。
+まとめて止めるときは `--transition-clip-seconds 0`。
 
 `--render` 時はローダー(次曲のデコード・解析・ストレッチ)が追いつけるよう
 既定で最大10倍速にペースする。CI / バッチでは前準備を並列化できる:
@@ -146,6 +154,22 @@ Dockerコンテナ内でビルド・テストする。
 ./dev.sh cargo build --workspace
 ./dev.sh cargo test --workspace
 ./dev.sh cargo run -p funkot-cli -- -l testdata/playlist.txt --render /work/out.wav
+```
+
+### デバッグ用
+
+- 各曲の再生開始時、解析キャッシュが既にあれば `intro_bars` / `outro_bars` / `bpm` を表示する。
+  ライブ1曲目で解析が後から終わった場合も、キャッシュができ次第同じ行を出す。
+- つなぎ区間だけ聴く（個別トランジションクリップと同じ切り出し条件。実機出力が必要 —
+  Docker内だけでなくホストで実行）:
+
+```sh
+# ライブ: つなぎ窓だけ再生（既定60秒、各つなぎの8小節前から）
+cargo run -p funkot-cli --release -- -l playlist.txt --transitions-only --no-loop
+
+# 同じ窓をWAVへ連結（デバイス不要、Docker可）
+./dev.sh cargo run -p funkot-cli --release -- \
+  -l playlist.txt --render /work/transitions.wav --transitions-only
 ```
 
 実機の音声出力を伴う確認だけはホスト側で `cargo run` する

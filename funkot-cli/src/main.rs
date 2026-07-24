@@ -76,8 +76,16 @@ struct Args {
     /// Per-transition clip length (seconds) emitted during `--render`.
     /// Clips start 8 bars before each `TransitionStarted` and run for this
     /// many seconds (capped by available render duration). Default 60s.
+    /// Set to 0 to disable transition clip export (and `--transitions-only`).
     #[arg(long, default_value_t = 60.0)]
     transition_clip_seconds: f64,
+
+    /// Dev: play only the same transition windows as per-transition clip export
+    /// (8 bars before each TransitionStarted, `--transition-clip-seconds` long).
+    /// With `--render`, OUT.wav is those windows concatenated instead of live play.
+    /// Same gates as clip export (`transition_clip_seconds > 0`, playlist length ≥ 2).
+    #[arg(long)]
+    transitions_only: bool,
 
     /// WAV sample format for `--render` / `--dump-wav` (default: 32-bit float)
     #[arg(long, value_enum, default_value_t = WavFormat::F32)]
@@ -172,6 +180,18 @@ fn run() -> Result<()> {
         bail!("cannot combine --render and --dump-wav (use one)");
     }
 
+    if args.transitions_only {
+        let ok = args.transition_clip_seconds.is_finite()
+            && args.transition_clip_seconds > 0.0
+            && playlist.len() >= 2;
+        if !ok {
+            bail!(
+                "--transitions-only needs playlist length ≥ 2 and --transition-clip-seconds > 0 \
+                 (same gates as transition clip export)"
+            );
+        }
+    }
+
     if let Some(out) = &args.render {
         let mut options = options;
         if !args.no_loop {
@@ -185,6 +205,7 @@ fn run() -> Result<()> {
             args.wav_format,
             args.render_speed,
             args.transition_clip_seconds,
+            args.transitions_only,
             args.jobs,
             &stop,
         )?;
@@ -195,6 +216,8 @@ fn run() -> Result<()> {
             args.sample_rate,
             args.dump_wav.as_deref(),
             args.wav_format,
+            args.transition_clip_seconds,
+            args.transitions_only,
             &stop,
         )?;
     }
@@ -339,7 +362,118 @@ impl PlayElapsed {
     }
 }
 
-fn print_event(event: &EngineEvent, playlist_len: usize, play_elapsed: &mut PlayElapsed) {
+/// Prints intro/outro/BPM once cache analysis is ready for the current track.
+struct AnalysisPrinter {
+    cache_dir: PathBuf,
+    /// Content hash waiting on a background analyze (first live track, cache miss).
+    pending_hash: Option<String>,
+}
+
+impl AnalysisPrinter {
+    fn new(cache_dir: PathBuf) -> Self {
+        Self {
+            cache_dir,
+            pending_hash: None,
+        }
+    }
+
+    fn on_track_started(&mut self, path: &Path) {
+        self.pending_hash = None;
+        let Ok(hash) = funkot_core::cache::content_hash(path) else {
+            return;
+        };
+        if print_analysis_if_cached(&self.cache_dir, &hash) {
+            return;
+        }
+        // Cache miss / needs_reanalysis: first live track may still be analyzing.
+        self.pending_hash = Some(hash);
+    }
+
+    fn poll(&mut self) {
+        let Some(hash) = self.pending_hash.clone() else {
+            return;
+        };
+        if print_analysis_if_cached(&self.cache_dir, &hash) {
+            self.pending_hash = None;
+        }
+    }
+}
+
+fn print_analysis_if_cached(cache_dir: &Path, hash: &str) -> bool {
+    let Some(a) = funkot_core::cache::load(cache_dir, hash) else {
+        return false;
+    };
+    if a.needs_reanalysis {
+        return false;
+    }
+    println!(
+        "  analysis: intro_bars={} outro_bars={} bpm={:.2}",
+        a.intro_bars, a.outro_bars, a.intro_bpm
+    );
+    true
+}
+
+/// Live `--transitions-only`: delay by preroll so `TransitionStarted` lines up
+/// with the clip window start (same 8-bar lead-in as render clip export).
+struct TransitionPlayGate {
+    delay: std::collections::VecDeque<(f32, f32)>,
+    preroll_frames: usize,
+    clip_len: u64,
+    play_left: u64,
+}
+
+impl TransitionPlayGate {
+    fn new(preroll_frames: u64, clip_len_frames: u64) -> Self {
+        Self {
+            delay: std::collections::VecDeque::with_capacity(preroll_frames as usize + 1),
+            preroll_frames: preroll_frames as usize,
+            clip_len: clip_len_frames,
+            play_left: 0,
+        }
+    }
+
+    /// `transition_offsets`: frame indices within this chunk where a transition starts.
+    fn process(&mut self, stereo: &mut [f32], n_frames: usize, transition_offsets: &[usize]) {
+        for i in 0..n_frames {
+            if transition_offsets.iter().any(|&o| o == i) {
+                self.play_left = self.play_left.max(self.clip_len);
+            }
+            let l = stereo[i * 2];
+            let r = stereo[i * 2 + 1];
+            let (ol, or) = self.step(l, r);
+            stereo[i * 2] = ol;
+            stereo[i * 2 + 1] = or;
+        }
+    }
+
+    fn step(&mut self, l: f32, r: f32) -> (f32, f32) {
+        if self.preroll_frames == 0 {
+            if self.play_left > 0 {
+                self.play_left -= 1;
+                return (l, r);
+            }
+            return (0.0, 0.0);
+        }
+        self.delay.push_back((l, r));
+        if self.delay.len() <= self.preroll_frames {
+            return (0.0, 0.0);
+        }
+        let (ol, or) = self.delay.pop_front().expect("delay non-empty");
+        if self.play_left > 0 {
+            self.play_left -= 1;
+            (ol, or)
+        } else {
+            (0.0, 0.0)
+        }
+    }
+}
+
+fn print_event(
+    event: &EngineEvent,
+    playlist_len: usize,
+    play_elapsed: &mut PlayElapsed,
+    analysis: &mut AnalysisPrinter,
+) {
     match event {
         EngineEvent::TrackStarted { index, path } => {
             play_elapsed.on_track_started();
@@ -351,6 +485,7 @@ fn print_event(event: &EngineEvent, playlist_len: usize, play_elapsed: &mut Play
                 local_hms(),
                 fmt_hms(play_elapsed.elapsed()),
             );
+            analysis.on_track_started(path);
         }
         EngineEvent::TransitionStarted { from, to } => {
             println!("~ transition: {} -> {}", file_name(from), file_name(to));
@@ -405,6 +540,36 @@ mod play_elapsed_tests {
     }
 }
 
+#[cfg(test)]
+mod transition_play_gate_tests {
+    use super::*;
+
+    #[test]
+    fn delay_aligns_window_with_transition() {
+        // preroll=2, clip=3: transition at engine frame 4 → hear delayed frames 2,3,4
+        let mut gate = TransitionPlayGate::new(2, 3);
+        let mut buf = vec![0.0f32; 10 * 2];
+        for i in 0..10 {
+            buf[i * 2] = (i + 1) as f32; // left = engine frame index + 1
+            buf[i * 2 + 1] = -(i as f32);
+        }
+        gate.process(&mut buf, 10, &[4]);
+
+        // frames 0..2: filling delay → silence
+        // frame 2: output engine0 (muted, play_left still 0)
+        // frame 3: output engine1 (muted)
+        // frame 4: transition → play_left=3, output engine2 (unmuted)
+        // frame 5: output engine3
+        // frame 6: output engine4
+        // frame 7+: muted
+        let left: Vec<f32> = (0..10).map(|i| buf[i * 2]).collect();
+        assert_eq!(
+            &left[..],
+            &[0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0]
+        );
+    }
+}
+
 fn run_render(
     options: EngineOptions,
     playlist: Vec<PathBuf>,
@@ -412,6 +577,7 @@ fn run_render(
     wav_format: WavFormat,
     render_speed: f64,
     transition_clip_seconds: f64,
+    transitions_only: bool,
     jobs: usize,
     stop: &AtomicBool,
 ) -> Result<()> {
@@ -422,6 +588,12 @@ fn run_render(
     let transition_enabled = transition_clip_seconds.is_finite()
         && transition_clip_seconds > 0.0
         && playlist_len >= 2;
+    if transitions_only && !transition_enabled {
+        bail!(
+            "--transitions-only needs playlist length ≥ 2 and --transition-clip-seconds > 0 \
+             (same gates as transition clip export)"
+        );
+    }
     let clip_len_frames = if transition_enabled {
         (transition_clip_seconds * f64::from(sample_rate)).round() as u64
     } else {
@@ -435,6 +607,8 @@ fn run_render(
     let preroll_samples = (preroll_frames as usize).saturating_mul(2);
     // Interleaved stereo ending at the next chunk's start (for preroll replay).
     let mut lookback: Vec<f32> = Vec::new();
+
+    let mut analysis = AnalysisPrinter::new(options.cache_dir.clone());
 
     let mut engine = if jobs == 1 {
         Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?
@@ -582,6 +756,10 @@ fn run_render(
 
     let mut transition_captures: Vec<TransitionCapture> = Vec::new();
     let mut next_transition_idx: u32 = 1;
+    let mut out_frames: u64 = 0; // frames actually written to OUT.wav
+    // Mix-timeline cursor so overlapping transition windows are not duplicated
+    // when concatenating into OUT under `--transitions-only`.
+    let mut out_mix_emitted_through: u64 = 0;
 
     const CHUNK_FRAMES: usize = 8192;
     let mut buf = vec![0.0f32; CHUNK_FRAMES * 2];
@@ -618,8 +796,9 @@ fn run_render(
             if let EngineEvent::TransitionStarted { from, to } = &event {
                 transitions_started.push((from.clone(), to.clone()));
             }
-            print_event(&event, playlist_len, &mut play_elapsed);
+            print_event(&event, playlist_len, &mut play_elapsed, &mut analysis);
         }
+        analysis.poll();
 
         if n == 0 {
             break;
@@ -678,7 +857,17 @@ fn run_render(
                     if lb_to > lb_from {
                         let off = ((lb_from - lookback_start) as usize) * 2;
                         let end = off + ((lb_to - lb_from) as usize) * 2;
-                        w.write_interleaved(&lookback[off..end])?;
+                        let preroll = &lookback[off..end];
+                        w.write_interleaved(preroll)?;
+                        if transitions_only {
+                            let emit_from = lb_from.max(out_mix_emitted_through);
+                            if lb_to > emit_from {
+                                let skip = ((emit_from - lb_from) as usize) * 2;
+                                writer.write_interleaved(&preroll[skip..])?;
+                                out_frames += lb_to - emit_from;
+                                out_mix_emitted_through = lb_to;
+                            }
+                        }
                     }
                 }
                 transition_captures.push(TransitionCapture {
@@ -695,7 +884,6 @@ fn run_render(
             );
         }
 
-        writer.write_interleaved(chunk)?;
         // Also write overlapping samples into active transition capture(s).
         if transition_enabled && clip_len_frames > 0 && !transition_captures.is_empty() {
             let chunk_end_frame = chunk_start_frame + n_frames_u64;
@@ -710,8 +898,39 @@ fn run_render(
                 let chunk_off_frames = overlap_start - chunk_start_frame;
                 let src_start = (chunk_off_frames as usize) * 2;
                 let src_end = src_start + (overlap_frames as usize) * 2;
-                cap.writer.write_interleaved(&chunk[src_start..src_end])?;
+                let overlap = &chunk[src_start..src_end];
+                cap.writer.write_interleaved(overlap)?;
             }
+            // Concatenate the same windows into OUT (dedupe overlapping clips).
+            if transitions_only {
+                let mut abs = chunk_start_frame.max(out_mix_emitted_through);
+                while abs < chunk_end_frame {
+                    let in_win = transition_captures
+                        .iter()
+                        .any(|c| abs >= c.start_frame && abs < c.end_frame);
+                    if !in_win {
+                        abs += 1;
+                        continue;
+                    }
+                    let run_end = transition_captures
+                        .iter()
+                        .filter(|c| abs >= c.start_frame && abs < c.end_frame)
+                        .map(|c| c.end_frame.min(chunk_end_frame))
+                        .max()
+                        .unwrap_or(abs + 1);
+                    let off = ((abs - chunk_start_frame) as usize) * 2;
+                    let end = off + ((run_end - abs) as usize) * 2;
+                    writer.write_interleaved(&chunk[off..end])?;
+                    out_frames += run_end - abs;
+                    out_mix_emitted_through = run_end;
+                    abs = run_end;
+                }
+            }
+        }
+
+        if !transitions_only {
+            writer.write_interleaved(chunk)?;
+            out_frames += n_frames_u64;
         }
 
         if transition_enabled && preroll_samples > 0 {
@@ -740,7 +959,7 @@ fn run_render(
     }
 
     let stats = writer.finalize()?;
-    let duration_secs = rendered_frames as f64 / f64::from(sample_rate);
+    let duration_secs = out_frames as f64 / f64::from(sample_rate);
     let peak_dbfs = if stats.peak > 0.0 {
         20.0 * f64::from(stats.peak).log10()
     } else {
@@ -772,9 +991,12 @@ fn run_live(
     explicit_sample_rate: Option<u32>,
     dump_wav: Option<&Path>,
     wav_format: WavFormat,
+    transition_clip_seconds: f64,
+    transitions_only: bool,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
     let playlist_len = playlist.len();
+    let mut analysis = AnalysisPrinter::new(options.cache_dir.clone());
 
     let host = cpal::default_host();
     let device = host
@@ -784,6 +1006,21 @@ fn run_live(
     let (config, channels) = pick_output_config(&device, explicit_sample_rate)?;
     options.output_sample_rate = config.sample_rate;
     let sample_rate = config.sample_rate;
+
+    // Same window as render transition clips: 8 bars before TransitionStarted.
+    const TRANSITION_CLIP_PREROLL_BARS: u32 = 8;
+    let mut transition_gate = if transitions_only {
+        let clip_len = (transition_clip_seconds * f64::from(sample_rate)).round() as u64;
+        let preroll =
+            (options.bar_frames() * f64::from(TRANSITION_CLIP_PREROLL_BARS)).round() as u64;
+        eprintln!(
+            "transitions-only playback: {preroll} frame preroll (~{TRANSITION_CLIP_PREROLL_BARS} bars), \
+             {clip_len} frame windows ({transition_clip_seconds}s)"
+        );
+        Some(TransitionPlayGate::new(preroll, clip_len))
+    } else {
+        None
+    };
 
     let mut engine = Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
     // Audio callback must never sleep (preview→Upgrade wait would underrun under load).
@@ -838,6 +1075,23 @@ fn run_live(
                 stereo.fill(0.0);
                 let n = engine.render(stereo);
 
+                let into = engine.transition_frames_into().unwrap_or(0);
+                let events = engine.poll_events();
+                if let Some(gate) = transition_gate.as_mut() {
+                    let mut offsets = Vec::new();
+                    for e in &events {
+                        if matches!(e, EngineEvent::TransitionStarted { .. }) {
+                            let start_offset = if into == 0 {
+                                0
+                            } else {
+                                n.saturating_sub(into as usize)
+                            };
+                            offsets.push(start_offset);
+                        }
+                    }
+                    gate.process(&mut stereo[..n * 2], n, &offsets);
+                }
+
                 for i in 0..frames {
                     let (l, r) = if i < n {
                         (stereo[i * 2], stereo[i * 2 + 1])
@@ -855,7 +1109,7 @@ fn run_live(
                     }
                 }
 
-                for event in engine.poll_events() {
+                for event in events {
                     let _ = event_tx.send(event);
                 }
             },
@@ -904,9 +1158,12 @@ fn run_live(
                     finished = true;
                 }
                 let mut clock = play_elapsed.lock().unwrap_or_else(|e| e.into_inner());
-                print_event(&event, playlist_len, &mut clock);
+                print_event(&event, playlist_len, &mut clock, &mut analysis);
+                analysis.poll();
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                analysis.poll();
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }

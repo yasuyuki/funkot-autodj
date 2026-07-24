@@ -56,12 +56,20 @@ funkot-autodj -l playlist.txt \
     --sample-rate HZ   # output sample rate (live: device default; with --render: 44100)
     --render out.wav   # write WAV instead of live playback (for listening tests; implies --no-loop)
     --wav-format f32   # offline WAV format: f32 (default) / s24 / s16
+    --transition-clip-seconds 60  # transition window length (render clips + --transitions-only; 0 disables)
+    --transitions-only # dev: play only transition windows (same as clip export); with --render: write them to OUT.wav
 ```
 
 Default `--render` output is **32-bit float WAV** (internal f32 mix bus written without
 clamping). Use `--wav-format s24` or `s16` only when integer PCM is required (both with
 TPDF dither). On write completion, peak level and count of samples/frames with `|x|>1`
 are printed (no limiter is applied).
+
+With a playlist of 2+ tracks and `--transition-clip-seconds > 0` (default 60), each
+transition window starts 8 bars before `TransitionStarted`. `--render` also writes those
+windows as per-transition clips next to the mix. `--transitions-only` plays only those
+same windows live (silence elsewhere); combine with `--render` to write them concatenated
+into `OUT.wav` instead. Set `--transition-clip-seconds 0` to disable.
 
 With `--render`, pacing defaults to up to 10× so the loader (decode/analyze/stretch of the
 next track) can keep up. For CI / batch, prep work can be parallelized:
@@ -150,6 +158,23 @@ Build and test inside the Docker container.
 ./dev.sh cargo build --workspace
 ./dev.sh cargo test --workspace
 ./dev.sh cargo run -p funkot-cli -- -l testdata/playlist.txt --render /work/out.wav
+```
+
+### Debug helpers
+
+- On each `TrackStarted`, if analysis cache is already complete, the CLI prints
+  `intro_bars` / `outro_bars` / `bpm`. If the first live track started before analysis
+  finished, the same line is printed when the cache appears.
+- Transition-only listening (same windows as per-transition clip export; needs a real
+  audio device — run on the host, not only in Docker):
+
+```sh
+# Live: hear only transition windows (default 60s from 8 bars before each mix)
+cargo run -p funkot-cli --release -- -l playlist.txt --transitions-only --no-loop
+
+# Same windows concatenated to WAV (no device needed; OK in Docker)
+./dev.sh cargo run -p funkot-cli --release -- \
+  -l playlist.txt --render /work/transitions.wav --transitions-only
 ```
 
 Only checks that need real device audio output should use `cargo run` on the host
