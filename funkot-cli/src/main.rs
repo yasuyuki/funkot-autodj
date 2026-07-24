@@ -22,6 +22,7 @@ use log::warn;
 #[command(
     name = "funkot-autodj",
     about = "Auto-DJ for Funkot dance music",
+    version,
     arg_required_else_help = true
 )]
 struct Args {
