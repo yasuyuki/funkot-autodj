@@ -73,11 +73,9 @@ struct Args {
     dump_wav: Option<PathBuf>,
 
     /// Per-transition clip length (seconds) emitted during `--render`.
-    /// Generated clips start at each transition start frame and are
-    /// capped by the available render duration.
-    ///
-    /// Default matches existing transition extraction presets (~90s).
-    #[arg(long, default_value_t = 90.0)]
+    /// Clips start 8 bars before each `TransitionStarted` and run for this
+    /// many seconds (capped by available render duration). Default 60s.
+    #[arg(long, default_value_t = 60.0)]
     transition_clip_seconds: f64,
 
     /// WAV sample format for `--render` / `--dump-wav` (default: 32-bit float)
@@ -394,6 +392,25 @@ fn run_render(
 ) -> Result<()> {
     let playlist_len = playlist.len();
     let sample_rate = options.output_sample_rate;
+    // Start 8 bars before TransitionStarted so the lead-in is audible.
+    const TRANSITION_CLIP_PREROLL_BARS: u32 = 8;
+    let transition_enabled = transition_clip_seconds.is_finite()
+        && transition_clip_seconds > 0.0
+        && playlist_len >= 2;
+    let clip_len_frames = if transition_enabled {
+        (transition_clip_seconds * f64::from(sample_rate)).round() as u64
+    } else {
+        0
+    };
+    let preroll_frames = if transition_enabled {
+        (options.bar_frames() * f64::from(TRANSITION_CLIP_PREROLL_BARS)).round() as u64
+    } else {
+        0
+    };
+    let preroll_samples = (preroll_frames as usize).saturating_mul(2);
+    // Interleaved stereo ending at the next chunk's start (for preroll replay).
+    let mut lookback: Vec<f32> = Vec::new();
+
     let mut engine = if jobs == 1 {
         Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?
     } else {
@@ -409,18 +426,6 @@ fn run_render(
     };
 
     let mut writer = WavStreamWriter::create(out_path, sample_rate, wav_format)?;
-
-    // During offline rendering, additionally emit per-transition WAV clips
-    // to speed up verification after each transition rule change.
-    let transition_enabled = transition_clip_seconds.is_finite()
-        && transition_clip_seconds > 0.0
-        && playlist_len >= 2;
-    let clip_len_frames = if transition_enabled {
-        (transition_clip_seconds * f64::from(sample_rate)).round() as u64
-    } else {
-        0
-    };
-
     struct TransitionCapture {
         start_frame: u64, // output-file frame indices
         end_frame: u64,   // exclusive
@@ -626,7 +631,8 @@ fn run_render(
                 } else {
                     n_frames_u64.saturating_sub(transition_frames_into_end)
                 };
-                let start_frame = chunk_start_frame + start_offset;
+                let transition_frame = chunk_start_frame + start_offset;
+                let start_frame = transition_frame.saturating_sub(preroll_frames);
                 let end_frame = start_frame.saturating_add(clip_len_frames);
 
                 let from_name = short_name_from_path(&from);
@@ -637,7 +643,19 @@ fn run_render(
                     wav_suffix(wav_format)
                 ));
 
-                let w = WavStreamWriter::create(&clip_path, sample_rate, wav_format)?;
+                let mut w = WavStreamWriter::create(&clip_path, sample_rate, wav_format)?;
+                // Replay audio before this chunk (preroll lives in lookback).
+                if start_frame < chunk_start_frame {
+                    let lookback_frames = (lookback.len() / 2) as u64;
+                    let lookback_start = chunk_start_frame.saturating_sub(lookback_frames);
+                    let lb_from = start_frame.max(lookback_start);
+                    let lb_to = end_frame.min(chunk_start_frame);
+                    if lb_to > lb_from {
+                        let off = ((lb_from - lookback_start) as usize) * 2;
+                        let end = off + ((lb_to - lb_from) as usize) * 2;
+                        w.write_interleaved(&lookback[off..end])?;
+                    }
+                }
                 transition_captures.push(TransitionCapture {
                     start_frame,
                     end_frame,
@@ -668,6 +686,13 @@ fn run_render(
                 let src_start = (chunk_off_frames as usize) * 2;
                 let src_end = src_start + (overlap_frames as usize) * 2;
                 cap.writer.write_interleaved(&chunk[src_start..src_end])?;
+            }
+        }
+
+        if transition_enabled && preroll_samples > 0 {
+            lookback.extend_from_slice(chunk);
+            if lookback.len() > preroll_samples {
+                lookback.drain(0..lookback.len() - preroll_samples);
             }
         }
 

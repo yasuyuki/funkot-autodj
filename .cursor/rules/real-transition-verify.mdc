@@ -24,7 +24,7 @@ alwaysApply: false
 ```
 
 - `vXX` は未使用の版番号に更新する
-- `--transition-clip-seconds` は既定 90。遷移 WAV は `testdata/real_mix_vXX_transitions/`（`01_…` = 1→2）
+- `--transition-clip-seconds` は既定 60。切替開始の 8 小節前から切り出し。遷移 WAV は `testdata/real_mix_vXX_transitions/`（`01_…` = 1→2）
 - 解析ロジック自体を変えた場合はキャッシュを再生成してからレンダーする（形状不変なら `real-cache-v4` を再利用可）
 
 2. 必要なら 2 曲の位相診断:
