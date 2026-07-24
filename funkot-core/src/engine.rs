@@ -1546,6 +1546,7 @@ fn prepare_first_live(
         };
 
     // Head preview so audio starts before full Preserve stretch finishes.
+    // Preview holds outro at EOF so a provisional mix point cannot fire early.
     let head_frames = ((FIRST_LIVE_HEAD_SECS * f64::from(buffer.sample_rate)).round() as u64)
         .min(buffer.frames)
         .max(1);
@@ -1574,6 +1575,28 @@ fn prepare_first_live(
         }
     }
 
+    // Full Upgrade must use real analysis markers. Provisional outro is often
+    // FALLBACK_BARS (64) on long tracks; real mix trigger may be 48 (e.g. IVY).
+    // Warming the cache in the background used to leave the deck on provisional
+    // markers while AnalysisPrinter already showed the correct outro_bars.
+    let analysis = if used_provisional {
+        match cache::get_or_analyze(path, &options.cache_dir, &buffer) {
+            Ok(a) => a,
+            Err(e) => {
+                return send_msg(
+                    tx,
+                    LoaderMsg::Failed {
+                        path: path.to_path_buf(),
+                        message: e.to_string(),
+                    },
+                    shutdown,
+                );
+            }
+        }
+    } else {
+        analysis
+    };
+
     let full = match finish_prepare(options, path, index, &buffer, &analysis, false) {
         Ok(t) => t,
         Err(e) => {
@@ -1594,24 +1617,7 @@ fn prepare_first_live(
     } else {
         LoaderMsg::Ready(full)
     };
-    if !send_msg(tx, msg, shutdown) {
-        return false;
-    }
-
-    // Warm cache in background when we skipped analyze.
-    if used_provisional {
-        let path_bg = path.to_path_buf();
-        let cache_dir = options.cache_dir.clone();
-        let _ = thread::Builder::new()
-            .name("funkot-analyze".into())
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || {
-                if let Ok(buf) = decode::decode_file(&path_bg) {
-                    let _ = cache::get_or_analyze(&path_bg, &cache_dir, &buf);
-                }
-            });
-    }
-    true
+    send_msg(tx, msg, shutdown)
 }
 
 /// Decode, analyze (cached), stretch, and map markers for one playlist entry.
@@ -2735,5 +2741,107 @@ mod tests {
             grid_err < 15.0,
             "fixed tempo should keep intro/outro bar-aligned: {grid_err:.1}ms"
         );
+    }
+
+    /// Cold-cache first-live Upgrade must not keep provisional FALLBACK outro (64)
+    /// when real analysis yields a shorter mix trigger (48). Regression for IVY:
+    /// AnalysisPrinter showed 48 while the deck still mixed at end−64.
+    #[test]
+    fn prepare_first_live_upgrade_uses_analyzed_outro() {
+        use crate::cache::{self, provisional};
+        use crate::testutil::{synth_track_with_options, write_wav, SynthOptions};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "funkot_first_live_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let cache_dir = dir.join("cache");
+        let path = dir.join("ivy_like.wav");
+
+        let sr = 44_100u32;
+        // total_bars ≥ 192 → provisional section_bars = FALLBACK (64).
+        let buf = synth_track_with_options(SynthOptions {
+            bpm: 180.0,
+            intro_bars: 16,
+            main_bars: 160,
+            outro_bars: 32,
+            sample_rate: sr,
+            outro_mid_plateau_bars: 16,
+            outro_mid_plateau_level: 0.92,
+            ..SynthOptions::default()
+        });
+        write_wav(&path, &buf).expect("write wav");
+
+        let prov = provisional(&buf, "ivy_like.wav");
+        assert_eq!(prov.outro_bars, crate::FALLBACK_BARS);
+        let real = crate::analysis::analyze(&buf, "ivy_like.wav").expect("analyze");
+        assert_eq!(real.outro_bars, 48);
+        assert!(real.outro_bars < prov.outro_bars);
+
+        let options = crate::EngineOptions {
+            rate: 1.0,
+            pitch_mode: PitchMode::Preserve,
+            fade_bars: 4,
+            highpass_hz: 300.0,
+            gain_normalize: false,
+            random: false,
+            loop_playlist: false,
+            output_sample_rate: sr,
+            cache_dir: cache_dir.clone(),
+        };
+        let (tx, rx) = mpsc::sync_channel::<LoaderMsg>(1);
+        let shutdown = AtomicBool::new(false);
+        let path_bg = path.clone();
+        let opts = options.clone();
+        let handle = thread::spawn(move || {
+            prepare_first_live(&opts, &path_bg, 0, &tx, &shutdown)
+        });
+
+        let mut preview = false;
+        let mut upgrade_outro = None;
+        for _ in 0..8 {
+            match rx.recv_timeout(Duration::from_secs(180)) {
+                Ok(LoaderMsg::Ready(t)) if t.preview => {
+                    preview = true;
+                    assert_eq!(
+                        t.outro_start_out, t.frames,
+                        "preview must hold transitions at EOF"
+                    );
+                }
+                Ok(LoaderMsg::Upgrade(t)) => {
+                    assert!(!t.preview);
+                    upgrade_outro = Some(t.outro_bars);
+                    break;
+                }
+                Ok(LoaderMsg::Ready(t)) => {
+                    // Short-file path (no preview): still must be analyzed.
+                    upgrade_outro = Some(t.outro_bars);
+                    break;
+                }
+                Ok(LoaderMsg::Failed { message, .. }) => panic!("prepare failed: {message}"),
+                Ok(LoaderMsg::Exhausted) => panic!("unexpected Exhausted"),
+                Err(e) => panic!("recv: {e}"),
+            }
+        }
+        assert!(handle.join().expect("join"), "prepare_first_live returned false");
+        assert!(preview, "expected head preview Ready");
+        assert_eq!(
+            upgrade_outro,
+            Some(48),
+            "Upgrade must use analyzed outro, not provisional {}",
+            prov.outro_bars
+        );
+        // Cache must have been written by the blocking analyze before Upgrade.
+        let hash = cache::content_hash(&path).expect("hash");
+        assert!(cache_dir.join(format!("{hash}.json")).is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
