@@ -5,6 +5,10 @@
 //! until Ready). If a head preview is exhausted before Upgrade: offline/tests
 //! spin-wait (default); realtime hosts ([`Engine::set_realtime`]) emit silence
 //! so the audio callback never sleeps.
+//!
+//! Transition phase-align runs on a worker thread once the next track is ready,
+//! and finished decks are dropped off-thread, so the live callback does not
+//! stall on kick/hat search or multi-megabyte `free` under load.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -558,6 +562,14 @@ struct ActiveTransition {
     fade_out_end: u64,
 }
 
+/// Free a finished deck off the audio thread.
+///
+/// Dropping the last `Arc` of a multi-minute stretch buffer can take milliseconds
+/// of allocator work; doing that inside `render` underruns under load.
+fn retire_deck(deck: Deck) {
+    thread::spawn(move || drop(deck));
+}
+
 /// Pull-based auto-DJ engine.
 pub struct Engine {
     options: EngineOptions,
@@ -585,6 +597,9 @@ pub struct Engine {
     /// ends before Upgrade (CPU-speed pulls / offline). Realtime hosts set
     /// this false via [`Self::set_realtime`] so the audio callback never sleeps.
     block_on_preview_upgrade: bool,
+    /// Background phase-align result: `(prev_start, next_entry, prev_nudge)`.
+    phase_align_ready: Option<(u64, u64, u64)>,
+    phase_align_rx: Option<Receiver<(u64, u64, u64)>>,
 }
 
 impl Engine {
@@ -633,6 +648,8 @@ impl Engine {
             stopped: false,
             loader_exhausted: false,
             block_on_preview_upgrade: true,
+            phase_align_ready: None,
+            phase_align_rx: None,
         })
     }
 
@@ -696,12 +713,15 @@ impl Engine {
             stopped: false,
             loader_exhausted: rest_empty,
             block_on_preview_upgrade: true,
+            phase_align_ready: None,
+            phase_align_rx: None,
         };
         if let Some(track) = first {
             engine.start_first(track);
         } else {
             engine.loader_exhausted = true;
         }
+        engine.kick_phase_align_if_needed();
         Ok(engine)
     }
 
@@ -761,6 +781,8 @@ impl Engine {
             }
 
             self.drain_loader();
+            self.poll_phase_align();
+            self.kick_phase_align_if_needed();
             self.await_preview_upgrade();
             self.maybe_start_or_update_transition();
 
@@ -819,8 +841,94 @@ impl Engine {
 
     /// Drop the previous deck and free its loader permit exactly once.
     fn drop_prev(&mut self) {
-        if self.prev.take().is_some() {
+        if let Some(deck) = self.prev.take() {
             self.release_permit();
+            retire_deck(deck);
+        }
+    }
+
+    fn retire_active(&mut self) {
+        if let Some(deck) = self.active.take() {
+            self.release_permit();
+            retire_deck(deck);
+        }
+    }
+
+    fn clear_phase_align(&mut self) {
+        self.phase_align_ready = None;
+        self.phase_align_rx = None;
+    }
+
+    fn poll_phase_align(&mut self) {
+        let Some(rx) = self.phase_align_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.phase_align_ready = Some(result);
+                self.phase_align_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.phase_align_rx = None;
+            }
+        }
+    }
+
+    /// Run kick/hat phase align on a worker so `begin_transition` stays RT-safe.
+    ///
+    /// On-time transitions use `prev_start = outro_start_out`. Delayed starts
+    /// fall back to an in-callback compute when the playhead disagrees.
+    fn kick_phase_align_if_needed(&mut self) {
+        if self.phase_align_rx.is_some() || self.phase_align_ready.is_some() {
+            return;
+        }
+        if self.transition.is_some() {
+            return;
+        }
+        let (Some(active), Some(next)) = (self.active.as_ref(), self.next_track.as_ref()) else {
+            return;
+        };
+
+        let prev_start = active.track.outro_start_out;
+        let prev_samples = Arc::clone(&active.track.samples);
+        let next_samples = Arc::clone(&next.samples);
+        let nominal = next
+            .first_downbeat_out
+            .saturating_add(bar_to_frames(
+                plan_transition(
+                    self.options.fade_bars,
+                    next.intro_bars,
+                    active.track.outro_bars,
+                )
+                .skip,
+                self.bar_frames,
+            ));
+        let outro_intro_grid = active.track.outro_start_out;
+        let outro_end_anchored = active.track.outro_end_anchored_out;
+        let sample_rate = self.options.output_sample_rate;
+        let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.phase_align_rx = Some(rx);
+        if thread::Builder::new()
+            .name("funkot-phase-align".into())
+            .spawn(move || {
+                let (entry, nudge) = align_next_entry_with_phase_hypotheses(
+                    &prev_samples,
+                    prev_start,
+                    &next_samples,
+                    nominal,
+                    outro_intro_grid,
+                    outro_end_anchored,
+                    sample_rate,
+                    beat_frames,
+                );
+                let _ = tx.send((prev_start, entry, nudge));
+            })
+            .is_err()
+        {
+            self.phase_align_rx = None;
         }
     }
 
@@ -838,6 +946,7 @@ impl Engine {
                 Ok(LoaderMsg::Ready(track)) => {
                     if self.next_track.is_none() {
                         self.next_track = Some(track);
+                        self.kick_phase_align_if_needed();
                     } else {
                         // Should not happen with the permit scheme; drop & free slot.
                         self.release_permit();
@@ -870,12 +979,17 @@ impl Engine {
             if deck.track.path == track.path {
                 deck.playhead = deck.playhead.min(track.frames.saturating_sub(1));
                 deck.track = track;
+                // Markers / buffer changed — any in-flight align is stale.
+                self.clear_phase_align();
+                self.kick_phase_align_if_needed();
                 return;
             }
         }
         if let Some(next) = self.next_track.as_mut() {
             if next.path == track.path {
                 *next = track;
+                self.clear_phase_align();
+                self.kick_phase_align_if_needed();
             }
         }
         // Else: already left this track; drop upgrade (no permit — same slot).
@@ -904,9 +1018,7 @@ impl Engine {
             // Realtime: never sleep. If the loader already gave up, end the deck
             // the same way the blocking path does; otherwise silence until Upgrade.
             if self.loader_exhausted {
-                if self.active.take().is_some() {
-                    self.release_permit();
-                }
+                self.retire_active();
                 self.drop_prev();
                 if self.next_track.is_none() {
                     self.mark_finished();
@@ -924,9 +1036,7 @@ impl Engine {
             }
             // Full stretch failed or loader quit without Upgrade: end the deck.
             if self.loader_exhausted {
-                if self.active.take().is_some() {
-                    self.release_permit();
-                }
+                self.retire_active();
                 self.drop_prev();
                 if self.next_track.is_none() {
                     self.mark_finished();
@@ -950,6 +1060,7 @@ impl Engine {
         });
         self.pending_events
             .push(EngineEvent::TrackStarted { index, path });
+        self.kick_phase_align_if_needed();
     }
 
     fn maybe_start_or_update_transition(&mut self) {
@@ -1050,17 +1161,22 @@ impl Engine {
             .first_downbeat_out
             .saturating_add(bar_to_frames(plan.skip, self.bar_frames));
         let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
-        // Sub-beat phase hyp + mod-4 kick+hat groove bar identity.
-        let (entry, prev_nudge) = align_next_entry_with_phase_hypotheses(
-            &active.track.samples,
-            active.playhead,
-            &next.samples,
-            nominal,
-            active.track.outro_start_out,
-            active.track.outro_end_anchored_out,
-            self.options.output_sample_rate,
-            beat_frames,
-        );
+        self.poll_phase_align();
+        // Prefer the background align when it matches this trigger playhead.
+        let (entry, prev_nudge) = match self.phase_align_ready.take() {
+            Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
+            _ => align_next_entry_with_phase_hypotheses(
+                &active.track.samples,
+                active.playhead,
+                &next.samples,
+                nominal,
+                active.track.outro_start_out,
+                active.track.outro_end_anchored_out,
+                self.options.output_sample_rate,
+                beat_frames,
+            ),
+        };
+        self.clear_phase_align();
         let entry = if next.frames == 0 {
             0
         } else {
@@ -1149,19 +1265,22 @@ impl Engine {
             };
             deck.highpass_enabled = frames_into >= fade_in_end;
 
-            // Skip the mix bus entirely at bit-exact silence (last fade-out
-            // frame and any float-underflow). Playhead still advances so the
-            // timeline stays consistent until we drop.
-            if gain_env > 0.0 && deck.playhead < deck.track.frames {
-                let (mut l, mut r) = read_deck_frame(deck);
-                if deck.highpass_enabled {
-                    deck.filter.process_frame(&mut l, &mut r);
-                }
-                let g = gain_env * deck.track.gain_linear;
-                mix_l += l * g;
-                mix_r += r * g;
-            }
+            // Skip the mix bus at bit-exact silence, but always drive the HPF so
+            // enabling mid-transition does not click from a cold filter state.
             if deck.playhead < deck.track.frames {
+                let (mut l, mut r) = read_deck_frame(deck);
+                let mut fl = l;
+                let mut fr = r;
+                deck.filter.process_frame(&mut fl, &mut fr);
+                if gain_env > 0.0 {
+                    if deck.highpass_enabled {
+                        l = fl;
+                        r = fr;
+                    }
+                    let g = gain_env * deck.track.gain_linear;
+                    mix_l += l * g;
+                    mix_r += r * g;
+                }
                 deck.playhead += 1;
             }
         }
@@ -1176,17 +1295,19 @@ impl Engine {
                 deck.highpass_enabled = frames_into < fade_in_end;
             }
 
-            // First fade-in frame is bit-exact 0: do not touch the mix bus.
-            if gain_env > 0.0 && deck.playhead < deck.track.frames {
+            if deck.playhead < deck.track.frames {
                 let (mut l, mut r) = read_deck_frame(deck);
+                // Active HPF is on from transition start (incl. silent first
+                // fade-in frame), so drive it whenever enabled.
                 if deck.highpass_enabled {
                     deck.filter.process_frame(&mut l, &mut r);
                 }
-                let g = gain_env * deck.track.gain_linear;
-                mix_l += l * g;
-                mix_r += r * g;
-            }
-            if deck.playhead < deck.track.frames {
+                // First fade-in frame is bit-exact 0: do not touch the mix bus.
+                if gain_env > 0.0 {
+                    let g = gain_env * deck.track.gain_linear;
+                    mix_l += l * g;
+                    mix_r += r * g;
+                }
                 deck.playhead += 1;
             }
         }
@@ -1213,8 +1334,7 @@ impl Engine {
             .unwrap_or(true);
         if active_done && self.transition.is_none() {
             if self.active.is_some() {
-                self.active = None;
-                self.release_permit();
+                self.retire_active();
             }
             // Stale prev must never outlive the transition.
             self.drop_prev();
