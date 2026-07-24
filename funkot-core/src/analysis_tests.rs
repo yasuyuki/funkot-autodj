@@ -7,7 +7,7 @@ use crate::cache::{self, get_cached_or_provisional, get_or_analyze};
 use crate::decode::AudioBuffer;
 use crate::stretch::{self, position_scale};
 use crate::testutil::{synth_track, synth_track_with_options, write_wav, SynthOptions};
-use crate::{Error, PitchMode, BEATS_PER_BAR, FALLBACK_BARS};
+use crate::{Error, PitchMode, TrackAnalysis, BEATS_PER_BAR, FALLBACK_BARS};
 
 fn bar_len_frames(bpm: f64, sample_rate: u32) -> f64 {
     f64::from(sample_rate) * 60.0 / bpm * f64::from(BEATS_PER_BAR)
@@ -471,10 +471,16 @@ fn cache_roundtrip_and_hand_edit() {
         "\"intro_bars\": 8",
         1,
     );
+    text = text.replacen(
+        "\"intro_bars_manual\": false",
+        "\"intro_bars_manual\": true",
+        1,
+    );
     std::fs::write(&json_path, text).expect("write edited cache");
 
     let a3 = get_or_analyze(&wav_path, &cache_dir, &buf).expect("edited load");
     assert_eq!(a3.intro_bars, 8);
+    assert!(a3.intro_bars_manual);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -534,6 +540,96 @@ fn corrupt_cache_reanalyzes() {
     let reloaded = cache::load(&cache_dir, &hash).expect("reloaded");
     assert_eq!(reloaded, a2);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn purge_auto_deletes_and_clears_manual() {
+    let dir = temp_dir("cache_purge");
+    let cache_dir = dir.join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("mkdir");
+
+    let auto = TrackAnalysis {
+        version: cache::CACHE_VERSION,
+        file_name: "auto.wav".into(),
+        sample_rate: 44_100,
+        total_frames: 1000,
+        intro_bpm: 180.0,
+        outro_bpm: 180.0,
+        first_downbeat: 0,
+        outro_start: 500,
+        intro_bars: 16,
+        outro_bars: 16,
+        bars_estimated_low_confidence: false,
+        intro_bars_low_confidence: false,
+        outro_bars_low_confidence: false,
+        intro_bars_manual: false,
+        outro_bars_manual: false,
+        needs_reanalysis: false,
+        rms_dbfs: -14.0,
+        gain_db: 0.0,
+    };
+    let mut manual = auto.clone();
+    manual.file_name = "manual.wav".into();
+    manual.intro_bars = 8;
+    manual.intro_bars_manual = true;
+    manual.outro_bars = 32;
+
+    cache::store(&cache_dir, "aaa", &auto).expect("store auto");
+    cache::store(&cache_dir, "bbb", &manual).expect("store manual");
+
+    let stats = cache::purge_auto(&cache_dir).expect("purge");
+    assert_eq!(stats.deleted, 1);
+    assert_eq!(stats.cleared, 1);
+    assert!(cache::load(&cache_dir, "aaa").is_none());
+
+    let cleared = cache::load(&cache_dir, "bbb").expect("kept");
+    assert!(cleared.needs_reanalysis);
+    assert_eq!(cleared.intro_bars, 8);
+    assert!(cleared.intro_bars_manual);
+    assert_eq!(cleared.outro_bars, 0); // not manual → cleared
+    assert!(!cleared.outro_bars_manual);
+    assert_eq!(cleared.intro_bpm, 0.0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_or_analyze_merges_manual_after_purge() {
+    let dir = temp_dir("cache_merge");
+    let wav_path = dir.join("track.wav");
+    let cache_dir = dir.join("cache");
+
+    let buf = synth_track(180.0, 16, 16, 16, 44_100);
+    write_wav(&wav_path, &buf).expect("write wav");
+
+    let a1 = get_or_analyze(&wav_path, &cache_dir, &buf).expect("first");
+    let hash = cache::content_hash(&wav_path).expect("hash");
+    let mut cached = cache::load(&cache_dir, &hash).expect("load");
+    cached.intro_bars = 8;
+    cached.intro_bars_manual = true;
+    cache::store(&cache_dir, &hash, &cached).expect("store manual");
+
+    let stats = cache::purge_auto(&cache_dir).expect("purge");
+    assert_eq!(stats.cleared, 1);
+
+    let (hit, did) = cache::fill_missing(&wav_path, &cache_dir, &buf).expect("fill");
+    assert!(did, "should reanalyze incomplete cache");
+    assert_eq!(hit.intro_bars, 8);
+    assert!(hit.intro_bars_manual);
+    assert!(!hit.needs_reanalysis);
+    // Auto outro should be restored from analysis (not necessarily equal to a1 if
+    // reconcile differs, but should be a valid non-zero section).
+    assert!(hit.outro_bars > 0);
+    assert!(!hit.outro_bars_manual);
+    assert!(hit.intro_bpm > 0.0);
+
+    let (again, did2) = cache::fill_missing(&wav_path, &cache_dir, &buf).expect("fill2");
+    assert!(!did2, "complete cache must skip");
+    assert_eq!(again, hit);
+
+    // Sanity: untouched fields from first analyze still make sense vs original.
+    let _ = a1;
     let _ = std::fs::remove_dir_all(&dir);
 }
 

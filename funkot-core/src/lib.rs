@@ -55,6 +55,9 @@ pub const TARGET_RMS_DBFS: f64 = -14.0;
 
 /// Result of the one-time per-track analysis. Serialized as JSON into the
 /// cache directory; users may hand-edit any field (e.g. `intro_bars`).
+///
+/// When hand-editing `intro_bars` / `outro_bars`, set the matching
+/// `*_bars_manual` flag so `--purge-auto-cache` keeps those values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TrackAnalysis {
     /// Cache format version; bump when the analyzer changes incompatibly.
@@ -87,6 +90,15 @@ pub struct TrackAnalysis {
     /// `true` when `outro_bars` came from the fallback / ambiguous estimate.
     #[serde(default)]
     pub outro_bars_low_confidence: bool,
+    /// Hand-edited `intro_bars`; preserved across `--purge-auto-cache` / reanalysis.
+    #[serde(default)]
+    pub intro_bars_manual: bool,
+    /// Hand-edited `outro_bars`; preserved across `--purge-auto-cache` / reanalysis.
+    #[serde(default)]
+    pub outro_bars_manual: bool,
+    /// Auto fields were stripped; next load reanalyzes and merges manual bars.
+    #[serde(default)]
+    pub needs_reanalysis: bool,
     /// Measured RMS loudness of the whole analyzed material, in dBFS.
     pub rms_dbfs: f64,
     /// Gain in dB to reach [`TARGET_RMS_DBFS`]. Applied unless disabled.

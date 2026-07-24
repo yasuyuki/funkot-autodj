@@ -91,30 +91,177 @@ pub fn store(cache_dir: &Path, hash: &str, analysis: &TrackAnalysis) -> Result<(
     Ok(())
 }
 
+/// Counts from [`purge_auto`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeStats {
+    pub deleted: usize,
+    pub cleared: usize,
+    pub skipped: usize,
+}
+
+/// Delete cache JSON with no manual intro/outro flags; strip auto fields from the rest.
+///
+/// Kept entries retain manual `intro_bars` / `outro_bars` and set `needs_reanalysis`
+/// so the next [`get_or_analyze`] recomputes everything else.
+pub fn purge_auto(cache_dir: &Path) -> Result<PurgeStats> {
+    let mut stats = PurgeStats::default();
+    if !cache_dir.is_dir() {
+        return Ok(stats);
+    }
+    let entries = fs::read_dir(cache_dir).map_err(|e| {
+        Error::Cache(format!(
+            "cannot read cache dir '{}': {e}",
+            cache_dir.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Cache(format!("cache dir entry: {e}")))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            stats.skipped += 1;
+            continue;
+        }
+        let data = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => {
+                stats.skipped += 1;
+                continue;
+            }
+        };
+        let mut analysis: TrackAnalysis = match serde_json::from_str(&data) {
+            Ok(a) => a,
+            Err(_) => {
+                stats.skipped += 1;
+                continue;
+            }
+        };
+        if analysis.version != CACHE_VERSION {
+            stats.skipped += 1;
+            continue;
+        }
+        if !analysis.intro_bars_manual && !analysis.outro_bars_manual {
+            fs::remove_file(&path).map_err(|e| {
+                Error::Cache(format!("cannot delete cache '{}': {e}", path.display()))
+            })?;
+            stats.deleted += 1;
+            continue;
+        }
+        strip_auto_fields(&mut analysis);
+        let json = serde_json::to_string_pretty(&analysis)
+            .map_err(|e| Error::Cache(format!("serialize analysis: {e}")))?;
+        fs::write(&path, json)
+            .map_err(|e| Error::Cache(format!("cannot write cache '{}': {e}", path.display())))?;
+        stats.cleared += 1;
+    }
+    Ok(stats)
+}
+
+/// Keep only manually protected bar counts; mark for reanalysis.
+fn strip_auto_fields(a: &mut TrackAnalysis) {
+    let intro_bars = if a.intro_bars_manual { a.intro_bars } else { 0 };
+    let outro_bars = if a.outro_bars_manual { a.outro_bars } else { 0 };
+    let intro_m = a.intro_bars_manual;
+    let outro_m = a.outro_bars_manual;
+    *a = TrackAnalysis {
+        version: CACHE_VERSION,
+        file_name: a.file_name.clone(),
+        sample_rate: a.sample_rate,
+        total_frames: a.total_frames,
+        intro_bpm: 0.0,
+        outro_bpm: 0.0,
+        first_downbeat: 0,
+        outro_start: 0,
+        intro_bars,
+        outro_bars,
+        bars_estimated_low_confidence: true,
+        intro_bars_low_confidence: !intro_m,
+        outro_bars_low_confidence: !outro_m,
+        intro_bars_manual: intro_m,
+        outro_bars_manual: outro_m,
+        needs_reanalysis: true,
+        rms_dbfs: TARGET_RMS_DBFS,
+        gain_db: 0.0,
+    };
+}
+
+/// Re-apply hand-edited intro/outro bars onto a fresh analysis.
+pub fn apply_manual_overrides(manual: &TrackAnalysis, mut fresh: TrackAnalysis) -> TrackAnalysis {
+    if manual.intro_bars_manual {
+        fresh.intro_bars = manual.intro_bars;
+        fresh.intro_bars_manual = true;
+        fresh.intro_bars_low_confidence = false;
+    }
+    if manual.outro_bars_manual {
+        fresh.outro_bars = manual.outro_bars;
+        fresh.outro_bars_manual = true;
+        fresh.outro_bars_low_confidence = false;
+        let bar_len = (60.0 / fresh.outro_bpm * f64::from(fresh.sample_rate) * f64::from(BEATS_PER_BAR))
+            .round()
+            .max(1.0) as u64;
+        fresh.outro_start = fresh
+            .total_frames
+            .saturating_sub(u64::from(fresh.outro_bars) * bar_len);
+    }
+    fresh.bars_estimated_low_confidence =
+        fresh.intro_bars_low_confidence || fresh.outro_bars_low_confidence;
+    fresh.needs_reanalysis = false;
+    fresh
+}
+
 /// Hash the file, try load, else analyze `buffer` and store.
+///
+/// Complete caches are returned as-is. Incomplete caches (`needs_reanalysis`)
+/// and misses are (re)analyzed; manual bar flags from an incomplete cache are kept.
 pub fn get_or_analyze(
     path: &Path,
     cache_dir: &Path,
     buffer: &AudioBuffer,
 ) -> Result<TrackAnalysis> {
     let hash = content_hash(path)?;
-    if let Some(cached) = load(cache_dir, &hash) {
-        return Ok(cached);
+    let prior = load(cache_dir, &hash);
+    if let Some(cached) = prior.as_ref() {
+        if !cached.needs_reanalysis {
+            return Ok(cached.clone());
+        }
     }
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    let analysis = crate::analysis::analyze(buffer, file_name)?;
+    let mut analysis = crate::analysis::analyze(buffer, file_name)?;
+    if let Some(cached) = prior.as_ref() {
+        if cached.intro_bars_manual || cached.outro_bars_manual {
+            analysis = apply_manual_overrides(cached, analysis);
+        }
+    }
     store(cache_dir, &hash, &analysis)?;
     Ok(analysis)
+}
+
+/// Hash the file, try load, else analyze `buffer` and store.
+///
+/// Same as [`get_or_analyze`], but returns whether a fresh analysis ran
+/// (`true` = analyzed or reanalyzed; `false` = complete cache hit).
+pub fn fill_missing(
+    path: &Path,
+    cache_dir: &Path,
+    buffer: &AudioBuffer,
+) -> Result<(TrackAnalysis, bool)> {
+    let hash = content_hash(path)?;
+    if let Some(cached) = load(cache_dir, &hash) {
+        if !cached.needs_reanalysis {
+            return Ok((cached, false));
+        }
+    }
+    let analysis = get_or_analyze(path, cache_dir, buffer)?;
+    Ok((analysis, true))
 }
 
 /// Cache hit, else provisional markers — never runs the analyzer.
 ///
 /// Returns `(analysis, used_provisional)`. Used so the first live track can
 /// start without waiting on analysis; subsequent prepares / offline render
-/// still use [`get_or_analyze`].
+/// still use [`get_or_analyze`]. Incomplete caches count as a miss.
 pub fn get_cached_or_provisional(
     path: &Path,
     cache_dir: &Path,
@@ -122,7 +269,9 @@ pub fn get_cached_or_provisional(
 ) -> Result<(TrackAnalysis, bool)> {
     let hash = content_hash(path)?;
     if let Some(cached) = load(cache_dir, &hash) {
-        return Ok((cached, false));
+        if !cached.needs_reanalysis {
+            return Ok((cached, false));
+        }
     }
     let file_name = path
         .file_name()
@@ -157,6 +306,9 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         bars_estimated_low_confidence: true,
         intro_bars_low_confidence: true,
         outro_bars_low_confidence: true,
+        intro_bars_manual: false,
+        outro_bars_manual: false,
+        needs_reanalysis: false,
         rms_dbfs: TARGET_RMS_DBFS,
         gain_db: 0.0,
     }

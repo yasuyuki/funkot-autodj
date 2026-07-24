@@ -198,6 +198,9 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         bars_estimated_low_confidence,
         intro_bars_low_confidence: intro_low_conf,
         outro_bars_low_confidence: outro_low_conf,
+        intro_bars_manual: false,
+        outro_bars_manual: false,
+        needs_reanalysis: false,
         rms_dbfs,
         gain_db,
     })

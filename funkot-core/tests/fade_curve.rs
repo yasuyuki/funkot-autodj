@@ -145,6 +145,9 @@ fn seed_constant_analysis(
         bars_estimated_low_confidence: false,
         intro_bars_low_confidence: false,
         outro_bars_low_confidence: false,
+        intro_bars_manual: false,
+        outro_bars_manual: false,
+        needs_reanalysis: false,
         rms_dbfs: -6.0,
         gain_db: 0.0,
     };

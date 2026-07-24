@@ -108,6 +108,17 @@ struct Args {
     /// Does not render a playlist mix. See `funkot-core/tests/fixtures/README.md`.
     #[arg(long = "gen-test-fixtures", value_name = "DIR")]
     gen_test_fixtures: Option<PathBuf>,
+
+    /// Delete cache entries with no manual intro/outro flags; strip auto fields
+    /// from entries that keep at least one `*_bars_manual` flag (they are
+    /// reanalyzed on next use / with `--fill-missing-cache`).
+    #[arg(long)]
+    purge_auto_cache: bool,
+
+    /// Decode+analyze only tracks whose cache is missing or marked
+    /// `needs_reanalysis`, then exit (skips complete cache hits).
+    #[arg(long)]
+    fill_missing_cache: bool,
 }
 
 fn main() {
@@ -136,6 +147,19 @@ fn run() -> Result<()> {
 
     let playlist = resolve_playlist(&args)?;
     let options = build_options(&args)?;
+
+    if args.purge_auto_cache {
+        let stats = funkot_core::cache::purge_auto(&options.cache_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        eprintln!(
+            "purge-auto-cache: deleted {} cleared {} skipped {}",
+            stats.deleted, stats.cleared, stats.skipped
+        );
+    }
+
+    if args.fill_missing_cache {
+        return fill_missing_cache(&playlist, &options.cache_dir);
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::clone(&stop);
@@ -1003,6 +1027,28 @@ fn select_f32_config(
     Ok(None)
 }
 
+fn fill_missing_cache(playlist: &[PathBuf], cache_dir: &Path) -> Result<()> {
+    use funkot_core::cache;
+    use funkot_core::decode::decode_file;
+
+    let mut analyzed = 0usize;
+    let mut skipped = 0usize;
+    for path in playlist {
+        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (_a, did) = cache::fill_missing(path, cache_dir, &buf)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if did {
+            analyzed += 1;
+            eprintln!("analyzed {}", path.display());
+        } else {
+            skipped += 1;
+        }
+    }
+    eprintln!(
+        "fill-missing-cache: analyzed {analyzed} skipped {skipped} (complete cache hits)"
+    );
+    Ok(())
+}
 
 fn gen_test_fixtures(dir: &Path) -> Result<()> {
     use funkot_core::analysis::analyze;

@@ -48,6 +48,8 @@ funkot-autodj -l playlist.txt \
     --no-loop          # 一巡したら終了(デフォルトは無限ループ)
     --no-gain          # RMS音量正規化を無効化
     --cache-dir DIR    # 解析キャッシュの保存先
+    --purge-auto-cache # 手動フラグなしのキャッシュを削除(手動ありは自動欄をクリア)
+    --fill-missing-cache # 欠落/`needs_reanalysis`のみ再計算して終了
     --sample-rate HZ   # 出力サンプリングレート(ライブはデバイス既定、--render時は44100)
     --render out.wav   # 再生せずWAVに書き出し(聴感テスト用、暗黙で--no-loop)
     --wav-format f32   # オフラインWAV形式: f32(既定) / s24 / s16
@@ -86,8 +88,11 @@ funkot-autodj -l playlist.txt \
 
 初回再生前に各曲の先頭・末尾のみを解析し、結果をファイル内容のハッシュを
 キーにしたJSONとして `--cache-dir` に保存する。イントロ/アウトロ小節数の
-自動推定が外れた曲は、JSONの `intro_bars` / `outro_bars` を手で書き換えれば
-上書きできる(推定に自信がない場合は64小節にフォールバックし
+自動推定が外れた曲は、JSONの `intro_bars` / `outro_bars` を手で書き換え、
+対応する `intro_bars_manual` / `outro_bars_manual` を `true` にすること
+（既定は `false`。手動フラグがあると `--purge-auto-cache` や再解析でも
+その小節数は保持される）。
+推定に自信がない場合は64小節にフォールバックし
 `bars_estimated_low_confidence: true` が付く。側別フラグ
 `intro_bars_low_confidence` / `outro_bars_low_confidence` も記録される。
 両側が高信頼なら `intro < outro` もそのまま保持する（短いイントロ曲向け。
@@ -95,6 +100,19 @@ funkot-autodj -l playlist.txt \
 `outro_bars` だけ変えるときは `outro_start` も
 `total_frames − outro_bars × bar_len` に合わせて更新すること（読込時は再計算しない）。
 キャッシュ形式が変わると `version` が上がり旧JSONは無効化される（現行は v8）。
+
+起動オプション:
+
+- `--purge-auto-cache` — 両手動フラグが `false` のエントリを削除。少なくとも
+  一方が `true` のエントリは手動小節数を残し、自動算出欄をクリアして
+  `needs_reanalysis: true` を立てる
+- `--fill-missing-cache` — キャッシュ欠落または `needs_reanalysis` の曲だけ
+  再解析して終了（完全ヒットはスキップ）。再解析後に手動フラグ側の小節数は
+  マージで保持される
+
+```sh
+funkot-autodj -l playlist.txt --purge-auto-cache --fill-missing-cache
+```
 
 ## 構成
 
