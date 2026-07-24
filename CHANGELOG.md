@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.1] - 2026-07-24
+
+### Fixed
+
+- Live transitions no longer glitch under load: phase-align runs on a worker thread, and finished decks are dropped off the audio thread.
+- First-live mixes on a cold cache no longer fire early from provisional FALLBACK outro (64 bars) while analysis already reported the real length; Upgrade waits for real outro markers.
+- Intro detection prefers a sustained RMS tension drop at 48 (then 64+) over later mid-main fill/rebuild cues (false 80 / false 64 cases).
+
+### Added
+
+- Hand-edited `intro_bars` / `outro_bars` are preserved across `--purge-auto-cache` and reanalysis via `intro_bars_manual` / `outro_bars_manual` and `needs_reanalysis`.
+- `--transitions-only` plays (or with `--render`, writes) the same transition windows used for per-transition clip export.
+- CLI prints `intro_bars` / `outro_bars` / `bpm` when analysis is ready on `TrackStarted`.
+
 ## [0.2.0] - 2026-07-24
 
 ### Breaking
