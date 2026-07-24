@@ -36,6 +36,7 @@ pub fn synth_track(
         outro_mid_plateau_level: 0.0,
         gradual_intro_layers: false,
         main_bass_boost: 0.0,
+        main_sparse_bars: 0,
     })
 }
 
@@ -72,6 +73,10 @@ pub struct SynthOptions {
     /// Extra low-mid (180 Hz) tone amplitude in the main only. Lets the main
     /// grow in RMS/body without a large HF-ratio jump.
     pub main_bass_boost: f32,
+    /// First N bars of the main stay kick-only (even when `main_midhigh`).
+    /// Models tension-drop main entries that later rebuild mid/high
+    /// (Love & Joy-like: true intro 64, false 80 on rebuild).
+    pub main_sparse_bars: u32,
 }
 
 impl Default for SynthOptions {
@@ -92,6 +97,7 @@ impl Default for SynthOptions {
             outro_mid_plateau_level: 0.0,
             gradual_intro_layers: false,
             main_bass_boost: 0.0,
+            main_sparse_bars: 0,
         }
     }
 }
@@ -115,6 +121,8 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
     let intro_end = lead_frames + bar_frames * opt.intro_bars as usize;
     let main_end = intro_end + bar_frames * opt.main_bars as usize;
     let intro_beats = (opt.intro_bars as usize) * BEATS_PER_BAR as usize;
+    let main_sparse_end =
+        intro_end + bar_frames * (opt.main_sparse_bars.min(opt.main_bars) as usize);
     let plateau_bars = opt
         .outro_mid_plateau_bars
         .min(opt.outro_bars.saturating_sub(1)) as usize;
@@ -126,20 +134,24 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
         let beat_start = lead_frames + beat_idx * beat_frames;
         let in_intro = beat_start < intro_end;
         let in_main = beat_start >= intro_end && beat_start < main_end;
+        let in_main_sparse = in_main && beat_start < main_sparse_end;
         let in_outro = beat_start >= main_end;
         let in_outro_plateau = in_outro && beat_start < plateau_end && plateau_bars > 0;
 
-        // Kick on every beat.
+        // Kick on every beat (thinner during sparse main entry = tension drop).
+        let kick_amp = if in_main_sparse { 0.35 } else { 0.8 };
         add_kick(
             &mut mono,
             beat_start,
             kick_len,
             sr,
-            0.8 * opt.amplitude_scale,
+            kick_amp * opt.amplitude_scale,
         );
 
         let mut bright = 0.0f32;
-        if (in_main && opt.main_midhigh) || (opt.intro_outro_midhigh && (in_intro || in_outro)) {
+        if (in_main && opt.main_midhigh && !in_main_sparse)
+            || (opt.intro_outro_midhigh && (in_intro || in_outro))
+        {
             bright = 1.0;
         } else if in_intro && opt.intro_bright_level > 0.0 {
             if opt.gradual_intro_layers && intro_beats > 1 {
@@ -170,6 +182,18 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
                 0.25 * bright * opt.amplitude_scale,
                 &mut rng,
             );
+            // Intro body pad: short HF bursts alone barely move bar RMS, so
+            // tension-drop cues (bright intro → sparse main) need sustained mid.
+            if in_intro && opt.intro_bright_level > 0.0 {
+                add_tone_burst(
+                    &mut mono,
+                    beat_start,
+                    (beat_frames / 2).max(1),
+                    sr,
+                    500.0,
+                    0.28 * bright * opt.amplitude_scale,
+                );
+            }
         }
 
         if in_main && opt.main_bass_boost > 0.0 {

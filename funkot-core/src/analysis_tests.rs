@@ -128,11 +128,54 @@ fn long_intro_96_sharp_main() {
 }
 
 #[test]
+fn intro_64_tension_drop_beats_80_rebuild() {
+    // Bright intro → tension-drop main (sparse) → mid/high rebuild at +16.
+    // Without 64 on the long-cue path, local_rise/ratio at the rebuild picks 80.
+    let sr = 44_100;
+    let bpm = 180.0;
+    let buf = synth_track_with_options(SynthOptions {
+        bpm,
+        intro_bars: 64,
+        main_bars: 48,
+        outro_bars: 16,
+        sample_rate: sr,
+        intro_bright_level: 0.75,
+        main_sparse_bars: 16,
+        ..SynthOptions::default()
+    });
+    let a = analyze(&buf, "intro64_drop.wav").expect("analyze");
+    assert_eq!(a.intro_bars, 64);
+    assert!(!a.intro_bars_low_confidence);
+}
+
+#[test]
 fn intro_48_sharp_main() {
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track(bpm, 48, 32, 32, sr);
     let a = analyze(&buf, "intro48.wav").expect("analyze");
+    assert_eq!(a.intro_bars, 48);
+    assert!(!a.intro_bars_low_confidence);
+}
+
+#[test]
+fn intro_48_tension_drop_beats_64_rebuild() {
+    // Shirube-like: bright intro → tension-drop main at 48 → mid/high rebuild
+    // at +16 (= bar 64). Without preferring the 48 drop, long fill/rise at 64
+    // wins first.
+    let sr = 44_100;
+    let bpm = 180.0;
+    let buf = synth_track_with_options(SynthOptions {
+        bpm,
+        intro_bars: 48,
+        main_bars: 48,
+        outro_bars: 16,
+        sample_rate: sr,
+        intro_bright_level: 0.75,
+        main_sparse_bars: 16,
+        ..SynthOptions::default()
+    });
+    let a = analyze(&buf, "intro48_drop.wav").expect("analyze");
     assert_eq!(a.intro_bars, 48);
     assert!(!a.intro_bars_low_confidence);
 }
@@ -169,7 +212,11 @@ fn outro_mid_plateau_rejects_early_drop_to_48() {
         ..SynthOptions::default()
     });
     let a = analyze(&buf, "ivy_outro.wav").expect("analyze");
-    assert_eq!(a.outro_bars, 48, "got intro={} outro={}", a.intro_bars, a.outro_bars);
+    assert_eq!(
+        a.outro_bars, 48,
+        "got intro={} outro={}",
+        a.intro_bars, a.outro_bars
+    );
     assert!(!a.outro_bars_low_confidence);
 }
 
@@ -653,4 +700,38 @@ fn short_track_errors() {
         Error::Analysis(msg) => assert!(msg.contains("short") || msg.contains("30")),
         other => panic!("expected Analysis error, got {other}"),
     }
+}
+
+/// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
+#[test]
+fn love_and_joy_intro_64_if_testdata_present() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../testdata/Surya Groxyn - Gakumas no Remix 2 - 06 Love & Joy.flac");
+    if !path.is_file() {
+        return;
+    }
+    let buf = crate::decode::decode_file(&path).expect("decode Love & Joy");
+    let a = analyze(&buf, path.file_name().unwrap().to_str().unwrap()).expect("analyze");
+    assert_eq!(
+        a.intro_bars, 64,
+        "Love & Joy intro must be 64 (got {} low={})",
+        a.intro_bars, a.intro_bars_low_confidence
+    );
+}
+
+/// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
+#[test]
+fn shirube_intro_48_if_testdata_present() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../testdata/DimsR - Gakumas no Remix 2 - 10 Shirube.flac");
+    if !path.is_file() {
+        return;
+    }
+    let buf = crate::decode::decode_file(&path).expect("decode Shirube");
+    let a = analyze(&buf, path.file_name().unwrap().to_str().unwrap()).expect("analyze");
+    assert_eq!(
+        a.intro_bars, 48,
+        "Shirube intro must be 48 (got {} low={})",
+        a.intro_bars, a.intro_bars_low_confidence
+    );
 }

@@ -9,12 +9,14 @@
 //!    then refine to sample accuracy (hop quantization is not enough for DJ phase).
 //! 5. Anchor the outro grid from the track end (production ends on a bar).
 //! 6. Detect intro length via boundary contrast + edge sharpness at
-//!    {8,16,32,48,64}, then medium/long cues at {48,80,96} (tension drop,
+//!    {8,16,32,48,64}, then medium/long cues at {48,64,80,96} (tension drop,
 //!    pre-boundary fill/shout, sharp rise) when the before-window is still
-//!    intro-like. Prefer the earliest sustained mainization; reject later
-//!    candidates when a clear earlier step already exists. Short lengths need
-//!    a sharp local step (energy or spectral); gradual layering ramps must not
-//!    be called short with high confidence. `bars >= 64` is not a free pass.
+//!    intro-like. A sustained RMS tension drop at 48 is checked before 64+
+//!    so mid-main fill/rebuild cannot steal a true 48-bar drop intro.
+//!    Prefer the earliest sustained mainization; reject later candidates when
+//!    a clear earlier step already exists. Short lengths need a sharp local
+//!    step (energy or spectral); gradual layering ramps must not be called
+//!    short with high confidence. `bars >= 64` is not a free pass.
 //!    Outro mix trigger = full mid/high-ratio drop boundary at {8,16,32,64}
 //!    plus 16 bars so DJ mixing starts before the collapse (~48 bars from end
 //!    on typical Funkot). Short snaps whose after-window is already a mid-outro
@@ -50,10 +52,11 @@ const MAX_SCAN_BARS_OUTRO: usize = 80;
 const SNAP_CANDIDATES: [u32; 4] = [8, 16, 32, 64];
 /// Intro snap grid including mid-length 48-bar machine intros.
 const INTRO_SNAP_CANDIDATES: [u32; 5] = [8, 16, 32, 48, 64];
-/// Medium/long intro lengths using fill/shout/tension cues (earliest hit).
-/// 48 is handled separately with stricter cues so long 80/96 tracks are not
-/// stolen by mid-intro layer adds.
-const LONG_INTRO_CANDIDATES: [u32; 2] = [80, 96];
+/// Long intro lengths using fill/shout/tension cues (earliest hit).
+/// Includes 64: energy-rise scoring misses tension-drop main entries, and a
+/// later 80 rebuild must not win. A 48-bar tension drop is checked first in
+/// [`pick_long_intro_bars`]; non-drop 48 cues stay on the stricter medium path.
+const LONG_INTRO_CANDIDATES: [u32; 3] = [64, 80, 96];
 /// Bars of "main body" sampled after a candidate boundary for contrast checks.
 const AFTER_WIN_BARS: usize = 8;
 /// Absolute snap slack (bars) when relative tolerance alone is too tight
@@ -1231,12 +1234,12 @@ fn snap_to_bar_grid(bars: u32) -> u32 {
 
 /// Choose a snap length from per-bar features, or fall back when ambiguous.
 ///
-/// Long {80,96} intros are tried first, then a stricter mid-length {48} cue
-/// path, then the earliest sustained short boundary. Short {8,16,32} lengths
-/// require a sharp boundary; gradual layering ramps are not accepted as short
-/// with high confidence. Mainness and candidate scoring prefer the earliest
-/// sustained boundary and reject later ones that already contain a clear
-/// earlier step.
+/// Long cues try a 48-bar tension drop first, then {64,80,96}, then a stricter
+/// mid-length {48} path (fill/shout/rise), then the earliest sustained short
+/// boundary. Short {8,16,32} lengths require a sharp boundary; gradual layering
+/// ramps are not accepted as short with high confidence. Mainness and candidate
+/// scoring prefer the earliest sustained boundary and reject later ones that
+/// already contain a clear earlier step.
 fn pick_section_bars(feats: &[BarFeat]) -> SectionEstimate {
     if let Some(hit) = pick_long_intro_bars(feats) {
         return hit;
@@ -1258,19 +1261,48 @@ fn pick_section_bars(feats: &[BarFeat]) -> SectionEstimate {
     }
 }
 
-/// Detect 80/96-bar intros using cues that energy-rise scoring alone misses.
+/// Detect 48/64/80/96-bar intros using cues that energy-rise scoring alone misses.
 ///
-/// Real Funkot often keeps adding layers at 32/64 while the DJ intro continues.
-/// Accept the earliest of {80,96} when the before-window is still intro-like
-/// and one of: sustained tension drop, pre-boundary fill (+ spectral shift),
-/// HF-ratio shout spike, or a sharp classic rise.
+/// Real Funkot often keeps adding layers at 32 while the DJ intro continues, or
+/// enters the main via a tension drop (quieter after the boundary). A sustained
+/// drop at 48 is accepted before {64,80,96}: otherwise a mid-main fill or
+/// post-drop rebuild can false-trigger 64 on a true 48-bar intro (Shirube).
+/// Without 64 on this path, a post-drop midband rebuild at 80 can false-trigger
+/// on true 64-bar intros (Love & Joy). Fill/shout/rise at 48 stay on the
+/// stricter [`pick_medium_intro_48`] path so mid-intro layer adds do not steal
+/// true 64/80/96 tracks.
 fn pick_long_intro_bars(feats: &[BarFeat]) -> Option<SectionEstimate> {
+    if let Some(est) = long_intro_tension_drop(feats, 48) {
+        return Some(est);
+    }
     for &cand in &LONG_INTRO_CANDIDATES {
         if let Some(est) = long_intro_candidate(feats, cand) {
             return Some(est);
         }
     }
     None
+}
+
+/// Sustained before→after RMS drop only (not fill/shout/rise).
+fn long_intro_tension_drop(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate> {
+    let c = cand as usize;
+    let min_before = if cand <= 48 { 24 } else { 32 };
+    if c < min_before || c + 8 > feats.len() {
+        return None;
+    }
+    if !long_intro_before_is_intro_like(feats, c) {
+        return None;
+    }
+    let drop = median_db(&feats[c - 8..c], |f| f.rms) - median_db(&feats[c..c + 8], |f| f.rms);
+    if drop < 2.0 {
+        return None;
+    }
+    Some(SectionEstimate {
+        bars: cand,
+        low_confidence: false,
+        score: drop,
+        sharpness: drop,
+    })
 }
 
 /// 48-bar intros: same family as long cues, but stricter and blocked when an
