@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file.
 
 - Live playback under CPU load: automatic transitions no longer run kick/hat phase-align inside the audio callback when the worker result is late (use nominal entry instead), and large prepared buffers (Upgrade, surplus Ready, rewind history) are freed off the audio thread to avoid underrun clicks. Manual skip/rewind still uses its existing align path.
 - Intro detection accepts a brightness tension drop (mid/high share falls while RMS holds) at 48 bars, so vocal mains whose hats step back are no longer overrun by a later fill at 64 (IVY). Auto-cached analyses from before this change keep the old length until `--purge-auto-cache`.
+- Intro detection checks the stricter 48-bar fill/shout/rise cue before {64,80,96} long cues, so pre-main spectral shouts (Starmine) are not overwritten by a quieter mid-main at 64. Purge auto-cache to refresh older analyses.
 
 ## [0.3.0] - 2026-07-25
 

@@ -37,6 +37,8 @@ pub fn synth_track(
         gradual_intro_layers: false,
         main_bass_boost: 0.0,
         main_sparse_bars: 0,
+        intro_end_shout_bars: 0,
+        main_sparse_after_bars: 0,
     })
 }
 
@@ -77,6 +79,12 @@ pub struct SynthOptions {
     /// Models tension-drop main entries that later rebuild mid/high
     /// (Love & Joy-like: true intro 64, false 80 on rebuild).
     pub main_sparse_bars: u32,
+    /// Last N intro bars get an extra mid/high shout (Starmine-like pre-main fill).
+    pub intro_end_shout_bars: u32,
+    /// From this many bars into the main onward, drop to sparse kick-only.
+    /// Models a mid-main quiet section that can false-trigger a later boundary
+    /// (Starmine: true intro 48 via shout, false 64 on mid-main drop).
+    pub main_sparse_after_bars: u32,
 }
 
 impl Default for SynthOptions {
@@ -98,6 +106,8 @@ impl Default for SynthOptions {
             gradual_intro_layers: false,
             main_bass_boost: 0.0,
             main_sparse_bars: 0,
+            intro_end_shout_bars: 0,
+            main_sparse_after_bars: 0,
         }
     }
 }
@@ -123,6 +133,10 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
     let intro_beats = (opt.intro_bars as usize) * BEATS_PER_BAR as usize;
     let main_sparse_end =
         intro_end + bar_frames * (opt.main_sparse_bars.min(opt.main_bars) as usize);
+    let main_sparse_after = intro_end
+        + bar_frames * (opt.main_sparse_after_bars.min(opt.main_bars) as usize);
+    let shout_bars = opt.intro_end_shout_bars.min(opt.intro_bars) as usize;
+    let shout_start = intro_end.saturating_sub(bar_frames * shout_bars);
     let plateau_bars = opt
         .outro_mid_plateau_bars
         .min(opt.outro_bars.saturating_sub(1)) as usize;
@@ -134,9 +148,12 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
         let beat_start = lead_frames + beat_idx * beat_frames;
         let in_intro = beat_start < intro_end;
         let in_main = beat_start >= intro_end && beat_start < main_end;
-        let in_main_sparse = in_main && beat_start < main_sparse_end;
+        let in_main_sparse = in_main
+            && ((opt.main_sparse_bars > 0 && beat_start < main_sparse_end)
+                || (opt.main_sparse_after_bars > 0 && beat_start >= main_sparse_after));
         let in_outro = beat_start >= main_end;
         let in_outro_plateau = in_outro && beat_start < plateau_end && plateau_bars > 0;
+        let in_intro_shout = in_intro && shout_bars > 0 && beat_start >= shout_start;
 
         // Kick on every beat (thinner during sparse main entry = tension drop).
         let kick_amp = if in_main_sparse { 0.35 } else { 0.8 };
@@ -152,7 +169,17 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
         if (in_main && opt.main_midhigh && !in_main_sparse)
             || (opt.intro_outro_midhigh && (in_intro || in_outro))
         {
-            bright = 1.0;
+            // Keep early-main brightness near a bright intro so RMS tension-drop
+            // at the true boundary stays weak (Starmine-like); shout carries 48.
+            bright = if in_main
+                && opt.intro_bright_level > 0.0
+                && opt.main_sparse_after_bars > 0
+                && !in_main_sparse
+            {
+                opt.intro_bright_level.max(0.55)
+            } else {
+                1.0
+            };
         } else if in_intro && opt.intro_bright_level > 0.0 {
             if opt.gradual_intro_layers && intro_beats > 1 {
                 let t = beat_idx as f32 / (intro_beats as f32 - 1.0);
@@ -164,6 +191,9 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
             bright = opt.outro_mid_plateau_level;
         } else if in_outro && opt.outro_bright_level > 0.0 {
             bright = opt.outro_bright_level;
+        }
+        if in_intro_shout {
+            bright = bright.max(1.35);
         }
 
         if bright > 0.0 {
@@ -191,7 +221,7 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
                     (beat_frames / 2).max(1),
                     sr,
                     500.0,
-                    0.28 * bright * opt.amplitude_scale,
+                    0.28 * bright.min(1.0) * opt.amplitude_scale,
                 );
             }
         }

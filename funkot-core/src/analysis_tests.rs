@@ -210,6 +210,29 @@ fn intro_48_tension_drop_beats_64_rebuild() {
 }
 
 #[test]
+fn intro_48_shout_beats_64_mid_main_drop() {
+    // Starmine-like: bright intro → pre-boundary spectral shout at 48 → main
+    // continues at similar RMS → quieter mid-main at +16 (= bar 64). Without
+    // checking medium-48 shout before long {64}, the mid-main drop wins.
+    let sr = 44_100;
+    let bpm = 180.0;
+    let buf = synth_track_with_options(SynthOptions {
+        bpm,
+        intro_bars: 48,
+        main_bars: 48,
+        outro_bars: 16,
+        sample_rate: sr,
+        intro_bright_level: 0.65,
+        intro_end_shout_bars: 1,
+        main_sparse_after_bars: 16,
+        ..SynthOptions::default()
+    });
+    let a = analyze(&buf, "intro48_shout.wav").expect("analyze");
+    assert_eq!(a.intro_bars, 48);
+    assert!(!a.intro_bars_low_confidence);
+}
+
+#[test]
 fn short_intro_16_short_outro_keeps_unequal() {
     let sr = 44_100;
     let bpm = 180.0;
@@ -781,6 +804,26 @@ fn shirube_intro_48_if_testdata_present() {
     assert_eq!(
         a.intro_bars, 48,
         "Shirube intro must be 48 (got {} low={})",
+        a.intro_bars, a.intro_bars_low_confidence
+    );
+}
+
+/// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
+///
+/// Starmine enters main with a spectral shout at bar 47–48 (RMS barely moves);
+/// a quieter mid-main at 64 used to win on the long-cue path.
+#[test]
+fn starmine_intro_48_if_testdata_present() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../testdata/Maks Sopian - Gakumas no Remix 2 - 07 Starmine.flac");
+    if !path.is_file() {
+        return;
+    }
+    let buf = crate::decode::decode_file(&path).expect("decode Starmine");
+    let a = analyze(&buf, path.file_name().unwrap().to_str().unwrap()).expect("analyze");
+    assert_eq!(
+        a.intro_bars, 48,
+        "Starmine intro must be 48 (got {} low={})",
         a.intro_bars, a.intro_bars_low_confidence
     );
 }
