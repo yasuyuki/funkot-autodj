@@ -3,10 +3,11 @@
 //! play after `fade_out_end`.
 
 use std::path::PathBuf;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use funkot_core::engine::{fade_in_gain, fade_out_gain, plan_transition, Engine, EngineEvent};
+use funkot_core::engine::{
+    fade_in_gain, fade_out_gain, plan_transition, prepare_tracks_parallel, Engine, EngineEvent,
+};
 use funkot_core::testutil::write_wav;
 use funkot_core::{EngineOptions, PitchMode, BEATS_PER_BAR, MAIN_GAP_BARS};
 
@@ -192,15 +193,17 @@ fn window_rms(mono: &[f32], center: usize, radius: usize) -> f32 {
 /// Transition start is sample-accurate: when `TransitionStarted` appears after a
 /// multi-frame `render`, [`Engine::transition_frames_into`] recovers the offset
 /// within that chunk.
+///
+/// Callers must feed [`Engine::from_prepared`] (after `prepare_tracks_parallel`)
+/// so both decks are ready before render — same pattern as `engine.rs` tests;
+/// avoids CI flake from background-loader timing without changing mix math.
 fn render_with_transition_mark(
     engine: &mut Engine,
     chunk_frames: usize,
-    pause_after_first_audio: Duration,
 ) -> (Vec<f32>, usize) {
     let mut out = Vec::new();
     let mut buf = vec![0.0f32; chunk_frames * 2];
     let mut recording = false;
-    let mut paused = pause_after_first_audio.is_zero();
     let mut spins = 0u64;
     let mut transition_at: Option<usize> = None;
     loop {
@@ -249,10 +252,6 @@ fn render_with_transition_mark(
                 continue;
             }
             recording = true;
-        }
-        if recording && !paused {
-            thread::sleep(pause_after_first_audio);
-            paused = true;
         }
         out.extend_from_slice(chunk);
         if out.len() > 50_000_000 {
@@ -320,16 +319,15 @@ fn linear_fade_full_span_constant_signal() {
     seed_constant_analysis(&path_a, &cache, &silent_a, intro, main, outro, bpm);
     seed_constant_analysis(&path_b, &cache, &tone_b, intro, main, outro, bpm);
 
-    let mut engine = Engine::new(
-        EngineOptions {
-            cache_dir: cache.clone(),
-            ..options_base.clone()
-        },
-        vec![path_a.clone(), path_b.clone()],
-    )
-    .expect("engine");
-    let (mixed_raw, t_frame) =
-        render_with_transition_mark(&mut engine, 4096, Duration::from_secs(180));
+    // Pre-prepare so this asserts fade math, not loader timing (see engine.rs).
+    let options = EngineOptions {
+        cache_dir: cache.clone(),
+        ..options_base.clone()
+    };
+    let tracks = prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1)
+        .expect("prepare");
+    let mut engine = Engine::from_prepared(options, tracks).expect("engine");
+    let (mixed_raw, t_frame) = render_with_transition_mark(&mut engine, 4096);
     let mono = mono_mix(&mixed_raw);
     let ref_rms = window_rms(
         &mono,
@@ -376,16 +374,14 @@ fn linear_fade_full_span_constant_signal() {
     write_wav(&path_b, &silent_b).expect("write b silent");
     seed_constant_analysis(&path_a, &cache2, &tone_a, intro, main, outro, bpm);
     seed_constant_analysis(&path_b, &cache2, &silent_b, intro, main, outro, bpm);
-    let mut engine2 = Engine::new(
-        EngineOptions {
-            cache_dir: cache2,
-            ..options_base
-        },
-        vec![path_a, path_b],
-    )
-    .expect("engine2");
-    let (mixed2_raw, t2) =
-        render_with_transition_mark(&mut engine2, 4096, Duration::from_secs(180));
+    let options2 = EngineOptions {
+        cache_dir: cache2,
+        ..options_base
+    };
+    let tracks2 = prepare_tracks_parallel(&options2, &[path_a.clone(), path_b.clone()], 1)
+        .expect("prepare2");
+    let mut engine2 = Engine::from_prepared(options2, tracks2).expect("engine2");
+    let (mixed2_raw, t2) = render_with_transition_mark(&mut engine2, 4096);
     let mono2 = mono_mix(&mixed2_raw);
     // Reference after HPF has switched to prev (past fade-in) but before fade-out.
     let ref_out = window_rms(
@@ -468,9 +464,9 @@ fn prev_deck_hard_stop_no_residual_after_fade_out() {
     let fo_span = fo_end.saturating_sub(fo_start);
     assert!(fo_span > 1);
 
-    let mut engine = Engine::new(options, vec![path_a, path_b]).expect("engine");
-    let (mixed, t_frame) =
-        render_with_transition_mark(&mut engine, 4096, Duration::from_secs(180));
+    let tracks = prepare_tracks_parallel(&options, &[path_a, path_b], 1).expect("prepare");
+    let mut engine = Engine::from_prepared(options, tracks).expect("engine");
+    let (mixed, t_frame) = render_with_transition_mark(&mut engine, 4096);
     let left = channel(&mixed, false);
     let right = channel(&mixed, true);
 

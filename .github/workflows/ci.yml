@@ -56,11 +56,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test --workspace --release
+        # Skip thin LTO for test binaries only; build job keeps workspace LTO.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
         run: cargo test --workspace --release
 
   build:
     name: build (${{ matrix.artifact }})
-    needs: [test]
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -165,7 +169,7 @@ jobs:
   release:
     name: release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
+    needs: [test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
