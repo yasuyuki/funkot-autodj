@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# BPM 180, 4/4: bars = seconds * 180 / (4 * 60)
+[ $# -eq 1 ] || { echo "usage: $0 SECONDS" >&2; exit 1; }
+awk -v s="$1" 'BEGIN { if (s != s + 0) { exit 1 } print s * 180 / 240 }'
