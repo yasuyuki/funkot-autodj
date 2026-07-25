@@ -1,6 +1,7 @@
 //! Integration tests for the pull-based mixing engine.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use funkot_core::engine::{
@@ -9,6 +10,15 @@ use funkot_core::engine::{
 };
 use funkot_core::testutil::{synth_track, write_wav};
 use funkot_core::{EngineOptions, PitchMode, BEATS_PER_BAR};
+
+/// Serialize this binary: `DECODE_FILE_CALLS` is process-global and races under
+/// parallel engine tests (CI saw 4–5 vs ≤3 on the permit-spin regression).
+fn engine_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 fn temp_dir(label: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -152,6 +162,7 @@ fn bar_rms(mono: &[f32], bar_frames: usize) -> Vec<f32> {
 
 #[test]
 fn two_track_transition_tempo_and_envelope() {
+    let _lock = engine_test_lock();
     let dir = temp_dir("two_track");
     let cache = dir.join("cache");
     let path_a = dir.join("a.wav");
@@ -311,6 +322,7 @@ fn two_track_transition_tempo_and_envelope() {
 
 #[test]
 fn silence_until_ready() {
+    let _lock = engine_test_lock();
     let dir = temp_dir("silence");
     let cache = dir.join("cache");
     let path = dir.join("a.wav");
@@ -347,6 +359,7 @@ fn silence_until_ready() {
 
 #[test]
 fn finished_once_and_stays_zero() {
+    let _lock = engine_test_lock();
     let dir = temp_dir("finished");
     let cache = dir.join("cache");
     let path = dir.join("a.wav");
@@ -389,6 +402,7 @@ fn finished_once_and_stays_zero() {
 
 #[test]
 fn pitch_mode_shift_duration() {
+    let _lock = engine_test_lock();
     let dir = temp_dir("shift");
     let cache = dir.join("cache");
     let path = dir.join("a.wav");
@@ -465,6 +479,7 @@ fn render_until_playing(engine: &mut Engine, chunk: usize) {
 
 #[test]
 fn nav_jump_next_intro_and_restart() {
+    let _lock = engine_test_lock();
     use funkot_core::engine::NavAction;
 
     let dir = temp_dir("nav_jump");
@@ -517,6 +532,7 @@ fn nav_jump_next_intro_and_restart() {
 
 #[test]
 fn nav_prev_jump_after_natural_transition() {
+    let _lock = engine_test_lock();
     use funkot_core::engine::NavAction;
 
     let dir = temp_dir("nav_prev");
@@ -578,6 +594,7 @@ fn nav_real_ivy_transition_clip_if_present() {
         eprintln!("skip nav_real_ivy: testdata FLAC missing");
         return;
     }
+    let _lock = engine_test_lock();
 
     let dir = temp_dir("nav_real");
     let cache = root.join("real-cache-v8");
@@ -661,6 +678,7 @@ fn nav_real_ivy_transition_clip_if_present() {
 
 #[test]
 fn nav_replaces_pending_action() {
+    let _lock = engine_test_lock();
     use funkot_core::engine::NavAction;
 
     let dir = temp_dir("nav_replace");
@@ -696,6 +714,7 @@ fn nav_replaces_pending_action() {
 /// loader prepare-and-drop tracks in a loop (Symphonia probe WARN spam).
 #[test]
 fn loader_does_not_spin_decode_before_history() {
+    let _lock = engine_test_lock();
     use funkot_core::decode;
 
     let dir = temp_dir("permit_spin");
