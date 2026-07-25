@@ -7,8 +7,10 @@
 //! so the audio callback never sleeps.
 //!
 //! Transition phase-align runs on a worker thread once the next track is ready,
-//! and finished decks are dropped off-thread, so the live callback does not
-//! stall on kick/hat search or multi-megabyte `free` under load.
+//! and finished decks / prepared buffers are dropped off-thread, so the live
+//! callback does not stall on kick/hat search or multi-megabyte `free` under
+//! load. Realtime automatic transitions fall back to the nominal entry when the
+//! worker is late (no in-callback align); offline render still computes sync.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -596,6 +598,11 @@ fn retire_deck(deck: Deck) {
     thread::spawn(move || drop(deck));
 }
 
+/// Same as [`retire_deck`] for a bare [`PreparedTrack`] (surplus Ready, Upgrade, history).
+fn retire_prepared(track: PreparedTrack) {
+    thread::spawn(move || drop(track));
+}
+
 /// Pull-based auto-DJ engine.
 pub struct Engine {
     options: EngineOptions,
@@ -952,9 +959,10 @@ impl Engine {
     }
 
     fn push_history(&mut self, track: PreparedTrack) {
-        if let Some(_old) = self.last_track.replace(track) {
+        if let Some(old) = self.last_track.replace(track) {
             // Replaced prior history slot → free that permit.
             self.release_permit();
+            retire_prepared(old);
         } else {
             self.arm_third_permit_if_needed();
         }
@@ -1130,7 +1138,7 @@ impl Engine {
                 if let Some(cur) = self.active.take() {
                     if let Some(old_next) = self.next_track.replace(cur.track) {
                         self.release_permit();
-                        drop(old_next);
+                        retire_prepared(old_next);
                     }
                     // cur's permit moved into next_track.
                 }
@@ -1374,7 +1382,7 @@ impl Engine {
                             "dropping surplus prepared track '{}' (next already queued)",
                             track.path.display()
                         );
-                        drop(track);
+                        retire_prepared(track);
                     }
                 }
                 Ok(LoaderMsg::Upgrade(track)) => {
@@ -1403,7 +1411,9 @@ impl Engine {
         if let Some(deck) = self.active.as_mut() {
             if deck.track.path == track.path {
                 deck.playhead = deck.playhead.min(track.frames.saturating_sub(1));
-                deck.track = track;
+                let old = std::mem::replace(&mut deck.track, track);
+                // Preview Arc free can be multi-ms; never on the audio thread.
+                retire_prepared(old);
                 // Markers / buffer changed — any in-flight align is stale.
                 self.clear_phase_align();
                 self.kick_phase_align_if_needed();
@@ -1412,12 +1422,15 @@ impl Engine {
         }
         if let Some(next) = self.next_track.as_mut() {
             if next.path == track.path {
-                *next = track;
+                let old = std::mem::replace(next, track);
+                retire_prepared(old);
                 self.clear_phase_align();
                 self.kick_phase_align_if_needed();
+                return;
             }
         }
         // Else: already left this track; drop upgrade (no permit — same slot).
+        retire_prepared(track);
     }
 
     /// True when the active deck has consumed its head preview and still needs Upgrade.
@@ -1584,9 +1597,13 @@ impl Engine {
         let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
         self.poll_phase_align();
         // Prefer the background align when it matches this trigger playhead.
+        // Realtime hosts must not fall back to in-callback kick/hat search —
+        // that stalls the audio thread under load (noise / dropouts). Offline
+        // render keeps the sync compute for bit-stable WAVs. Manual nav uses
+        // [`Self::begin_transition_to`] and is unchanged.
         let (entry, prev_nudge) = match self.phase_align_ready.take() {
             Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
-            _ => align_next_entry_with_phase_hypotheses(
+            _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
                 &active.track.samples,
                 active.playhead,
                 &next.samples,
@@ -1596,6 +1613,7 @@ impl Engine {
                 self.options.output_sample_rate,
                 beat_frames,
             ),
+            _ => (nominal, 0),
         };
         self.clear_phase_align();
         let entry = if next.frames == 0 {

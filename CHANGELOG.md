@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Live playback under CPU load: automatic transitions no longer run kick/hat phase-align inside the audio callback when the worker result is late (use nominal entry instead), and large prepared buffers (Upgrade, surplus Ready, rewind history) are freed off the audio thread to avoid underrun clicks. Manual skip/rewind still uses its existing align path.
 - Intro detection accepts a brightness tension drop (mid/high share falls while RMS holds) at 48 bars, so vocal mains whose hats step back are no longer overrun by a later fill at 64 (IVY). Auto-cached analyses from before this change keep the old length until `--purge-auto-cache`.
 
 ## [0.3.0] - 2026-07-25
