@@ -92,7 +92,21 @@ Minimal fixture generation for analysis goldens (does not build a full mix):
 ./dev.sh cargo test -p funkot-core --release --test analysis_golden
 ```
 
-During live playback, press Enter to pause/resume. Stop with Ctrl+C or kill.
+During live playback:
+- **Enter** — pause / resume
+- **Left arrow** — skip / rewind (multi-tap within 500ms):
+  - ×1: transition to this track's normal entry
+  - ×2: transition to the previous track's normal entry
+  - ×3: jump immediately to the previous track's intro
+- **Right arrow** — skip ahead (multi-tap within 500ms):
+  - ×1: transition to the next track's normal entry
+  - ×2: jump immediately to the next track's intro
+- **Ctrl+C** / kill — stop
+
+On each navigational transition the engine estimates BPM near the playhead.
+If it falls in the Funkot band (source-equivalent 172–188 BPM), the mix waits
+for the next bar boundary and uses the normal DJ transition; otherwise it uses
+a simple linear crossfade (no high-pass / phase lock).
 
 Supported formats: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV
 

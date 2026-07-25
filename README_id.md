@@ -84,7 +84,21 @@ Generate fixture minimal untuk analysis golden (tanpa full mix):
 ./dev.sh cargo test -p funkot-core --release --test analysis_golden
 ```
 
-Saat putar live, Enter untuk pause/resume. Keluar dengan Ctrl+C atau kill.
+Saat putar live:
+- **Enter** — jeda / lanjut
+- **Panah kiri** — skip / rewind (multi-tap dalam 500ms):
+  - ×1: transisi ke titik masuk normal track ini
+  - ×2: transisi ke titik masuk normal track sebelumnya
+  - ×3: loncat langsung ke intro track sebelumnya
+- **Panah kanan** — maju (multi-tap dalam 500ms):
+  - ×1: transisi ke titik masuk normal track berikutnya
+  - ×2: loncat langsung ke intro track berikutnya
+- **Ctrl+C** / kill — berhenti
+
+Pada tiap navigasi, mesin memperkirakan BPM di sekitar playhead.
+Jika dalam pita Funkot (setara sumber 172–188 BPM), mix menunggu batas bar
+berikutnya dan memakai transisi DJ normal; jika tidak, memakai crossfade
+linear sederhana (tanpa high-pass / phase lock).
 
 Format didukung: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV
 

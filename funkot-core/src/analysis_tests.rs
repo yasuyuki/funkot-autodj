@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use crate::analysis::{analyze, reconcile_intro_outro, refine_kick_marker, SectionEstimate};
+use crate::analysis::{
+    analyze, analyze_local_tempo, reconcile_intro_outro, refine_kick_marker, SectionEstimate,
+};
 use crate::cache::{self, get_cached_or_provisional, get_or_analyze};
 use crate::decode::AudioBuffer;
 use crate::stretch::{self, position_scale};
@@ -64,6 +66,33 @@ fn classic_180_16_32_16() {
         (outro_secs - expected_secs).abs() < 0.1,
         "outro_start {outro_secs}s vs expected {expected_secs}s"
     );
+}
+
+#[test]
+fn local_tempo_near_target_in_range() {
+    let sr = 44_100u32;
+    let source_bpm = 180.0;
+    let rate = 1.10;
+    let target = source_bpm * rate;
+    let buf = synth_track(source_bpm, 16, 32, 16, sr);
+    // Stretch like the engine: source 180 → target 198.
+    let speed = target / source_bpm;
+    let out = stretch::render_track(&buf.samples, sr, sr, speed, PitchMode::Preserve)
+        .expect("stretch");
+    let frames = (out.len() / 2) as u64;
+    let playhead = frames / 3;
+    let local = analyze_local_tempo(&out, playhead, sr, target).expect("local tempo");
+    assert!(
+        local.in_transition_range,
+        "expected in-range bpm={}, target={target}",
+        local.bpm
+    );
+    assert!(
+        (local.bpm - target).abs() < 3.0,
+        "local bpm {} far from target {target}",
+        local.bpm
+    );
+    assert!(local.next_bar_frame >= playhead);
 }
 
 #[test]

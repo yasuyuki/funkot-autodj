@@ -1,6 +1,6 @@
 //! funkot-autodj CLI: live playback via cpal, or offline WAV render.
 
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -12,9 +12,12 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, StreamConfig, SupportedBufferSize};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use funkot_cli::nav_keys::{MultiPressAggregator, NavDir, MULTI_PRESS_WINDOW};
 use funkot_cli::playlist::{load_playlist_file, validate_paths_exist};
 use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
-use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent};
+use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent, NavAction};
 use funkot_core::{EngineOptions, PitchMode};
 use log::warn;
 
@@ -1025,6 +1028,7 @@ fn run_live(
     let mut engine = Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
     // Audio callback must never sleep (preview→Upgrade wait would underrun under load).
     engine.set_realtime(true);
+    let nav_tx = engine.nav_sender();
 
     // ponytail: try_lock dump; async ringbuf writer if dump still underruns
     let dump_path = dump_wav.map(|p| p.to_path_buf());
@@ -1122,32 +1126,66 @@ fn run_live(
 
     stream.play().context("failed to start audio stream")?;
     let play_elapsed = Arc::new(Mutex::new(PlayElapsed::default()));
-    eprintln!("press Enter to pause/resume, Ctrl+C to stop");
+    eprintln!(
+        "keys: Enter=pause  Left×1=restart  Left×2=prev  Left×3=prev intro  \
+         Right×1=next  Right×2=next intro  (multi-tap ≤{}ms)  Ctrl+C=stop",
+        MULTI_PRESS_WINDOW.as_millis()
+    );
 
-    // Toggle pause from stdin (no TUI dep). EOF or read error ends the watcher.
-    let paused_stdin = Arc::clone(&paused);
-    let play_elapsed_stdin = Arc::clone(&play_elapsed);
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let now_paused = !paused_stdin.fetch_xor(true, Ordering::SeqCst);
-                    if let Ok(mut clock) = play_elapsed_stdin.lock() {
-                        clock.set_paused(now_paused);
+    // Raw keyboard: Enter pause, left/right multi-tap nav. Always restore raw mode.
+    let paused_keys = Arc::clone(&paused);
+    let play_elapsed_keys = Arc::clone(&play_elapsed);
+    let stop_keys = Arc::clone(stop);
+    let key_join = thread::spawn(move || {
+        if let Err(e) = enable_raw_mode() {
+            eprintln!("warn: raw mode unavailable ({e}); skip/rewind keys disabled");
+            // Fallback: line-mode Enter pause only.
+            let stdin = io::stdin();
+            let mut line = String::new();
+            loop {
+                if stop_keys.load(Ordering::SeqCst) {
+                    break;
+                }
+                line.clear();
+                match stdin.lock().read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => toggle_pause(&paused_keys, &play_elapsed_keys),
+                    Err(_) => break,
+                }
+            }
+            return;
+        }
+        let _raw_guard = RawModeGuard;
+        let mut agg = MultiPressAggregator::new();
+        while !stop_keys.load(Ordering::SeqCst) {
+            let poll_ms = MULTI_PRESS_WINDOW
+                .as_millis()
+                .min(50)
+                .max(10) as u64;
+            match event::poll(Duration::from_millis(poll_ms)) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key)) => {
+                        handle_key(
+                            key,
+                            &paused_keys,
+                            &play_elapsed_keys,
+                            &nav_tx,
+                            &mut agg,
+                            &stop_keys,
+                        );
                     }
-                    if now_paused {
-                        println!("paused");
-                    } else {
-                        println!("resumed");
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                Ok(false) => {
+                    if let Some(action) = agg.poll_timeout(Instant::now()) {
+                        let _ = nav_tx.try_send(action);
                     }
                 }
                 Err(_) => break,
             }
         }
+        let _ = agg.flush();
     });
 
     let mut finished = false;
@@ -1168,6 +1206,8 @@ fn run_live(
         }
     }
 
+    stop.store(true, Ordering::SeqCst);
+    let _ = key_join.join();
     drop(stream);
     if let (Some(dump), Some(path)) = (dump, dump_path) {
         let w = Arc::try_unwrap(dump)
@@ -1183,6 +1223,61 @@ fn run_live(
         );
     }
     Ok(())
+}
+
+struct RawModeGuard;
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn toggle_pause(paused: &AtomicBool, play_elapsed: &Mutex<PlayElapsed>) {
+    let now_paused = !paused.fetch_xor(true, Ordering::SeqCst);
+    if let Ok(mut clock) = play_elapsed.lock() {
+        clock.set_paused(now_paused);
+    }
+    // Raw mode: println needs \r
+    if now_paused {
+        println!("\rpaused");
+    } else {
+        println!("\rresumed");
+    }
+    let _ = io::stdout().flush();
+}
+
+fn handle_key(
+    key: KeyEvent,
+    paused: &AtomicBool,
+    play_elapsed: &Mutex<PlayElapsed>,
+    nav_tx: &mpsc::SyncSender<NavAction>,
+    agg: &mut MultiPressAggregator,
+    stop: &AtomicBool,
+) {
+    // Ignore key-up; act on Press (and Repeat for held keys — we still coalesce).
+    if key.kind == KeyEventKind::Release {
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        stop.store(true, Ordering::SeqCst);
+        return;
+    }
+    match key.code {
+        KeyCode::Enter => toggle_pause(paused, play_elapsed),
+        KeyCode::Left => {
+            if let Some(action) = agg.press(NavDir::Left, Instant::now()) {
+                let _ = nav_tx.try_send(action);
+            }
+        }
+        KeyCode::Right => {
+            if let Some(action) = agg.press(NavDir::Right, Instant::now()) {
+                let _ = nav_tx.try_send(action);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn write_frame(data: &mut [f32], frame: usize, channels: u16, l: f32, r: f32) {

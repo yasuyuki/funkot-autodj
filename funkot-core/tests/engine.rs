@@ -435,3 +435,258 @@ fn pitch_mode_shift_duration() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn engine_opts(cache: PathBuf) -> EngineOptions {
+    EngineOptions {
+        rate: 1.10,
+        pitch_mode: PitchMode::Preserve,
+        fade_bars: 4,
+        highpass_hz: 300.0,
+        gain_normalize: false,
+        random: false,
+        loop_playlist: false,
+        output_sample_rate: 44_100,
+        cache_dir: cache,
+    }
+}
+
+fn render_until_playing(engine: &mut Engine, chunk: usize) {
+    let mut buf = vec![0.0f32; chunk * 2];
+    for _ in 0..50_000 {
+        let n = engine.render(&mut buf);
+        assert!(n > 0);
+        if buf.iter().any(|s| s.abs() > 1e-5) {
+            return;
+        }
+    }
+    panic!("timed out waiting for audio");
+}
+
+#[test]
+fn nav_jump_next_intro_and_restart() {
+    use funkot_core::engine::NavAction;
+
+    let dir = temp_dir("nav_jump");
+    let cache = dir.join("cache");
+    let path_a = dir.join("a.wav");
+    let path_b = dir.join("b.wav");
+    let sr = 44_100u32;
+    write_wav(&path_a, &synth_track(180.0, 16, 32, 16, sr)).unwrap();
+    write_wav(&path_b, &synth_track(180.0, 16, 32, 16, sr)).unwrap();
+
+    let options = engine_opts(cache);
+    let bar_frames = options.bar_frames();
+    let tracks =
+        prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1).expect("prepare");
+    let b_fd = tracks[1].first_downbeat_out;
+    let mut engine = Engine::from_prepared(options, tracks).expect("engine");
+    render_until_playing(&mut engine, 2048);
+
+    engine.request_nav(NavAction::JumpToNextIntro);
+    let mut buf = vec![0.0f32; 2048 * 2];
+    let _ = engine.render(&mut buf);
+    let events = engine.poll_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::TrackStarted { path, .. } if path == &path_b)),
+        "expected TrackStarted for B, got {events:?}"
+    );
+
+    // Advance a bit into B, then restart current (left ×1).
+    for _ in 0..100 {
+        let _ = engine.render(&mut buf);
+    }
+    engine.request_nav(NavAction::RestartCurrent);
+    // Offline path may WaitBar then transition — pull enough for a few bars.
+    for _ in 0..(bar_frames as usize * 20 / 2048 + 10) {
+        let _ = engine.render(&mut buf);
+    }
+    let events = engine.poll_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::TransitionStarted { .. })),
+        "restart should start a transition, got {events:?}"
+    );
+
+    let _ = b_fd;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nav_prev_jump_after_natural_transition() {
+    use funkot_core::engine::NavAction;
+
+    let dir = temp_dir("nav_prev");
+    let cache = dir.join("cache");
+    let path_a = dir.join("a.wav");
+    let path_b = dir.join("b.wav");
+    let sr = 44_100u32;
+    // Short main so natural transition arrives quickly.
+    write_wav(&path_a, &synth_track(180.0, 8, 8, 8, sr)).unwrap();
+    write_wav(&path_b, &synth_track(180.0, 8, 16, 8, sr)).unwrap();
+
+    let options = engine_opts(cache);
+    let tracks =
+        prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1).expect("prepare");
+    let mut engine = Engine::from_prepared(options, tracks).expect("engine");
+
+    let mut buf = vec![0.0f32; 4096 * 2];
+    let mut saw_b = false;
+    for _ in 0..200_000 {
+        let n = engine.render(&mut buf);
+        if n == 0 {
+            break;
+        }
+        for e in engine.poll_events() {
+            if matches!(e, EngineEvent::TrackStarted { path, .. } if path == path_b) {
+                saw_b = true;
+            }
+        }
+        if saw_b {
+            break;
+        }
+    }
+    assert!(saw_b, "should reach track B via natural transition");
+
+    engine.request_nav(NavAction::JumpToPrevIntro);
+    let _ = engine.render(&mut buf);
+    let events = engine.poll_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::TrackStarted { path, .. } if path == &path_a)),
+        "left×3 should jump to A intro, got {events:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nav_real_ivy_transition_clip_if_present() {
+    use funkot_core::engine::NavAction;
+    use hound::{SampleFormat, WavSpec, WavWriter};
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("testdata");
+    let path_a = root.join("AntonFer - Gakumas no Remix 2 - 02 IVY.flac");
+    let path_b = root.join("AntonFer - Gakumas no Remix 2 - 09 Sakura Photograph.flac");
+    if !path_a.is_file() || !path_b.is_file() {
+        eprintln!("skip nav_real_ivy: testdata FLAC missing");
+        return;
+    }
+
+    let dir = temp_dir("nav_real");
+    let cache = root.join("real-cache-v8");
+    let options = EngineOptions {
+        rate: 1.10,
+        pitch_mode: PitchMode::Preserve,
+        fade_bars: 4,
+        highpass_hz: 300.0,
+        gain_normalize: true,
+        random: false,
+        loop_playlist: false,
+        output_sample_rate: 44_100,
+        cache_dir: cache,
+    };
+    let tracks =
+        prepare_tracks_parallel(&options, &[path_a, path_b], 1).expect("prepare real");
+    let bar = options.bar_frames();
+    let sr = options.output_sample_rate;
+    let mut engine = Engine::from_prepared(options, tracks).expect("engine");
+    render_until_playing(&mut engine, 4096);
+
+    // Advance ~30s into the first track so local BPM sees steady material.
+    let skip = (30.0 * f64::from(sr)) as usize;
+    let mut buf = vec![0.0f32; 4096 * 2];
+    let mut advanced = 0usize;
+    while advanced < skip {
+        let n = engine.render(&mut buf);
+        assert!(n > 0);
+        advanced += n;
+    }
+
+    engine.request_nav(NavAction::TransitionToNext);
+    let mut out = Vec::new();
+    let capture = (bar * 24.0).round() as usize; // ~24 bars covers wait + fade
+    let mut got = 0usize;
+    let mut saw_trans = false;
+    while got < capture {
+        let n = engine.render(&mut buf);
+        assert!(n > 0, "render ended early");
+        for e in engine.poll_events() {
+            if matches!(e, EngineEvent::TransitionStarted { .. }) {
+                saw_trans = true;
+            }
+        }
+        out.extend_from_slice(&buf[..n * 2]);
+        got += n;
+    }
+    assert!(saw_trans, "expected TransitionStarted from nav");
+    assert_finite_peak(&out, 8.0);
+
+    let mono = mono_mix(&out);
+    let bf = bar.round() as usize;
+    let rms = bar_rms(&mono, bf);
+    assert!(rms.len() >= 4);
+    let peak_rms = rms.iter().copied().fold(0.0f32, f32::max);
+    for (i, &v) in rms.iter().enumerate() {
+        assert!(
+            v >= 0.05 * peak_rms,
+            "nav transition bar {i} dropout rms={v} peak={peak_rms}"
+        );
+    }
+
+    let clip = dir.join("nav_ivy_transition.wav");
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: sr,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let mut w = WavWriter::create(&clip, spec).expect("wav");
+    for frame in out.chunks_exact(2) {
+        w.write_sample(frame[0]).unwrap();
+        w.write_sample(frame[1]).unwrap();
+    }
+    w.finalize().unwrap();
+    eprintln!("wrote {}", clip.display());
+    // Keep clip under testdata for listening if desired.
+    let listen = root.join("nav_ivy_transition_clip.wav");
+    let _ = std::fs::copy(&clip, &listen);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nav_replaces_pending_action() {
+    use funkot_core::engine::NavAction;
+
+    let dir = temp_dir("nav_replace");
+    let cache = dir.join("cache");
+    let path_a = dir.join("a.wav");
+    let path_b = dir.join("b.wav");
+    let sr = 44_100u32;
+    write_wav(&path_a, &synth_track(180.0, 16, 32, 16, sr)).unwrap();
+    write_wav(&path_b, &synth_track(180.0, 16, 32, 16, sr)).unwrap();
+
+    let options = engine_opts(cache);
+    let tracks =
+        prepare_tracks_parallel(&options, &[path_a, path_b.clone()], 1).expect("prepare");
+    let mut engine = Engine::from_prepared(options, tracks).expect("engine");
+    render_until_playing(&mut engine, 2048);
+
+    // Queue a transition, then replace with an immediate jump.
+    engine.request_nav(NavAction::TransitionToNext);
+    engine.request_nav(NavAction::JumpToNextIntro);
+    let mut buf = vec![0.0f32; 2048 * 2];
+    let _ = engine.render(&mut buf);
+    let events = engine.poll_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::TrackStarted { path, .. } if path == &path_b)),
+        "jump should win over pending transition, got {events:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

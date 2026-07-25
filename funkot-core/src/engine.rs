@@ -17,10 +17,25 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::analysis::refine_groove_phase;
+use crate::analysis::{analyze_local_tempo, refine_groove_phase, LocalTempo};
 use crate::filter::StereoHighPass;
 use crate::stretch::{self, position_scale};
 use crate::{cache, decode, EngineOptions, Error, Result, BEATS_PER_BAR, MAIN_GAP_BARS};
+
+/// Live skip / rewind request (CLI / host). Multiple presses are coalesced by the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavAction {
+    /// Left ×1: transition to the current track's normal entry.
+    RestartCurrent,
+    /// Left ×2: transition to the previous track's normal entry.
+    TransitionToPrev,
+    /// Left ×3: jump immediately to the previous track's intro.
+    JumpToPrevIntro,
+    /// Right ×1: transition to the next track's normal entry.
+    TransitionToNext,
+    /// Right ×2: jump immediately to the next track's intro.
+    JumpToNextIntro,
+}
 
 /// Events emitted by the engine (and loader failures).
 #[derive(Debug, Clone)]
@@ -560,6 +575,13 @@ struct ActiveTransition {
     fade_in_end: u64,
     fade_out_start: u64,
     fade_out_end: u64,
+    /// Simultaneous linear crossfade without HPF / phase-align (local BPM out of range).
+    simple: bool,
+}
+
+enum PendingNav {
+    Analyzing { gen: u64 },
+    WaitBar { action: NavAction, at_frame: u64 },
 }
 
 /// Free a finished deck off the audio thread.
@@ -581,6 +603,8 @@ pub struct Engine {
     loader_join: Option<JoinHandle<()>>,
     /// Next prepared track waiting to enter a transition (at most one).
     next_track: Option<PreparedTrack>,
+    /// Previous track kept for rewind (holds a loader permit while present).
+    last_track: Option<PreparedTrack>,
     active: Option<Deck>,
     prev: Option<Deck>,
     transition: Option<ActiveTransition>,
@@ -600,6 +624,12 @@ pub struct Engine {
     /// Background phase-align result: `(prev_start, next_entry, prev_nudge)`.
     phase_align_ready: Option<(u64, u64, u64)>,
     phase_align_rx: Option<Receiver<(u64, u64, u64)>>,
+    /// Host → engine nav commands (audio thread drains in [`Self::render`]).
+    nav_tx: SyncSender<NavAction>,
+    nav_rx: Receiver<NavAction>,
+    pending_nav: Option<PendingNav>,
+    nav_gen: u64,
+    nav_tempo_rx: Option<Receiver<(u64, NavAction, Option<LocalTempo>)>>,
 }
 
 impl Engine {
@@ -614,10 +644,12 @@ impl Engine {
         let bar_frames = options.bar_frames();
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
-        // Two permits ⇒ at most current + next prepared buffers in flight.
-        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(2);
+        // Three permits ⇒ history + current + next prepared buffers in flight.
+        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(3);
         let _ = permit_tx.try_send(());
         let _ = permit_tx.try_send(());
+        let _ = permit_tx.try_send(());
+        let (nav_tx, nav_rx) = mpsc::sync_channel::<NavAction>(8);
 
         let opts = options.clone();
         let shutdown_flag = Arc::clone(&shutdown);
@@ -637,6 +669,7 @@ impl Engine {
             permit_tx,
             loader_join: Some(join),
             next_track: None,
+            last_track: None,
             active: None,
             prev: None,
             transition: None,
@@ -650,6 +683,11 @@ impl Engine {
             block_on_preview_upgrade: true,
             phase_align_ready: None,
             phase_align_rx: None,
+            nav_tx,
+            nav_rx,
+            pending_nav: None,
+            nav_gen: 0,
+            nav_tempo_rx: None,
         })
     }
 
@@ -673,7 +711,8 @@ impl Engine {
         let bar_frames = options.bar_frames();
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
-        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(2);
+        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(3);
+        let (nav_tx, nav_rx) = mpsc::sync_channel::<NavAction>(8);
 
         let mut tracks = tracks;
         let first = (!tracks.is_empty()).then(|| tracks.remove(0));
@@ -682,7 +721,8 @@ impl Engine {
         let rest_empty = rest.is_empty();
 
         // Slots already filled by first/second are not free for the loader.
-        let initial_permits = 2 - usize::from(first.is_some()) - usize::from(second.is_some());
+        // One spare permit remains for rewind history.
+        let initial_permits = 3 - usize::from(first.is_some()) - usize::from(second.is_some());
         for _ in 0..initial_permits {
             let _ = permit_tx.try_send(());
         }
@@ -702,6 +742,7 @@ impl Engine {
             permit_tx,
             loader_join: Some(join),
             next_track: second,
+            last_track: None,
             active: None,
             prev: None,
             transition: None,
@@ -715,6 +756,11 @@ impl Engine {
             block_on_preview_upgrade: true,
             phase_align_ready: None,
             phase_align_rx: None,
+            nav_tx,
+            nav_rx,
+            pending_nav: None,
+            nav_gen: 0,
+            nav_tempo_rx: None,
         };
         if let Some(track) = first {
             engine.start_first(track);
@@ -781,9 +827,12 @@ impl Engine {
             }
 
             self.drain_loader();
+            self.drain_nav_commands();
+            self.poll_nav_tempo();
             self.poll_phase_align();
             self.kick_phase_align_if_needed();
             self.await_preview_upgrade();
+            self.tick_pending_nav();
             self.maybe_start_or_update_transition();
 
             if self.active.is_none() && self.prev.is_none() {
@@ -817,6 +866,17 @@ impl Engine {
         self.transition.as_ref().map(|t| t.frames_into)
     }
 
+    /// Cloneable sender for live hosts (audio callback owns the engine).
+    pub fn nav_sender(&self) -> SyncSender<NavAction> {
+        self.nav_tx.clone()
+    }
+
+    /// Queue a skip/rewind action (replaces any not-yet-executed nav). Safe from
+    /// the render thread; live hosts should prefer [`Self::nav_sender`].
+    pub fn request_nav(&mut self, action: NavAction) {
+        self.begin_nav(action);
+    }
+
     pub fn stop(&mut self) {
         self.stopped = true;
         self.shutdown.store(true, Ordering::SeqCst);
@@ -829,6 +889,7 @@ impl Engine {
         // Unblock loader waiting on a permit.
         let _ = self.permit_tx.try_send(());
         let _ = self.permit_tx.try_send(());
+        let _ = self.permit_tx.try_send(());
         // Detach: prepare_track ignores shutdown and can take minutes (decode/stretch).
         // Joining here made Ctrl+C hang until the in-flight prepare finished or crashed.
         drop(self.loader_join.take());
@@ -839,24 +900,342 @@ impl Engine {
         let _ = self.permit_tx.try_send(());
     }
 
-    /// Drop the previous deck and free its loader permit exactly once.
+    /// Drop the previous deck into rewind history (keeps its permit while stored).
     fn drop_prev(&mut self) {
         if let Some(deck) = self.prev.take() {
+            let same = self.active.as_ref().is_some_and(|a| {
+                a.track.playlist_index == deck.track.playlist_index && a.track.path == deck.track.path
+            });
+            if same {
+                // RestartCurrent: shared buffer / single permit with active.
+                return;
+            }
+            self.push_history(deck.track);
+        }
+    }
+
+    fn push_history(&mut self, track: PreparedTrack) {
+        if let Some(_old) = self.last_track.replace(track) {
+            // Replaced prior history slot → free that permit.
             self.release_permit();
-            retire_deck(deck);
         }
     }
 
     fn retire_active(&mut self) {
         if let Some(deck) = self.active.take() {
-            self.release_permit();
-            retire_deck(deck);
+            self.push_history(deck.track);
+            // History keeps the permit; do not release here.
         }
     }
 
     fn clear_phase_align(&mut self) {
         self.phase_align_ready = None;
         self.phase_align_rx = None;
+    }
+
+    fn drain_nav_commands(&mut self) {
+        let mut last = None;
+        while let Ok(action) = self.nav_rx.try_recv() {
+            last = Some(action);
+        }
+        if let Some(action) = last {
+            self.begin_nav(action);
+        }
+    }
+
+    fn begin_nav(&mut self, action: NavAction) {
+        if self.active.is_none() {
+            return;
+        }
+        match action {
+            NavAction::TransitionToPrev | NavAction::JumpToPrevIntro if self.last_track.is_none() => {
+                return;
+            }
+            NavAction::TransitionToNext | NavAction::JumpToNextIntro if self.next_track.is_none() => {
+                return;
+            }
+            _ => {}
+        }
+
+        // Immediate jumps skip BPM / bar wait.
+        if matches!(
+            action,
+            NavAction::JumpToPrevIntro | NavAction::JumpToNextIntro
+        ) {
+            self.cancel_pending_nav();
+            self.execute_jump(action);
+            return;
+        }
+
+        self.cancel_pending_nav();
+        self.nav_gen = self.nav_gen.wrapping_add(1);
+        let gen = self.nav_gen;
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let samples = Arc::clone(&active.track.samples);
+        let playhead = active.playhead;
+        let sr = self.options.output_sample_rate;
+        let target = self.options.target_bpm();
+
+        // Offline / tests: analyze inline (deterministic, no callback stall concern).
+        if self.block_on_preview_upgrade {
+            let tempo = analyze_local_tempo(&samples, playhead, sr, target);
+            let dj = tempo.map(|t| t.in_transition_range).unwrap_or(false);
+            if dj {
+                let at = tempo.map(|t| t.next_bar_frame).unwrap_or(playhead);
+                self.pending_nav = Some(PendingNav::WaitBar {
+                    action,
+                    at_frame: at,
+                });
+            } else {
+                self.execute_nav_transition(action, true);
+            }
+            return;
+        }
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.nav_tempo_rx = Some(rx);
+        self.pending_nav = Some(PendingNav::Analyzing { gen });
+        let _ = thread::Builder::new()
+            .name("funkot-nav-tempo".into())
+            .spawn(move || {
+                let tempo = analyze_local_tempo(&samples, playhead, sr, target);
+                let _ = tx.send((gen, action, tempo));
+            });
+    }
+
+    fn cancel_pending_nav(&mut self) {
+        self.pending_nav = None;
+        self.nav_tempo_rx = None;
+        self.nav_gen = self.nav_gen.wrapping_add(1);
+    }
+
+    fn poll_nav_tempo(&mut self) {
+        let Some(rx) = self.nav_tempo_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((gen, action, tempo)) => {
+                self.nav_tempo_rx = None;
+                let still = matches!(
+                    self.pending_nav,
+                    Some(PendingNav::Analyzing { gen: g }) if g == gen
+                );
+                if !still {
+                    return;
+                }
+                let dj = tempo.map(|t| t.in_transition_range).unwrap_or(false);
+                if dj {
+                    let at = tempo.map(|t| t.next_bar_frame).unwrap_or_else(|| {
+                        self.active.as_ref().map(|d| d.playhead).unwrap_or(0)
+                    });
+                    self.pending_nav = Some(PendingNav::WaitBar {
+                        action,
+                        at_frame: at,
+                    });
+                } else {
+                    self.pending_nav = None;
+                    self.execute_nav_transition(action, true);
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.nav_tempo_rx = None;
+                if matches!(self.pending_nav, Some(PendingNav::Analyzing { .. })) {
+                    self.pending_nav = None;
+                }
+            }
+        }
+    }
+
+    fn tick_pending_nav(&mut self) {
+        let Some(PendingNav::WaitBar { action, at_frame }) = self.pending_nav else {
+            return;
+        };
+        let playhead = match self.active.as_ref() {
+            Some(d) => d.playhead,
+            None => {
+                self.pending_nav = None;
+                return;
+            }
+        };
+        if playhead >= at_frame {
+            self.pending_nav = None;
+            self.execute_nav_transition(action, false);
+        }
+    }
+
+    fn abort_active_transition(&mut self) {
+        self.transition = None;
+        self.awaiting_next_at_outro = false;
+        if let Some(deck) = self.prev.take() {
+            // Mid-transition abort: prev loses its slot.
+            self.release_permit();
+            retire_deck(deck);
+        }
+        self.clear_phase_align();
+    }
+
+    fn execute_jump(&mut self, action: NavAction) {
+        match action {
+            NavAction::JumpToPrevIntro => {
+                let Some(prev) = self.last_track.take() else {
+                    return;
+                };
+                self.abort_active_transition();
+                if let Some(cur) = self.active.take() {
+                    if let Some(old_next) = self.next_track.replace(cur.track) {
+                        self.release_permit();
+                        drop(old_next);
+                    }
+                    // cur's permit moved into next_track.
+                }
+                self.start_first(prev);
+            }
+            NavAction::JumpToNextIntro => {
+                let Some(next) = self.next_track.take() else {
+                    return;
+                };
+                self.abort_active_transition();
+                if let Some(cur) = self.active.take() {
+                    self.push_history(cur.track);
+                }
+                self.start_first(next);
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_nav_transition(&mut self, action: NavAction, simple: bool) {
+        let target = match action {
+            NavAction::RestartCurrent => {
+                let Some(active) = self.active.as_ref() else {
+                    return;
+                };
+                active.track.clone()
+            }
+            NavAction::TransitionToPrev => match self.last_track.take() {
+                Some(t) => t,
+                None => return,
+            },
+            NavAction::TransitionToNext => match self.next_track.take() {
+                Some(t) => t,
+                None => return,
+            },
+            NavAction::JumpToPrevIntro | NavAction::JumpToNextIntro => return,
+        };
+
+        // RestartCurrent shares the same Arc buffer — no extra permit.
+        let restart_same = matches!(action, NavAction::RestartCurrent);
+        self.begin_transition_to(target, simple, restart_same);
+    }
+
+    /// Start a user-triggered or automatic-style transition onto `next`.
+    fn begin_transition_to(&mut self, next: PreparedTrack, simple: bool, restart_same: bool) {
+        self.abort_active_transition();
+        let Some(active) = self.active.take() else {
+            if !restart_same {
+                // Put next back where it came from if we can.
+                self.next_track = Some(next);
+            }
+            return;
+        };
+
+        let plan = plan_transition(
+            self.options.fade_bars,
+            next.intro_bars,
+            active.track.outro_bars.max(self.options.fade_bars * 2),
+        );
+        let nominal = next
+            .first_downbeat_out
+            .saturating_add(bar_to_frames(plan.skip, self.bar_frames));
+
+        let (entry, prev_nudge) = if simple {
+            (nominal, 0)
+        } else {
+            let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
+            self.poll_phase_align();
+            match self.phase_align_ready.take() {
+                Some((prev_start, entry, nudge)) if prev_start == active.playhead => {
+                    (entry, nudge)
+                }
+                _ => align_next_entry_with_phase_hypotheses(
+                    &active.track.samples,
+                    active.playhead,
+                    &next.samples,
+                    nominal,
+                    active.track.outro_start_out,
+                    active.track.outro_end_anchored_out,
+                    self.options.output_sample_rate,
+                    beat_frames,
+                ),
+            }
+        };
+        self.clear_phase_align();
+        let entry = if next.frames == 0 {
+            0
+        } else {
+            entry.min(next.frames - 1)
+        };
+
+        let from_path = active.track.path.clone();
+        let to_path = next.path.clone();
+        let next_index = next.playlist_index;
+        let same_track = restart_same
+            || (active.track.playlist_index == next.playlist_index
+                && active.track.path == next.path);
+
+        let next_deck = Deck {
+            track: next,
+            playhead: entry,
+            highpass_enabled: !simple,
+            filter: StereoHighPass::new(self.options.output_sample_rate, self.options.highpass_hz),
+        };
+
+        let mut prev_deck = active;
+        prev_deck.highpass_enabled = false;
+        if prev_nudge > 0 {
+            let max_ph = prev_deck.track.frames.saturating_sub(1);
+            prev_deck.playhead = prev_deck.playhead.saturating_add(prev_nudge).min(max_ph);
+        }
+
+        let (fade_in_end, fade_out_start, fade_out_end) = if simple {
+            let n = bar_to_frames(self.options.fade_bars.max(1), self.bar_frames);
+            (n, 0, n)
+        } else {
+            (
+                bar_to_frames(plan.f_eff, self.bar_frames),
+                bar_to_frames(plan.fadeout_start, self.bar_frames),
+                bar_to_frames(plan.fadeout_end, self.bar_frames),
+            )
+        };
+
+        self.pending_events.push(EngineEvent::TransitionStarted {
+            from: from_path,
+            to: to_path.clone(),
+        });
+        if !same_track {
+            self.pending_events.push(EngineEvent::TrackStarted {
+                index: next_index,
+                path: to_path,
+            });
+        }
+
+        self.prev = Some(prev_deck);
+        self.active = Some(next_deck);
+        self.transition = Some(ActiveTransition {
+            frames_into: 0,
+            fade_in_end,
+            fade_out_start,
+            fade_out_end,
+            simple,
+        });
+        self.awaiting_next_at_outro = false;
+
+        // RestartCurrent: both decks share one permit; tag so drop_prev won't
+        // treat prev as an extra slot. push_history on drop still OK (replace).
+        let _ = same_track;
     }
 
     fn poll_phase_align(&mut self) {
@@ -1064,7 +1443,7 @@ impl Engine {
     }
 
     fn maybe_start_or_update_transition(&mut self) {
-        if self.transition.is_some() {
+        if self.transition.is_some() || self.pending_nav.is_some() {
             return;
         }
 
@@ -1221,6 +1600,7 @@ impl Engine {
             fade_in_end,
             fade_out_start,
             fade_out_end,
+            simple: false,
         });
     }
 
@@ -1239,7 +1619,7 @@ impl Engine {
             }
         }
 
-        let (in_trans, frames_into, fade_in_end, fade_out_start, fade_out_end) =
+        let (in_trans, frames_into, fade_in_end, fade_out_start, fade_out_end, simple) =
             if let Some(t) = self.transition.as_ref() {
                 (
                     true,
@@ -1247,9 +1627,10 @@ impl Engine {
                     t.fade_in_end,
                     t.fade_out_start,
                     t.fade_out_end,
+                    t.simple,
                 )
             } else {
-                (false, 0, 0, 0, 0)
+                (false, 0, 0, 0, 0, false)
             };
 
         let mut mix_l = 0.0f32;
@@ -1263,7 +1644,11 @@ impl Engine {
             } else {
                 1.0
             };
-            deck.highpass_enabled = frames_into >= fade_in_end;
+            if !simple {
+                deck.highpass_enabled = frames_into >= fade_in_end;
+            } else {
+                deck.highpass_enabled = false;
+            }
 
             // Skip the mix bus at bit-exact silence, but always drive the HPF so
             // enabling mid-transition does not click from a cold filter state.
@@ -1292,7 +1677,7 @@ impl Engine {
                 1.0
             };
             if in_trans {
-                deck.highpass_enabled = frames_into < fade_in_end;
+                deck.highpass_enabled = !simple && frames_into < fade_in_end;
             }
 
             if deck.playhead < deck.track.frames {
@@ -1353,6 +1738,7 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        let _ = self.permit_tx.try_send(());
         let _ = self.permit_tx.try_send(());
         let _ = self.permit_tx.try_send(());
         while self.loader_rx.try_recv().is_ok() {}

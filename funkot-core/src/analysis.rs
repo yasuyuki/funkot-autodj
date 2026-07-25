@@ -29,7 +29,9 @@
 
 use crate::cache::CACHE_VERSION;
 use crate::decode::AudioBuffer;
-use crate::{Error, Result, TrackAnalysis, BEATS_PER_BAR, FALLBACK_BARS, TARGET_RMS_DBFS};
+use crate::{
+    Error, Result, TrackAnalysis, BEATS_PER_BAR, FALLBACK_BARS, NOMINAL_BPM, TARGET_RMS_DBFS,
+};
 
 /// Head/tail analysis window for BPM/downbeat only (section scan uses the full buffer).
 const SEGMENT_SECS: f64 = 110.0;
@@ -109,6 +111,79 @@ pub struct SectionEstimate {
     pub score: f64,
     /// Local edge sharpness at the candidate boundary.
     pub sharpness: f64,
+}
+
+/// Local tempo around a playhead in already-stretched (output-domain) audio.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocalTempo {
+    /// Estimated BPM in the output / playback domain.
+    pub bpm: f64,
+    /// Next bar-boundary frame at or after `playhead` (output domain).
+    pub next_bar_frame: u64,
+    /// `true` when `bpm` falls in the Funkot transition band around `target_bpm`
+    /// (source-equivalent 172..=188 mapped by `target_bpm / 180`).
+    pub in_transition_range: bool,
+}
+
+/// Estimate tempo near `playhead` in interleaved stereo output audio.
+///
+/// Window: ~8s centered on the playhead (clamped to the buffer). Failure → `None`
+/// (callers treat that as out-of-range → simple crossfade).
+pub fn analyze_local_tempo(
+    interleaved: &[f32],
+    playhead: u64,
+    sample_rate: u32,
+    target_bpm: f64,
+) -> Option<LocalTempo> {
+    if sample_rate == 0 || !target_bpm.is_finite() || target_bpm <= 0.0 {
+        return None;
+    }
+    let frames = (interleaved.len() / 2) as u64;
+    if frames < 8 || playhead >= frames {
+        return None;
+    }
+
+    let sr = f64::from(sample_rate);
+    let win_frames = ((8.0 * sr).round() as u64).max(1);
+    let half = win_frames / 2;
+    let start = playhead.saturating_sub(half);
+    let end = (start + win_frames).min(frames);
+    let start = end.saturating_sub(win_frames).min(start);
+    if end <= start + 4 {
+        return None;
+    }
+
+    let mut mono = Vec::with_capacity((end - start) as usize);
+    for i in start..end {
+        let i = i as usize;
+        mono.push(0.5 * (interleaved[i * 2] + interleaved[i * 2 + 1]));
+    }
+
+    let onset = onset_envelope(&mono, sample_rate, HOP).ok()?;
+    let bpm_lo = target_bpm * (BPM_MIN / NOMINAL_BPM);
+    let bpm_hi = target_bpm * (BPM_MAX / NOMINAL_BPM);
+    let bpm = estimate_bpm_range(&onset.novelty, HOP, sample_rate, bpm_lo, bpm_hi).ok()?;
+
+    let period_hops = bpm_to_period_hops(bpm, HOP as f64, sr);
+    let first_hop =
+        find_first_downbeat_hop(&onset.novelty, &onset.energy, period_hops, HOP).ok()?;
+    let local_fd = refine_kick_marker_mono(&mono, sample_rate, first_hop, KICK_REFINE_RADIUS_MS);
+    let bar_frames = (60.0 / bpm * sr * f64::from(BEATS_PER_BAR)).max(1.0);
+    let abs_fd = start.saturating_add(local_fd);
+    let rel = playhead as f64 - abs_fd as f64;
+    let bars_ahead = (rel / bar_frames).ceil().max(0.0);
+    let mut next_bar = abs_fd as f64 + bars_ahead * bar_frames;
+    if next_bar < playhead as f64 {
+        next_bar += bar_frames;
+    }
+    let next_bar_frame = next_bar.round().clamp(0.0, (frames.saturating_sub(1)) as f64) as u64;
+
+    let in_transition_range = (bpm_lo..=bpm_hi).contains(&bpm);
+    Some(LocalTempo {
+        bpm,
+        next_bar_frame,
+        in_transition_range,
+    })
 }
 
 /// Analyze a fully decoded track. `file_name` is stored for human reference.
@@ -828,10 +903,23 @@ fn bpm_to_period_hops(bpm: f64, hop: f64, sample_rate: f64) -> f64 {
 }
 
 fn estimate_bpm(onset: &[f64], hop: usize, sample_rate: u32) -> Result<f64> {
+    estimate_bpm_range(onset, hop, sample_rate, BPM_MIN, BPM_MAX)
+}
+
+fn estimate_bpm_range(
+    onset: &[f64],
+    hop: usize,
+    sample_rate: u32,
+    bpm_min: f64,
+    bpm_max: f64,
+) -> Result<f64> {
     let sr = f64::from(sample_rate);
     let hop_f = hop as f64;
-    let min_period = bpm_to_period_hops(BPM_MAX, hop_f, sr);
-    let max_period = bpm_to_period_hops(BPM_MIN, hop_f, sr);
+    if !(bpm_min.is_finite() && bpm_max.is_finite()) || bpm_min <= 0.0 || bpm_max <= bpm_min {
+        return Err(Error::Analysis("invalid BPM search range".into()));
+    }
+    let min_period = bpm_to_period_hops(bpm_max, hop_f, sr);
+    let max_period = bpm_to_period_hops(bpm_min, hop_f, sr);
 
     if onset.len() < (max_period as usize) + 8 {
         return Err(Error::Analysis(
@@ -842,10 +930,10 @@ fn estimate_bpm(onset: &[f64], hop: usize, sample_rate: u32) -> Result<f64> {
     // Comb-filter tempo: for each BPM, take the best phase of a beat-period comb
     // on the onset novelty. Impulse-train kicks peak sharply at the true tempo.
     let step = 0.05;
-    let mut best_bpm = 180.0;
+    let mut best_bpm = 0.5 * (bpm_min + bpm_max);
     let mut best_score = f64::NEG_INFINITY;
-    let mut bpm = BPM_MIN;
-    while bpm <= BPM_MAX + 1e-9 {
+    let mut bpm = bpm_min;
+    while bpm <= bpm_max + 1e-9 {
         let period = bpm_to_period_hops(bpm, hop_f, sr);
         if period < min_period - 0.5 || period > max_period + 0.5 {
             bpm += step;
@@ -874,12 +962,13 @@ fn estimate_bpm(onset: &[f64], hop: usize, sample_rate: u32) -> Result<f64> {
         best_bpm = mid + delta.clamp(-1.5, 1.5) * d;
     }
 
-    if !best_bpm.is_finite() || !(BPM_MIN - 1.0..=BPM_MAX + 1.0).contains(&best_bpm) {
+    let pad = (bpm_max - bpm_min) * 0.05 + 0.5;
+    if !best_bpm.is_finite() || !(bpm_min - pad..=bpm_max + pad).contains(&best_bpm) {
         return Err(Error::Analysis(format!(
             "BPM estimate out of range: {best_bpm}"
         )));
     }
-    Ok(best_bpm.clamp(BPM_MIN - 0.5, BPM_MAX + 0.5))
+    Ok(best_bpm.clamp(bpm_min - 0.5, bpm_max + 0.5))
 }
 
 /// Max over phase of the mean onset value sampled on a comb with the given period.
