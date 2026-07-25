@@ -749,6 +749,26 @@ fn love_and_joy_intro_64_if_testdata_present() {
 }
 
 /// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
+///
+/// IVY enters its vocal main at 48 with RMS held but the machine hats stepping
+/// back (brightness tension drop); a later fill at 62 used to false-trigger 64.
+#[test]
+fn ivy_intro_48_if_testdata_present() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../testdata/AntonFer - Gakumas no Remix 2 - 02 IVY.flac");
+    if !path.is_file() {
+        return;
+    }
+    let buf = crate::decode::decode_file(&path).expect("decode IVY");
+    let a = analyze(&buf, path.file_name().unwrap().to_str().unwrap()).expect("analyze");
+    assert_eq!(
+        a.intro_bars, 48,
+        "IVY intro must be 48 (got {} low={})",
+        a.intro_bars, a.intro_bars_low_confidence
+    );
+}
+
+/// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
 #[test]
 fn shirube_intro_48_if_testdata_present() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

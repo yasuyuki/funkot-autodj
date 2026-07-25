@@ -11,8 +11,9 @@
 //! 6. Detect intro length via boundary contrast + edge sharpness at
 //!    {8,16,32,48,64}, then medium/long cues at {48,64,80,96} (tension drop,
 //!    pre-boundary fill/shout, sharp rise) when the before-window is still
-//!    intro-like. A sustained RMS tension drop at 48 is checked before 64+
-//!    so mid-main fill/rebuild cannot steal a true 48-bar drop intro.
+//!    intro-like. A sustained tension drop at 48 — quieter (RMS) or duller
+//!    (mid/high share, vocal main with the hats stepping back) — is checked
+//!    before 64+ so mid-main fill/rebuild cannot steal a true 48-bar intro.
 //!    Prefer the earliest sustained mainization; reject later candidates when
 //!    a clear earlier step already exists. Short lengths need a sharp local
 //!    step (energy or spectral); gradual layering ramps must not be called
@@ -1372,7 +1373,11 @@ fn pick_long_intro_bars(feats: &[BarFeat]) -> Option<SectionEstimate> {
     None
 }
 
-/// Sustained before→after RMS drop only (not fill/shout/rise).
+/// Sustained before→after energy or brightness drop only (not fill/shout/rise).
+///
+/// Funkot vocal mains enter either quieter (RMS drop, Shirube) or duller — the
+/// machine hats/leads step back for the vocal while RMS holds (IVY). Both are
+/// tension drops; brightness needs a bigger margin since it is noisier.
 fn long_intro_tension_drop(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate> {
     let c = cand as usize;
     let min_before = if cand <= 48 { 24 } else { 32 };
@@ -1382,15 +1387,25 @@ fn long_intro_tension_drop(feats: &[BarFeat], cand: u32) -> Option<SectionEstima
     if !long_intro_before_is_intro_like(feats, c) {
         return None;
     }
-    let drop = median_db(&feats[c - 8..c], |f| f.rms) - median_db(&feats[c..c + 8], |f| f.rms);
-    if drop < 2.0 {
+    let before = &feats[c - 8..c];
+    let after = &feats[c..c + 8];
+    let drop = median_db(before, |f| f.rms) - median_db(after, |f| f.rms);
+    // Only trust brightness with a full head scan: on a short track the
+    // after-window is the (equally dull) outro, not a vocal main.
+    let dull = if feats.len() >= MAX_SCAN_BARS_INTRO {
+        local_ratio_step(after, before)
+    } else {
+        0.0
+    };
+    if drop < 2.0 && dull < 3.0 {
         return None;
     }
+    let score = drop.max(dull);
     Some(SectionEstimate {
         bars: cand,
         low_confidence: false,
-        score: drop,
-        sharpness: drop,
+        score,
+        sharpness: score,
     })
 }
 
