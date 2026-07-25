@@ -34,6 +34,7 @@ pub fn synth_track(
         outro_bright_level: 0.0,
         outro_mid_plateau_bars: 0,
         outro_mid_plateau_level: 0.0,
+        outro_end_tag_bars: 0,
         gradual_intro_layers: false,
         main_bass_boost: 0.0,
         main_sparse_bars: 0,
@@ -69,6 +70,9 @@ pub struct SynthOptions {
     pub outro_mid_plateau_bars: u32,
     /// Brightness for [`Self::outro_mid_plateau_bars`] (0..1 scale).
     pub outro_mid_plateau_level: f32,
+    /// Last N outro bars get a bright mid/high end-tag (Starmine-like final fill
+    /// after a sparse floor). Must not inflate the outro-floor estimate.
+    pub outro_end_tag_bars: u32,
     /// If true, intro mid/high ramps linearly from 0 to `intro_bright_level`
     /// across the intro (gradual layering).
     pub gradual_intro_layers: bool,
@@ -103,6 +107,7 @@ impl Default for SynthOptions {
             outro_bright_level: 0.0,
             outro_mid_plateau_bars: 0,
             outro_mid_plateau_level: 0.0,
+            outro_end_tag_bars: 0,
             gradual_intro_layers: false,
             main_bass_boost: 0.0,
             main_sparse_bars: 0,
@@ -141,6 +146,8 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
         .outro_mid_plateau_bars
         .min(opt.outro_bars.saturating_sub(1)) as usize;
     let plateau_end = main_end + bar_frames * plateau_bars;
+    let end_tag_bars = opt.outro_end_tag_bars.min(opt.outro_bars) as usize;
+    let end_tag_start = (lead_frames + body_frames).saturating_sub(bar_frames * end_tag_bars);
 
     let mut rng = 0xC0FFEE_u32;
 
@@ -153,6 +160,7 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
                 || (opt.main_sparse_after_bars > 0 && beat_start >= main_sparse_after));
         let in_outro = beat_start >= main_end;
         let in_outro_plateau = in_outro && beat_start < plateau_end && plateau_bars > 0;
+        let in_outro_end_tag = in_outro && end_tag_bars > 0 && beat_start >= end_tag_start;
         let in_intro_shout = in_intro && shout_bars > 0 && beat_start >= shout_start;
 
         // Kick on every beat (thinner during sparse main entry = tension drop).
@@ -191,6 +199,9 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
             bright = opt.outro_mid_plateau_level;
         } else if in_outro && opt.outro_bright_level > 0.0 {
             bright = opt.outro_bright_level;
+        }
+        if in_outro_end_tag {
+            bright = bright.max(0.95);
         }
         if in_intro_shout {
             bright = bright.max(1.35);

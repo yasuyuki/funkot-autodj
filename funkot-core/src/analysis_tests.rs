@@ -273,6 +273,33 @@ fn outro_mid_plateau_rejects_early_drop_to_48() {
 }
 
 #[test]
+fn outro_end_tag_does_not_inflate_floor_to_48() {
+    // Starmine-like: 32-bar outro (16 mid-plateau + 16 sparse) plus a bright
+    // final fill. Floor must use a low robust estimate so the ~16 drop + lead
+    // stays 32; a median floor raised by the tag used to skip to 32+lead=48.
+    let sr = 44_100;
+    let bpm = 180.0;
+    let buf = synth_track_with_options(SynthOptions {
+        bpm,
+        intro_bars: 16,
+        main_bars: 64,
+        outro_bars: 32,
+        sample_rate: sr,
+        outro_mid_plateau_bars: 16,
+        outro_mid_plateau_level: 0.55,
+        outro_end_tag_bars: 4,
+        ..SynthOptions::default()
+    });
+    let a = analyze(&buf, "starmine_outro_tag.wav").expect("analyze");
+    assert_eq!(
+        a.outro_bars, 32,
+        "got intro={} outro={}",
+        a.intro_bars, a.outro_bars
+    );
+    assert!(!a.outro_bars_low_confidence);
+}
+
+#[test]
 fn no_section_contrast_falls_back() {
     let sr = 44_100;
     let bpm = 180.0;
@@ -811,9 +838,10 @@ fn shirube_intro_48_if_testdata_present() {
 /// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
 ///
 /// Starmine enters main with a spectral shout at bar 47–48 (RMS barely moves);
-/// a quieter mid-main at 64 used to win on the long-cue path.
+/// a quieter mid-main at 64 used to win on the long-cue path. Outro is 32 bars;
+/// a bright end-tag used to inflate the floor and report 48.
 #[test]
-fn starmine_intro_48_if_testdata_present() {
+fn starmine_intro_48_outro_32_if_testdata_present() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../testdata/Maks Sopian - Gakumas no Remix 2 - 07 Starmine.flac");
     if !path.is_file() {
@@ -825,5 +853,10 @@ fn starmine_intro_48_if_testdata_present() {
         a.intro_bars, 48,
         "Starmine intro must be 48 (got {} low={})",
         a.intro_bars, a.intro_bars_low_confidence
+    );
+    assert_eq!(
+        a.outro_bars, 32,
+        "Starmine outro must be 32 (got {} low={})",
+        a.outro_bars, a.outro_bars_low_confidence
     );
 }

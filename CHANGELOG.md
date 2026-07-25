@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Outro floor sampling falls back to the lower quartile when a bright final fill spikes the near-end window (max ≫ median), so true 32-bar outros are no longer reported as 48 (Starmine). Purge auto-cache to refresh older analyses.
+
 ## [0.3.1] - 2026-07-25
 
 ### Fixed

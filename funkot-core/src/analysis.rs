@@ -1162,9 +1162,17 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
         })
         .collect();
 
+    // Floor window can mix a bright final fill with the true sparse collapse
+    // (Starmine). When max ≫ median an end-tag is present — use Q1 so the tag
+    // does not raise `enter` and skip the ~16-bar drop (→ false 32+lead=48).
+    // Milder windows keep the median (Totsumal / IVY).
     let mut floor_vals: Vec<f64> = ratio[floor_lo..floor_hi].to_vec();
     floor_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let floor = floor_vals[floor_vals.len() / 2];
+    let n = floor_vals.len();
+    let q1 = floor_vals[n / 4];
+    let median = floor_vals[n / 2];
+    let max = floor_vals[n - 1];
+    let floor = if max > median * 1.55 { q1 } else { median };
 
     let far_lo = (feats.len() / 2).max(floor_hi + 4);
     if far_lo >= ratio.len() {
