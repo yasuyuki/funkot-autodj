@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # At most ~2×/day when master moved; always on release tags.
+  schedule:
+    - cron: "0 */12 * * *"
   push:
-    branches: [master]
     tags: ["v*"]
 
 env:
@@ -10,8 +12,32 @@ env:
   RUST_VERSION: "1.93"
 
 jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # schedule: only if master got a commit in the last 12h
+          if git log --since="12 hours ago" -1 --pretty=%H | grep -q .; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
     name: test (linux)
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
