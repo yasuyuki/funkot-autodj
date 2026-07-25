@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - 2026-07-25
+
+### Added
+
+- Live skip/rewind navigation via left/right arrow multi-tap (≤500ms window): restart current, previous/next at normal entry, or immediate jump to previous/next intro.
+- Local tempo analysis around the playhead; source-equivalent 172–188 BPM uses the usual DJ transition (bar wait, HPF, phase lock), otherwise a simple linear crossfade without HPF/phase-align.
+- Crossterm raw-mode keyboard handling in the CLI (Enter pause/resume; fallback to line-mode Enter if raw mode is unavailable).
+- Engine `NavAction` / `nav_sender` API and rewind history of the previous deck for reverse navigation.
+
 ## [0.2.1] - 2026-07-24
 
 ### Fixed
