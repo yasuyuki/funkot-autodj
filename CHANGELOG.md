@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-25
+
 ### Fixed
 
 - Live playback under CPU load: automatic transitions no longer run kick/hat phase-align inside the audio callback when the worker result is late (use nominal entry instead), and large prepared buffers (Upgrade, surplus Ready, rewind history) are freed off the audio thread to avoid underrun clicks. Manual skip/rewind still uses its existing align path.
