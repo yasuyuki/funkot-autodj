@@ -2,16 +2,32 @@
 
 use std::fs::File;
 use std::path::Path;
+#[cfg(any(test, feature = "testutil"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::formats::TrackType;
+use symphonia::core::formats::probe::{Hint, ProbeableFormat};
+use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use symphonia::default::formats::IsoMp4Reader;
 
 use crate::{Error, Result};
+
+/// Test/helper counter for how often [`decode_file`] opens a demuxer.
+#[cfg(any(test, feature = "testutil"))]
+pub static DECODE_FILE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(test, feature = "testutil"))]
+pub fn reset_decode_file_calls() {
+    DECODE_FILE_CALLS.store(0, Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "testutil"))]
+pub fn decode_file_calls() -> u64 {
+    DECODE_FILE_CALLS.load(Ordering::SeqCst)
+}
 
 /// Fully decoded audio: interleaved stereo f32 at the file's native sample rate.
 #[derive(Debug, Clone)]
@@ -45,35 +61,90 @@ impl AudioBuffer {
     }
 }
 
-/// Decode an entire audio file to stereo f32 at native sample rate.
+fn extension_lower(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+}
+
+fn is_isomp4_extension(ext: &str) -> bool {
+    // Match symphonia-format-isomp4's registered extensions (not raw `.aac`).
+    matches!(
+        ext,
+        "m4a" | "mp4" | "m4b" | "m4p" | "m4r" | "m4v" | "mov"
+    )
+}
+
+/// Open a demuxer for `path`.
 ///
-/// Supported: MP3, AAC (m4a), ALAC (m4a), FLAC, Ogg Vorbis, WAV.
-pub fn decode_file(path: &Path) -> Result<AudioBuffer> {
-    let file = File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
+/// ISO BMFF (m4a/mp4/…) is opened via [`IsoMp4Reader`] directly. Symphonia's
+/// generic probe searches for the `ftyp` marker at offset 4 and warns
+/// `skipped 4 bytes of junk at 0` on every normal file — those bytes are the
+/// atom size, not junk. Direct open avoids that false-positive WARN on each
+/// prepare. Other formats still use the probe (with an extension hint).
+fn open_format<'s>(
+    path: &Path,
+    mss: MediaSourceStream<'s>,
+    fmt_opts: FormatOptions,
+    meta_opts: MetadataOptions,
+) -> Result<Box<dyn FormatReader + 's>> {
+    let ext = extension_lower(path);
+    if ext.as_deref().is_some_and(is_isomp4_extension) {
+        match IsoMp4Reader::try_probe_new(mss, fmt_opts.clone()) {
+            Ok(format) => return Ok(format),
+            Err(e) => {
+                // Re-open for probe fallback (mss was consumed).
+                let file = File::open(path).map_err(|io| {
+                    Error::Decode(format!(
+                        "isomp4 open failed for '{}' ({e}); re-open: {io}",
+                        path.display()
+                    ))
+                })?;
+                let mss = MediaSourceStream::new(Box::new(file), Default::default());
+                return probe_format(path, mss, fmt_opts, meta_opts);
+            }
+        }
     }
+    probe_format(path, mss, fmt_opts, meta_opts)
+}
 
-    let fmt_opts = FormatOptions::default();
-    let meta_opts = MetadataOptions::default();
-
-    let mut format = symphonia::default::get_probe()
+fn probe_format<'s>(
+    path: &Path,
+    mss: MediaSourceStream<'s>,
+    fmt_opts: FormatOptions,
+    meta_opts: MetadataOptions,
+) -> Result<Box<dyn FormatReader + 's>> {
+    let mut hint = Hint::new();
+    if let Some(ext) = extension_lower(path) {
+        hint.with_extension(&ext);
+    }
+    symphonia::default::get_probe()
         .probe(&hint, mss, fmt_opts, meta_opts)
         .map_err(|e| {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("(none)");
+            let ext = extension_lower(path).unwrap_or_else(|| "(none)".into());
             Error::UnsupportedFormat(format!(
                 "cannot probe '{}': {} (extension: {})",
                 path.display(),
                 e,
                 ext
             ))
-        })?;
+        })
+}
+
+/// Decode an entire audio file to stereo f32 at native sample rate.
+///
+/// Supported: MP3, AAC (m4a), ALAC (m4a), FLAC, Ogg Vorbis, WAV.
+pub fn decode_file(path: &Path) -> Result<AudioBuffer> {
+    #[cfg(any(test, feature = "testutil"))]
+    DECODE_FILE_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    let file = File::open(path)?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let fmt_opts = FormatOptions::default();
+    let meta_opts = MetadataOptions::default();
+
+    let mut format = open_format(path, mss, fmt_opts, meta_opts)?;
 
     let track = format
         .default_track(TrackType::Audio)
@@ -345,5 +416,17 @@ mod tests {
             }
             other => panic!("expected UnsupportedFormat, got {other}"),
         }
+    }
+
+    #[test]
+    fn isomp4_extension_detected() {
+        assert!(is_isomp4_extension("m4a"));
+        assert!(is_isomp4_extension("mp4"));
+        assert!(!is_isomp4_extension("mp3"));
+        assert!(!is_isomp4_extension("flac"));
+        assert_eq!(
+            extension_lower(Path::new("Track.M4A")).as_deref(),
+            Some("m4a")
+        );
     }
 }

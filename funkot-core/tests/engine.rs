@@ -690,3 +690,47 @@ fn nav_replaces_pending_action() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Regression: seeding 3 loader permits before rewind history existed let the
+/// loader prepare-and-drop tracks in a loop (Symphonia probe WARN spam).
+#[test]
+fn loader_does_not_spin_decode_before_history() {
+    use funkot_core::decode;
+
+    let dir = temp_dir("permit_spin");
+    let cache = dir.join("cache");
+    let sr = 44_100u32;
+    // Long enough that we stay on track 1 while spinning render; short enough
+    // that a surplus prepare loop would decode many files quickly.
+    let mut paths = Vec::new();
+    for i in 0..6 {
+        let p = dir.join(format!("t{i}.wav"));
+        write_wav(&p, &synth_track(180.0, 16, 64, 16, sr)).unwrap();
+        paths.push(p);
+    }
+
+    decode::reset_decode_file_calls();
+    let mut options = engine_opts(cache);
+    options.loop_playlist = true;
+    let mut engine = Engine::new(options, paths).expect("engine");
+    render_until_playing(&mut engine, 2048);
+
+    // ~2s of audio at 44.1k / 2048 — well before a 64-bar main outro.
+    let mut buf = vec![0.0f32; 2048 * 2];
+    for _ in 0..50 {
+        let _ = engine.render(&mut buf);
+        let _ = engine.poll_events();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let calls = decode::decode_file_calls();
+    // first-live + one next prefetch (occasionally +1 if Upgrade path re-touches;
+    // never a continuous spin through the 6-track playlist).
+    assert!(
+        calls <= 3,
+        "expected ≤3 decode_file calls before history exists, got {calls}"
+    );
+
+    engine.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use log::warn;
+
 use crate::analysis::{analyze_local_tempo, refine_groove_phase, LocalTempo};
 use crate::filter::StereoHighPass;
 use crate::stretch::{self, position_scale};
@@ -615,6 +617,13 @@ pub struct Engine {
     finished: bool,
     finished_emitted: bool,
     stopped: bool,
+    /// Third loader permit (history / in-transition `prev`) armed after a slot exists.
+    ///
+    /// Seeding all three permits at startup let the loader prepare a track while
+    /// `active` + `next_track` were already full and `last_track` was still empty;
+    /// each surplus `Ready` was dropped and the permit re-released, causing a
+    /// decode/probe loop (~every prepare duration) and spam Symphonia junk warnings.
+    third_permit_armed: bool,
     /// Playlist exhausted signal from loader (no more tracks coming).
     loader_exhausted: bool,
     /// When true, [`Self::render`] spin-waits if the first-track head preview
@@ -644,9 +653,9 @@ impl Engine {
         let bar_frames = options.bar_frames();
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
-        // Three permits ⇒ history + current + next prepared buffers in flight.
+        // Capacity 3 for history + current + next, but only seed current+next
+        // until rewind history / in-transition prev actually exists.
         let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(3);
-        let _ = permit_tx.try_send(());
         let _ = permit_tx.try_send(());
         let _ = permit_tx.try_send(());
         let (nav_tx, nav_rx) = mpsc::sync_channel::<NavAction>(8);
@@ -679,6 +688,7 @@ impl Engine {
             finished: false,
             finished_emitted: false,
             stopped: false,
+            third_permit_armed: false,
             loader_exhausted: false,
             block_on_preview_upgrade: true,
             phase_align_ready: None,
@@ -721,8 +731,11 @@ impl Engine {
         let rest_empty = rest.is_empty();
 
         // Slots already filled by first/second are not free for the loader.
-        // One spare permit remains for rewind history.
-        let initial_permits = 3 - usize::from(first.is_some()) - usize::from(second.is_some());
+        // Do not seed the history/prev spare until that slot exists (see
+        // `arm_third_permit_if_needed`).
+        let initial_permits = 2usize
+            .saturating_sub(usize::from(first.is_some()))
+            .saturating_sub(usize::from(second.is_some()));
         for _ in 0..initial_permits {
             let _ = permit_tx.try_send(());
         }
@@ -752,6 +765,7 @@ impl Engine {
             finished: false,
             finished_emitted: false,
             stopped: false,
+            third_permit_armed: false,
             loader_exhausted: rest_empty,
             block_on_preview_upgrade: true,
             phase_align_ready: None,
@@ -900,6 +914,26 @@ impl Engine {
         let _ = self.permit_tx.try_send(());
     }
 
+    /// Enable the third loader permit once a distinct history/prev buffer exists.
+    ///
+    /// `RestartCurrent` parks the same track on `prev` without an extra permit;
+    /// arming there would recreate the surplus-prepare loop.
+    fn arm_third_permit_if_needed(&mut self) {
+        if self.third_permit_armed {
+            return;
+        }
+        let distinct_prev = self.prev.as_ref().is_some_and(|p| {
+            !self.active.as_ref().is_some_and(|a| {
+                a.track.playlist_index == p.track.playlist_index && a.track.path == p.track.path
+            })
+        });
+        if self.last_track.is_none() && !distinct_prev {
+            return;
+        }
+        self.third_permit_armed = true;
+        self.release_permit();
+    }
+
     /// Drop the previous deck into rewind history (keeps its permit while stored).
     fn drop_prev(&mut self) {
         if let Some(deck) = self.prev.take() {
@@ -918,6 +952,8 @@ impl Engine {
         if let Some(_old) = self.last_track.replace(track) {
             // Replaced prior history slot → free that permit.
             self.release_permit();
+        } else {
+            self.arm_third_permit_if_needed();
         }
     }
 
@@ -1232,6 +1268,7 @@ impl Engine {
             simple,
         });
         self.awaiting_next_at_outro = false;
+        self.arm_third_permit_if_needed();
 
         // RestartCurrent: both decks share one permit; tag so drop_prev won't
         // treat prev as an extra slot. push_history on drop still OK (replace).
@@ -1327,8 +1364,14 @@ impl Engine {
                         self.next_track = Some(track);
                         self.kick_phase_align_if_needed();
                     } else {
-                        // Should not happen with the permit scheme; drop & free slot.
-                        self.release_permit();
+                        // Permit accounting bug: accepting this would bounce
+                        // prepares forever. Drop the buffer and keep the permit
+                        // consumed so the loader cannot spin.
+                        warn!(
+                            "dropping surplus prepared track '{}' (next already queued)",
+                            track.path.display()
+                        );
+                        drop(track);
                     }
                 }
                 Ok(LoaderMsg::Upgrade(track)) => {
@@ -1602,6 +1645,7 @@ impl Engine {
             fade_out_end,
             simple: false,
         });
+        self.arm_third_permit_if_needed();
     }
 
     fn render_one_frame(&mut self) -> (f32, f32) {
