@@ -137,8 +137,12 @@ mod tests {
         let mut a = MultiPressAggregator::new();
         let t = t0();
         assert!(a.press(NavDir::Left, t).is_none());
-        assert!(a.press(NavDir::Left, t + Duration::from_millis(100)).is_none());
-        assert!(a.press(NavDir::Left, t + Duration::from_millis(200)).is_none());
+        assert!(a
+            .press(NavDir::Left, t + Duration::from_millis(100))
+            .is_none());
+        assert!(a
+            .press(NavDir::Left, t + Duration::from_millis(200))
+            .is_none());
         assert_eq!(
             a.poll_timeout(t + Duration::from_millis(700)),
             Some(NavAction::JumpToPrevIntro)
@@ -150,7 +154,9 @@ mod tests {
         let mut a = MultiPressAggregator::new();
         let t = t0();
         assert!(a.press(NavDir::Left, t).is_none());
-        assert!(a.press(NavDir::Left, t + Duration::from_millis(50)).is_none());
+        assert!(a
+            .press(NavDir::Left, t + Duration::from_millis(50))
+            .is_none());
         assert_eq!(
             a.press(NavDir::Right, t + Duration::from_millis(100)),
             Some(NavAction::TransitionToPrev)

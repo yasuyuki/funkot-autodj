@@ -109,7 +109,14 @@ fn main() {
     let (entry_end, score_end, nudge_end) =
         align_next_entry_scored(&prev_s, poutro, &next_s, entry_end_nom, out_sr, beat_frames);
     let (entry_aligned, nudge_chosen) = align_next_entry_with_phase_hypotheses(
-        &prev_s, poutro, &next_s, entry, poutro, pend, out_sr, beat_frames,
+        &prev_s,
+        poutro,
+        &next_s,
+        entry,
+        poutro,
+        pend,
+        out_sr,
+        beat_frames,
     );
 
     println!("target_bpm={target:.3} beat={beat_frames:.1}f bar={bar_frames:.1}f");
@@ -159,7 +166,16 @@ fn main() {
     let n = ((f64::from(bars)) * bar_frames).round() as usize;
     let prev_mix = poutro.saturating_add(nudge_chosen);
     println!("--- nominal entry ---");
-    measure_pair(&prev_s, poutro, &next_s, entry, out_sr, n, target, beat_frames);
+    measure_pair(
+        &prev_s,
+        poutro,
+        &next_s,
+        entry,
+        out_sr,
+        n,
+        target,
+        beat_frames,
+    );
     println!("--- aligned entry (prev+nudge) ---");
     measure_pair(
         &prev_s,

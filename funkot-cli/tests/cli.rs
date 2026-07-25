@@ -106,8 +106,15 @@ fn render_two_tracks_end_to_end() {
 
     // Transition clips should be emitted automatically for `--render`.
     let transitions_dir = dir.join("out_transitions");
-    let entries: Vec<_> = fs::read_dir(&transitions_dir).expect("read transitions dir").collect();
-    assert_eq!(entries.len(), 1, "expected 1 transition clip, got {}", entries.len());
+    let entries: Vec<_> = fs::read_dir(&transitions_dir)
+        .expect("read transitions dir")
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected 1 transition clip, got {}",
+        entries.len()
+    );
     let clip_path = entries[0].as_ref().unwrap().path();
     let clip_reader = hound::WavReader::open(&clip_path).expect("open clip");
     let spec = clip_reader.spec();

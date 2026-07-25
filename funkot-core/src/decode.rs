@@ -69,10 +69,7 @@ fn extension_lower(path: &Path) -> Option<String> {
 
 fn is_isomp4_extension(ext: &str) -> bool {
     // Match symphonia-format-isomp4's registered extensions (not raw `.aac`).
-    matches!(
-        ext,
-        "m4a" | "mp4" | "m4b" | "m4p" | "m4r" | "m4v" | "mov"
-    )
+    matches!(ext, "m4a" | "mp4" | "m4b" | "m4p" | "m4r" | "m4v" | "mov")
 }
 
 /// Open a demuxer for `path`.

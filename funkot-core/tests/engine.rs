@@ -180,8 +180,8 @@ fn two_track_transition_tempo_and_envelope() {
     // Pre-prepare both tracks so this asserts mix math, not loader timing.
     // Engine::new + sleep was flaky under CI load (next track late → wrong duration).
     // jobs=1: avoid any cross-platform scheduling noise while preparing.
-    let tracks = prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1)
-        .expect("prepare");
+    let tracks =
+        prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1).expect("prepare");
     assert_eq!(tracks.len(), 2);
     let a_fd = tracks[0].first_downbeat_out;
     let a_outro = tracks[0].outro_start_out;
@@ -569,7 +569,9 @@ fn nav_real_ivy_transition_clip_if_present() {
     use funkot_core::engine::NavAction;
     use hound::{SampleFormat, WavSpec, WavWriter};
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("testdata");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("testdata");
     let path_a = root.join("AntonFer - Gakumas no Remix 2 - 02 IVY.flac");
     let path_b = root.join("AntonFer - Gakumas no Remix 2 - 09 Sakura Photograph.flac");
     if !path_a.is_file() || !path_b.is_file() {
@@ -590,8 +592,7 @@ fn nav_real_ivy_transition_clip_if_present() {
         output_sample_rate: 44_100,
         cache_dir: cache,
     };
-    let tracks =
-        prepare_tracks_parallel(&options, &[path_a, path_b], 1).expect("prepare real");
+    let tracks = prepare_tracks_parallel(&options, &[path_a, path_b], 1).expect("prepare real");
     let bar = options.bar_frames();
     let sr = options.output_sample_rate;
     let mut engine = Engine::from_prepared(options, tracks).expect("engine");
@@ -671,8 +672,7 @@ fn nav_replaces_pending_action() {
     write_wav(&path_b, &synth_track(180.0, 16, 32, 16, sr)).unwrap();
 
     let options = engine_opts(cache);
-    let tracks =
-        prepare_tracks_parallel(&options, &[path_a, path_b.clone()], 1).expect("prepare");
+    let tracks = prepare_tracks_parallel(&options, &[path_a, path_b.clone()], 1).expect("prepare");
     let mut engine = Engine::from_prepared(options, tracks).expect("engine");
     render_until_playing(&mut engine, 2048);
 

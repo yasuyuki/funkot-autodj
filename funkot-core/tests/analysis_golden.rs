@@ -105,8 +105,8 @@ fn golden_downbeat_and_section_tolerances() {
         if let Some(bars_from_fd) = expect["outro_start_bars_from_fd"].as_u64() {
             let expected = a.first_downbeat as f64
                 + (bars_from_fd as f64) * bar_len_frames(a.intro_bpm, a.sample_rate);
-            let tol = expect["outro_start_tol_secs"].as_f64().unwrap_or(0.12)
-                * f64::from(a.sample_rate);
+            let tol =
+                expect["outro_start_tol_secs"].as_f64().unwrap_or(0.12) * f64::from(a.sample_rate);
             let err = (a.outro_start as f64 - expected).abs();
             assert!(
                 err <= tol,

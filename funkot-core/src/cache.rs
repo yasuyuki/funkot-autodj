@@ -195,9 +195,10 @@ pub fn apply_manual_overrides(manual: &TrackAnalysis, mut fresh: TrackAnalysis) 
         fresh.outro_bars = manual.outro_bars;
         fresh.outro_bars_manual = true;
         fresh.outro_bars_low_confidence = false;
-        let bar_len = (60.0 / fresh.outro_bpm * f64::from(fresh.sample_rate) * f64::from(BEATS_PER_BAR))
-            .round()
-            .max(1.0) as u64;
+        let bar_len =
+            (60.0 / fresh.outro_bpm * f64::from(fresh.sample_rate) * f64::from(BEATS_PER_BAR))
+                .round()
+                .max(1.0) as u64;
         fresh.outro_start = fresh
             .total_frames
             .saturating_sub(u64::from(fresh.outro_bars) * bar_len);

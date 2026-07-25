@@ -314,21 +314,20 @@ pub fn align_next_entry_scored(
 
     // Kick/hat micro-phase disagreement (e.g. on-beat vs off-beat hats): trust kick.
     let disagree_hops = (0.25 * hops_per_beat).round().max(1.0) as i64;
-    let (lag_hops, fine_corr) =
-        if corr_kick.is_finite()
-            && corr_hat.is_finite()
-            && corr_kick >= PHASE_ALIGN_MIN_CORR
-            && corr_hat >= PHASE_ALIGN_MIN_CORR
-            && (lag_kick - lag_hat).abs() > disagree_hops
-        {
-            (lag_kick, corr_kick)
-        } else if corr_groove.is_finite() && corr_groove >= PHASE_ALIGN_MIN_CORR {
-            (lag_groove, corr_groove)
-        } else if corr_kick.is_finite() && corr_kick >= PHASE_ALIGN_MIN_CORR {
-            (lag_kick, corr_kick)
-        } else {
-            return (next_entry, 0.0, 0);
-        };
+    let (lag_hops, fine_corr) = if corr_kick.is_finite()
+        && corr_hat.is_finite()
+        && corr_kick >= PHASE_ALIGN_MIN_CORR
+        && corr_hat >= PHASE_ALIGN_MIN_CORR
+        && (lag_kick - lag_hat).abs() > disagree_hops
+    {
+        (lag_kick, corr_kick)
+    } else if corr_groove.is_finite() && corr_groove >= PHASE_ALIGN_MIN_CORR {
+        (lag_groove, corr_groove)
+    } else if corr_kick.is_finite() && corr_kick >= PHASE_ALIGN_MIN_CORR {
+        (lag_kick, corr_kick)
+    } else {
+        return (next_entry, 0.0, 0);
+    };
 
     let lag_frames = lag_hops.saturating_mul(PHASE_ALIGN_HOP as i64);
     if lag_frames >= 0 {
@@ -560,7 +559,10 @@ enum LoaderMsg {
     Ready(PreparedTrack),
     /// Replace the playing (or queued) first-track preview with the full stretch.
     Upgrade(PreparedTrack),
-    Failed { path: PathBuf, message: String },
+    Failed {
+        path: PathBuf,
+        message: String,
+    },
     Exhausted,
 }
 
@@ -938,7 +940,8 @@ impl Engine {
     fn drop_prev(&mut self) {
         if let Some(deck) = self.prev.take() {
             let same = self.active.as_ref().is_some_and(|a| {
-                a.track.playlist_index == deck.track.playlist_index && a.track.path == deck.track.path
+                a.track.playlist_index == deck.track.playlist_index
+                    && a.track.path == deck.track.path
             });
             if same {
                 // RestartCurrent: shared buffer / single permit with active.
@@ -984,10 +987,14 @@ impl Engine {
             return;
         }
         match action {
-            NavAction::TransitionToPrev | NavAction::JumpToPrevIntro if self.last_track.is_none() => {
+            NavAction::TransitionToPrev | NavAction::JumpToPrevIntro
+                if self.last_track.is_none() =>
+            {
                 return;
             }
-            NavAction::TransitionToNext | NavAction::JumpToNextIntro if self.next_track.is_none() => {
+            NavAction::TransitionToNext | NavAction::JumpToNextIntro
+                if self.next_track.is_none() =>
+            {
                 return;
             }
             _ => {}
@@ -1063,9 +1070,9 @@ impl Engine {
                 }
                 let dj = tempo.map(|t| t.in_transition_range).unwrap_or(false);
                 if dj {
-                    let at = tempo.map(|t| t.next_bar_frame).unwrap_or_else(|| {
-                        self.active.as_ref().map(|d| d.playhead).unwrap_or(0)
-                    });
+                    let at = tempo
+                        .map(|t| t.next_bar_frame)
+                        .unwrap_or_else(|| self.active.as_ref().map(|d| d.playhead).unwrap_or(0));
                     self.pending_nav = Some(PendingNav::WaitBar {
                         action,
                         at_frame: at,
@@ -1193,9 +1200,7 @@ impl Engine {
             let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
             self.poll_phase_align();
             match self.phase_align_ready.take() {
-                Some((prev_start, entry, nudge)) if prev_start == active.playhead => {
-                    (entry, nudge)
-                }
+                Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
                 _ => align_next_entry_with_phase_hypotheses(
                     &active.track.samples,
                     active.playhead,
@@ -1309,17 +1314,15 @@ impl Engine {
         let prev_start = active.track.outro_start_out;
         let prev_samples = Arc::clone(&active.track.samples);
         let next_samples = Arc::clone(&next.samples);
-        let nominal = next
-            .first_downbeat_out
-            .saturating_add(bar_to_frames(
-                plan_transition(
-                    self.options.fade_bars,
-                    next.intro_bars,
-                    active.track.outro_bars,
-                )
-                .skip,
-                self.bar_frames,
-            ));
+        let nominal = next.first_downbeat_out.saturating_add(bar_to_frames(
+            plan_transition(
+                self.options.fade_bars,
+                next.intro_bars,
+                active.track.outro_bars,
+            )
+            .skip,
+            self.bar_frames,
+        ));
         let outro_intro_grid = active.track.outro_start_out;
         let outro_end_anchored = active.track.outro_end_anchored_out;
         let sample_rate = self.options.output_sample_rate;
@@ -1537,11 +1540,7 @@ impl Engine {
         };
 
         let o_remaining = active.track.outro_bars.saturating_sub(bars_into);
-        let next_intro = self
-            .next_track
-            .as_ref()
-            .map(|t| t.intro_bars)
-            .unwrap_or(0);
+        let next_intro = self.next_track.as_ref().map(|t| t.intro_bars).unwrap_or(0);
         // Compact schedule needs 2·f_eff bars of outro; f_eff ≥ 1 → at least 2.
         let f_eff = {
             let from_intro = next_intro.saturating_sub(MAIN_GAP_BARS) / 2;
@@ -2336,13 +2335,9 @@ pub fn derive_outro_start_out(
     let rough_tail = rough
         .saturating_add(bar_to_frames(bars_to_anchor, bar_frames))
         .min(out_frames.saturating_sub(anchor_len.max(1)));
-    let refined_tail = refine_output_downbeat(
-        interleaved_stereo,
-        sample_rate,
-        rough_tail,
-        beat_frames,
-    )
-    .min(out_frames.saturating_sub(1));
+    let refined_tail =
+        refine_output_downbeat(interleaved_stereo, sample_rate, rough_tail, beat_frames)
+            .min(out_frames.saturating_sub(1));
 
     refined_tail
         .saturating_sub(bar_to_frames(bars_to_anchor, bar_frames))
@@ -2690,14 +2685,8 @@ mod tests {
         let outro_bars = 8u32;
 
         let analysis_coarse = true_outro + (0.12 * beat).round() as u64;
-        let outro_out = derive_outro_start_out(
-            &stereo,
-            sr,
-            out_frames,
-            analysis_coarse,
-            outro_bars,
-            bar,
-        );
+        let outro_out =
+            derive_outro_start_out(&stereo, sr, out_frames, analysis_coarse, outro_bars, bar);
 
         let kick_err_ms =
             (outro_out as i64 - true_outro as i64).unsigned_abs() as f64 * 1000.0 / f64::from(sr);
@@ -2707,17 +2696,7 @@ mod tests {
         );
 
         let (fd_out, prep_outro, _end_anchored) = prepare_output_markers(
-            &stereo,
-            sr,
-            out_frames,
-            fd,
-            true_outro,
-            bpm,
-            sr,
-            fd,
-            true_outro,
-            outro_bars,
-            bar,
+            &stereo, sr, out_frames, fd, true_outro, bpm, sr, fd, true_outro, outro_bars, bar,
         );
         assert!(
             fd_out < beat.round() as u64 / 2,
@@ -2747,17 +2726,7 @@ mod tests {
         let outro_bars = 8u32;
 
         let (fd_out, production, end_anchored) = prepare_output_markers(
-            &stereo,
-            sr,
-            out_frames,
-            fd,
-            true_outro,
-            bpm,
-            sr,
-            fd,
-            true_outro,
-            outro_bars,
-            bar,
+            &stereo, sr, out_frames, fd, true_outro, bpm, sr, fd, true_outro, outro_bars, bar,
         );
 
         let legacy = legacy_intro_propagated_outro(fd, true_outro, bpm, sr, fd_out, bar);
@@ -2778,8 +2747,8 @@ mod tests {
             bar_phase < 0.01 || bar_phase > 0.99,
             "outro must land on intro bar line, frac={bar_phase:.4}"
         );
-        let end_err_ms =
-            (end_anchored as i64 - true_outro as i64).unsigned_abs() as f64 * 1000.0 / f64::from(sr);
+        let end_err_ms = (end_anchored as i64 - true_outro as i64).unsigned_abs() as f64 * 1000.0
+            / f64::from(sr);
         assert!(
             end_err_ms < 8.0,
             "end-anchored outro must stay on analysis kick: err {end_err_ms:.2}ms"
@@ -2899,10 +2868,8 @@ mod tests {
                 for (i, frame) in (start..end).enumerate() {
                     let t = i as f64 / f64::from(sr);
                     let env = (-t / 0.03).exp() as f32;
-                    mono[frame] += kick_amp
-                        * 0.9
-                        * env
-                        * (2.0 * std::f64::consts::PI * 60.0 * t).sin() as f32;
+                    mono[frame] +=
+                        kick_amp * 0.9 * env * (2.0 * std::f64::consts::PI * 60.0 * t).sin() as f32;
                 }
                 if beat_in_bar == 1 || beat_in_bar == 3 {
                     let hat_start = start + (0.5 * beat).round() as usize;
@@ -2910,7 +2877,8 @@ mod tests {
                     for (i, frame) in (hat_start..hat_end).enumerate() {
                         let t = i as f64 / f64::from(sr);
                         let env = (-t / 0.008).exp() as f32;
-                        mono[frame] += 0.55 * env * (2.0 * std::f64::consts::PI * 9000.0 * t).sin() as f32;
+                        mono[frame] +=
+                            0.55 * env * (2.0 * std::f64::consts::PI * 9000.0 * t).sin() as f32;
                     }
                 }
             }
@@ -2972,10 +2940,8 @@ mod tests {
                 for (i, frame) in (start..end).enumerate() {
                     let t = i as f64 / f64::from(sr);
                     let env = (-t / 0.03).exp() as f32;
-                    mono[frame] += accent
-                        * 0.9
-                        * env
-                        * (2.0 * std::f64::consts::PI * 60.0 * t).sin() as f32;
+                    mono[frame] +=
+                        accent * 0.9 * env * (2.0 * std::f64::consts::PI * 60.0 * t).sin() as f32;
                 }
             }
             let mut stereo = Vec::with_capacity(n * 2);
@@ -3127,8 +3093,9 @@ mod tests {
         let outro_bars = 16u32;
         let mapped_outro = out_frames.saturating_sub((f64::from(outro_bars) * bar).round() as u64);
         let source_bar = f64::from(sr) * 60.0 / bpm * f64::from(BEATS_PER_BAR);
-        let outro_start_in =
-            buf.frames.saturating_sub((f64::from(outro_bars) * source_bar).round() as u64);
+        let outro_start_in = buf
+            .frames
+            .saturating_sub((f64::from(outro_bars) * source_bar).round() as u64);
 
         let (fd_out, outro_out, end_anchored) = prepare_output_markers(
             &rendered,
@@ -3230,9 +3197,7 @@ mod tests {
         let shutdown = AtomicBool::new(false);
         let path_bg = path.clone();
         let opts = options.clone();
-        let handle = thread::spawn(move || {
-            prepare_first_live(&opts, &path_bg, 0, &tx, &shutdown)
-        });
+        let handle = thread::spawn(move || prepare_first_live(&opts, &path_bg, 0, &tx, &shutdown));
 
         let mut preview = false;
         let mut upgrade_outro = None;
@@ -3260,7 +3225,10 @@ mod tests {
                 Err(e) => panic!("recv: {e}"),
             }
         }
-        assert!(handle.join().expect("join"), "prepare_first_live returned false");
+        assert!(
+            handle.join().expect("join"),
+            "prepare_first_live returned false"
+        );
         assert!(preview, "expected head preview Ready");
         assert_eq!(
             upgrade_outro,

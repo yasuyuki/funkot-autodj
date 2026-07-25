@@ -177,7 +177,9 @@ pub fn analyze_local_tempo(
     if next_bar < playhead as f64 {
         next_bar += bar_frames;
     }
-    let next_bar_frame = next_bar.round().clamp(0.0, (frames.saturating_sub(1)) as f64) as u64;
+    let next_bar_frame = next_bar
+        .round()
+        .clamp(0.0, (frames.saturating_sub(1)) as f64) as u64;
 
     let in_transition_range = (bpm_lo..=bpm_hi).contains(&bpm);
     Some(LocalTempo {
@@ -382,7 +384,9 @@ pub fn refine_groove_phase(
         .round()
         .max(1.0) as i64;
 
-    let n_beats = GROOVE_REFINE_BARS.saturating_mul(BEATS_PER_BAR).clamp(4, 32);
+    let n_beats = GROOVE_REFINE_BARS
+        .saturating_mul(BEATS_PER_BAR)
+        .clamp(4, 32);
     let span = (f64::from(n_beats) * beat_frames).ceil() as i64 + radius + 8;
     let center = approx as i64;
     let lo = (center - radius).max(0) as usize;
@@ -432,11 +436,7 @@ pub fn refine_groove_phase(
         for k in 0..n_beats {
             let pos = approx_local + delta as f64 + f64::from(k) * beat_frames;
             // Downbeat (every bar) weighs more; other on-beats still count.
-            let w = if k % BEATS_PER_BAR == 0 {
-                2.0
-            } else {
-                1.0
-            };
+            let w = if k % BEATS_PER_BAR == 0 { 2.0 } else { 1.0 };
             kick_sum += w * band_peak(&kick, pos);
             hat_sum += w * band_peak(&hat, pos);
             // Off-beat hats are common in Funkot; add a lighter bonus.
@@ -1101,8 +1101,7 @@ fn detect_section_bars(
 fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
     if let Some(drop) = pick_outro_full_drop(feats) {
         let can_lead = drop.bars < FALLBACK_BARS
-            && feats.len()
-                >= drop.bars as usize + OUTRO_LEAD_BARS as usize + AFTER_WIN_BARS;
+            && feats.len() >= drop.bars as usize + OUTRO_LEAD_BARS as usize + AFTER_WIN_BARS;
         let bars = if can_lead {
             snap_to_bar_grid(drop.bars.saturating_add(OUTRO_LEAD_BARS)).min(FALLBACK_BARS)
         } else {
@@ -1168,10 +1167,7 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
     if far_lo >= ratio.len() {
         return None;
     }
-    let peak = ratio[far_lo..]
-        .iter()
-        .copied()
-        .fold(0.0f64, f64::max);
+    let peak = ratio[far_lo..].iter().copied().fold(0.0f64, f64::max);
     let far_hi = (far_lo + 16).min(ratio.len());
     let mut far_vals = ratio[far_lo..far_hi].to_vec();
     far_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1531,8 +1527,10 @@ fn long_intro_candidate(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate>
 fn local_boundary_rise(pre: &[BarFeat], post: &[BarFeat]) -> f64 {
     let mut step = 0.0;
     step += (median_db(post, |f| f.rms) - median_db(pre, |f| f.rms)).max(0.0);
-    step += (median_db(post, |f| f.hf_energy.sqrt()) - median_db(pre, |f| f.hf_energy.sqrt())).max(0.0);
-    step += (median_db(post, |f| f.mid_energy.sqrt()) - median_db(pre, |f| f.mid_energy.sqrt())).max(0.0);
+    step +=
+        (median_db(post, |f| f.hf_energy.sqrt()) - median_db(pre, |f| f.hf_energy.sqrt())).max(0.0);
+    step += (median_db(post, |f| f.mid_energy.sqrt()) - median_db(pre, |f| f.mid_energy.sqrt()))
+        .max(0.0);
     step
 }
 
@@ -1723,22 +1721,16 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
 
     // Prefer earliest credible boundary (short intros over mid-main false hits).
     // 8-bar is only used when it is the sole survivor (else layer-adds win).
-    let mut pool: Vec<SectionEstimate> = scored
-        .iter()
-        .copied()
-        .filter(|s| s.bars > 8)
-        .collect();
+    let mut pool: Vec<SectionEstimate> = scored.iter().copied().filter(|s| s.bars > 8).collect();
     if pool.is_empty() {
         pool = scored;
     }
     pool.sort_by(|a, b| {
-        a.bars
-            .cmp(&b.bars)
-            .then_with(|| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        a.bars.cmp(&b.bars).then_with(|| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
 
     let best = pool.first()?;
@@ -1805,12 +1797,11 @@ fn after_stays_mainlike(feats: &[BarFeat], k: usize) -> bool {
     let soft = MAINNESS_ENTER * 0.6;
     // Spectral sustain: midhi after boundary stays above early intro.
     let early_r = median_f(&feats[..4.min(k)], |f| f.midhigh_ratio);
-    let after_r = median_f(
-        &feats[k..(k + AFTER_WIN_BARS).min(feats.len())],
-        |f| f.midhigh_ratio,
-    );
-    let spectral_ok = after_r >= early_r + 0.04
-        || (early_r > 1e-8 && after_r / early_r.max(1e-8) >= 1.35);
+    let after_r = median_f(&feats[k..(k + AFTER_WIN_BARS).min(feats.len())], |f| {
+        f.midhigh_ratio
+    });
+    let spectral_ok =
+        after_r >= early_r + 0.04 || (early_r > 1e-8 && after_r / early_r.max(1e-8) >= 1.35);
     let energy_ok = mainness
         .get(k..k + MAINNESS_SUSTAIN)
         .map(|w| w.iter().filter(|&&v| v >= soft).count() >= MAINNESS_SUSTAIN * 2 / 3)
@@ -1830,8 +1821,7 @@ fn still_climbing_after(feats: &[BarFeat], c: usize) -> bool {
     }
     let near_r = median_f(&feats[c..c + 4], |f| f.midhigh_ratio);
     let later_r = median_f(&feats[c + 8..c + 12], |f| f.midhigh_ratio);
-    later_r >= near_r + 0.04
-        || (near_r > 1e-8 && later_r / near_r.max(1e-8) >= 1.35)
+    later_r >= near_r + 0.04 || (near_r > 1e-8 && later_r / near_r.max(1e-8) >= 1.35)
 }
 
 fn passes_short_sharpness_gate(
@@ -1882,8 +1872,7 @@ fn before_is_gradual(before: &[BarFeat]) -> bool {
     }
     let early_r = median_f(&before[..q], |f| f.midhigh_ratio);
     let late_r = median_f(&before[before.len() - q..], |f| f.midhigh_ratio);
-    late_r >= early_r + 0.04
-        || (early_r > 1e-8 && late_r / early_r.max(1e-8) >= 1.35)
+    late_r >= early_r + 0.04 || (early_r > 1e-8 && late_r / early_r.max(1e-8) >= 1.35)
 }
 
 fn bar_mainness(bar: &BarFeat, baseline: &[BarFeat]) -> f64 {

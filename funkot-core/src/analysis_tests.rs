@@ -77,8 +77,8 @@ fn local_tempo_near_target_in_range() {
     let buf = synth_track(source_bpm, 16, 32, 16, sr);
     // Stretch like the engine: source 180 → target 198.
     let speed = target / source_bpm;
-    let out = stretch::render_track(&buf.samples, sr, sr, speed, PitchMode::Preserve)
-        .expect("stretch");
+    let out =
+        stretch::render_track(&buf.samples, sr, sr, speed, PitchMode::Preserve).expect("stretch");
     let frames = (out.len() / 2) as u64;
     let playhead = frames / 3;
     let local = analyze_local_tempo(&out, playhead, sr, target).expect("local tempo");

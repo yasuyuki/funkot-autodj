@@ -588,9 +588,8 @@ fn run_render(
     let sample_rate = options.output_sample_rate;
     // Start 8 bars before TransitionStarted so the lead-in is audible.
     const TRANSITION_CLIP_PREROLL_BARS: u32 = 8;
-    let transition_enabled = transition_clip_seconds.is_finite()
-        && transition_clip_seconds > 0.0
-        && playlist_len >= 2;
+    let transition_enabled =
+        transition_clip_seconds.is_finite() && transition_clip_seconds > 0.0 && playlist_len >= 2;
     if transitions_only && !transition_enabled {
         bail!(
             "--transitions-only needs playlist length ≥ 2 and --transition-clip-seconds > 0 \
@@ -760,8 +759,8 @@ fn run_render(
     let mut transition_captures: Vec<TransitionCapture> = Vec::new();
     let mut next_transition_idx: u32 = 1;
     let mut out_frames: u64 = 0; // frames actually written to OUT.wav
-    // Mix-timeline cursor so overlapping transition windows are not duplicated
-    // when concatenating into OUT under `--transitions-only`.
+                                 // Mix-timeline cursor so overlapping transition windows are not duplicated
+                                 // when concatenating into OUT under `--transitions-only`.
     let mut out_mix_emitted_through: u64 = 0;
 
     const CHUNK_FRAMES: usize = 8192;
@@ -831,7 +830,10 @@ fn run_render(
         // Anchor per-transition clip start on the output-file frame index.
         let chunk_start_frame = rendered_frames;
 
-        if transition_enabled && !transitions_started.is_empty() && transition_frames_into_end <= n_frames_u64 {
+        if transition_enabled
+            && !transitions_started.is_empty()
+            && transition_frames_into_end <= n_frames_u64
+        {
             for (from, to) in transitions_started {
                 let start_offset = if transition_frames_into_end == 0 {
                     0
@@ -983,7 +985,11 @@ fn run_render(
         for cap in transition_captures {
             let _ = cap.writer.finalize();
         }
-        println!("wrote {} transition clips to {}", n_clips, transitions_dir.display());
+        println!(
+            "wrote {} transition clips to {}",
+            n_clips,
+            transitions_dir.display()
+        );
     }
     Ok(())
 }
@@ -1158,10 +1164,7 @@ fn run_live(
         let _raw_guard = RawModeGuard;
         let mut agg = MultiPressAggregator::new();
         while !stop_keys.load(Ordering::SeqCst) {
-            let poll_ms = MULTI_PRESS_WINDOW
-                .as_millis()
-                .min(50)
-                .max(10) as u64;
+            let poll_ms = MULTI_PRESS_WINDOW.as_millis().min(50).max(10) as u64;
             match event::poll(Duration::from_millis(poll_ms)) {
                 Ok(true) => match event::read() {
                     Ok(Event::Key(key)) => {
@@ -1351,9 +1354,7 @@ fn stable_buffer_size(supported: &SupportedBufferSize) -> BufferSize {
         // (~480 @ 48 kHz). That is the *callback* period, not an Initialize
         // ceiling — cpal still enlarges the ring buffer from Fixed(n). Clamping
         // to max here previously forced Fixed(480) and undid the whole point.
-        SupportedBufferSize::Range { min, .. } => {
-            BufferSize::Fixed(LIVE_BUFFER_FRAMES.max(min))
-        }
+        SupportedBufferSize::Range { min, .. } => BufferSize::Fixed(LIVE_BUFFER_FRAMES.max(min)),
         SupportedBufferSize::Unknown => BufferSize::Fixed(LIVE_BUFFER_FRAMES),
     }
 }
@@ -1387,8 +1388,8 @@ fn fill_missing_cache(playlist: &[PathBuf], cache_dir: &Path) -> Result<()> {
     let mut skipped = 0usize;
     for path in playlist {
         let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (_a, did) = cache::fill_missing(path, cache_dir, &buf)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (_a, did) =
+            cache::fill_missing(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
         if did {
             analyzed += 1;
             eprintln!("analyzed {}", path.display());
@@ -1396,9 +1397,7 @@ fn fill_missing_cache(playlist: &[PathBuf], cache_dir: &Path) -> Result<()> {
             skipped += 1;
         }
     }
-    eprintln!(
-        "fill-missing-cache: analyzed {analyzed} skipped {skipped} (complete cache hits)"
-    );
+    eprintln!("fill-missing-cache: analyzed {analyzed} skipped {skipped} (complete cache hits)");
     Ok(())
 }
 

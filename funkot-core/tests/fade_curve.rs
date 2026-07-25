@@ -197,10 +197,7 @@ fn window_rms(mono: &[f32], center: usize, radius: usize) -> f32 {
 /// Callers must feed [`Engine::from_prepared`] (after `prepare_tracks_parallel`)
 /// so both decks are ready before render — same pattern as `engine.rs` tests;
 /// avoids CI flake from background-loader timing without changing mix math.
-fn render_with_transition_mark(
-    engine: &mut Engine,
-    chunk_frames: usize,
-) -> (Vec<f32>, usize) {
+fn render_with_transition_mark(engine: &mut Engine, chunk_frames: usize) -> (Vec<f32>, usize) {
     let mut out = Vec::new();
     let mut buf = vec![0.0f32; chunk_frames * 2];
     let mut recording = false;
@@ -324,8 +321,8 @@ fn linear_fade_full_span_constant_signal() {
         cache_dir: cache.clone(),
         ..options_base.clone()
     };
-    let tracks = prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1)
-        .expect("prepare");
+    let tracks =
+        prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1).expect("prepare");
     let mut engine = Engine::from_prepared(options, tracks).expect("engine");
     let (mixed_raw, t_frame) = render_with_transition_mark(&mut engine, 4096);
     let mono = mono_mix(&mixed_raw);
@@ -378,8 +375,8 @@ fn linear_fade_full_span_constant_signal() {
         cache_dir: cache2,
         ..options_base
     };
-    let tracks2 = prepare_tracks_parallel(&options2, &[path_a.clone(), path_b.clone()], 1)
-        .expect("prepare2");
+    let tracks2 =
+        prepare_tracks_parallel(&options2, &[path_a.clone(), path_b.clone()], 1).expect("prepare2");
     let mut engine2 = Engine::from_prepared(options2, tracks2).expect("engine2");
     let (mixed2_raw, t2) = render_with_transition_mark(&mut engine2, 4096);
     let mono2 = mono_mix(&mixed2_raw);
