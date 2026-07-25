@@ -458,6 +458,7 @@ fn render_until_playing(engine: &mut Engine, chunk: usize) {
         if buf.iter().any(|s| s.abs() > 1e-5) {
             return;
         }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     panic!("timed out waiting for audio");
 }
