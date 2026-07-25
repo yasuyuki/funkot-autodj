@@ -4,6 +4,13 @@
 #
 # Usage: ./dev.sh cargo build --workspace
 # Optional: DEV_BIND_SRC=/host/path DEV_BIND_DST=/host/path (default: same as src)
+#
+# Local CI speed (dev.sh only; GitHub Actions is unchanged):
+#   DEV_JOBS             — cargo/rustc/test parallelism (default: nproc / hw.ncpu)
+#   CARGO_BUILD_JOBS     — override build jobs (default: DEV_JOBS)
+#   RUST_TEST_THREADS    — override test threads (default: DEV_JOBS)
+#   CARGO_PROFILE_RELEASE_LTO — default false (matches GH test job; thin LTO is slow)
+#   CARGO_INCREMENTAL    — default 1 (faster local release rebuilds)
 set -eu
 cd "$(dirname "$0")"
 
@@ -12,6 +19,25 @@ IMAGE=funkot-autodj-dev
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker build -t "$IMAGE" .
 fi
+
+# Host CPU count → container cargo/test parallelism.
+if [ -z "${DEV_JOBS:-}" ]; then
+    if command -v nproc >/dev/null 2>&1; then
+        DEV_JOBS=$(nproc)
+    elif command -v sysctl >/dev/null 2>&1; then
+        DEV_JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    else
+        DEV_JOBS=1
+    fi
+fi
+: "${CARGO_BUILD_JOBS:=$DEV_JOBS}"
+: "${RUST_TEST_THREADS:=$DEV_JOBS}"
+# GH test job sets LTO=false; keep official release artifacts on Actions/cross-build.
+: "${CARGO_PROFILE_RELEASE_LTO:=false}"
+: "${CARGO_INCREMENTAL:=1}"
+
+# Skip named volume /work/target (multi-GB); only fix bind-mount ownership.
+CHOWN_WORK='find /work -mindepth 1 -maxdepth 1 ! -name target -exec chown -R "$HOST_UID:$HOST_GID" {} + 2>/dev/null || true'
 
 # The container runs as root; hand ownership of anything it wrote in the
 # mounted workspace (Cargo.lock, testdata, ...) back to the invoking user.
@@ -27,7 +53,11 @@ if [ -n "${DEV_BIND_SRC:-}" ]; then
         -e CARGO_TERM_COLOR=never \
         -e HOST_UID="$(id -u)" \
         -e HOST_GID="$(id -g)" \
-        "$IMAGE" sh -c '"$@"; status=$?; chown -R "$HOST_UID:$HOST_GID" /work 2>/dev/null || true; exit $status' -- "$@"
+        -e CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+        -e RUST_TEST_THREADS="$RUST_TEST_THREADS" \
+        -e CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" \
+        -e CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
+        "$IMAGE" sh -c '"$@"; status=$?; '"$CHOWN_WORK"'; exit $status' -- "$@"
 fi
 
 exec docker run --rm -i \
@@ -37,4 +67,8 @@ exec docker run --rm -i \
     -e CARGO_TERM_COLOR=never \
     -e HOST_UID="$(id -u)" \
     -e HOST_GID="$(id -g)" \
-    "$IMAGE" sh -c '"$@"; status=$?; chown -R "$HOST_UID:$HOST_GID" /work 2>/dev/null || true; exit $status' -- "$@"
+    -e CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+    -e RUST_TEST_THREADS="$RUST_TEST_THREADS" \
+    -e CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" \
+    -e CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
+    "$IMAGE" sh -c '"$@"; status=$?; '"$CHOWN_WORK"'; exit $status' -- "$@"
