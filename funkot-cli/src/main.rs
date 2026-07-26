@@ -2,7 +2,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,11 +14,14 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, StreamConfig, SupportedBufferSize};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use funkot_cli::label_session::{self, LabelKey, LabelOutcome, Side, TrackSession};
 use funkot_cli::nav_keys::{MultiPressAggregator, NavDir, MULTI_PRESS_WINDOW};
 use funkot_cli::playlist::{load_playlist_file, validate_paths_exist};
 use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
+use funkot_core::decode::decode_file;
 use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent, NavAction};
-use funkot_core::{EngineOptions, PitchMode};
+use funkot_core::labels::{upsert_label, SectionLabel};
+use funkot_core::{cache, EngineOptions, PitchMode};
 use log::warn;
 
 #[derive(Debug, Parser)]
@@ -130,6 +133,23 @@ struct Args {
     /// `needs_reanalysis`, then exit (skips complete cache hits).
     #[arg(long)]
     fill_missing_cache: bool,
+
+    /// Interactively label intro/outro section lengths against `--labels`,
+    /// then exit. Tracks come from `-l/--list` or the positional FILES, same
+    /// as normal playback. See `funkot_cli::label_session` for the key
+    /// bindings and `funkot_core::labels` for the on-disk format.
+    #[arg(long = "label-sections", requires = "labels")]
+    label_sections: bool,
+
+    /// `labels.tsv` path for `--label-sections` (required with that flag).
+    #[arg(long, value_name = "FILE")]
+    labels: Option<PathBuf>,
+
+    /// With `--label-sections`, write each candidate's click clip as WAV
+    /// into DIR instead of playing it live, then exit. For environments
+    /// without an audio output device (e.g. inside the dev container).
+    #[arg(long, value_name = "DIR", requires = "label_sections")]
+    render_clips: Option<PathBuf>,
 }
 
 fn main() {
@@ -154,6 +174,18 @@ fn run() -> Result<()> {
 
     if let Some(dir) = &args.gen_test_fixtures {
         return gen_test_fixtures(dir);
+    }
+
+    if args.label_sections {
+        // clap's `requires` guarantees this is Some.
+        let labels_path = args.labels.clone().expect("--labels required by clap");
+        let playlist = resolve_playlist(&args)?;
+        return run_label_sections(
+            &playlist,
+            &labels_path,
+            &args.cache_dir,
+            args.render_clips.as_deref(),
+        );
     }
 
     let playlist = resolve_playlist(&args)?;
@@ -1398,6 +1430,392 @@ fn fill_missing_cache(playlist: &[PathBuf], cache_dir: &Path) -> Result<()> {
         }
     }
     eprintln!("fill-missing-cache: analyzed {analyzed} skipped {skipped} (complete cache hits)");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `--label-sections`: interactive (or `--render-clips` offline) intro/outro
+// ground-truth annotation. Candidate navigation / accept / skip / ambiguous
+// -set state lives in `funkot_cli::label_session` (pure, unit-tested); this
+// section only wires it to a playlist, `labels.tsv`, the cache, cpal, and
+// crossterm.
+// ---------------------------------------------------------------------
+
+fn run_label_sections(
+    playlist: &[PathBuf],
+    labels_path: &Path,
+    cache_dir: &Path,
+    render_clips_dir: Option<&Path>,
+) -> Result<()> {
+    let existing = if labels_path.exists() {
+        funkot_core::labels::load_labels(labels_path).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        Vec::new()
+    };
+    let labeled: std::collections::HashSet<String> =
+        existing.into_iter().map(|l| l.hash).collect();
+
+    let mut hashes = Vec::with_capacity(playlist.len());
+    let mut skipped = 0usize;
+    for path in playlist {
+        let hash = cache::content_hash(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if labeled.contains(&hash) {
+            skipped += 1;
+        }
+        hashes.push(hash);
+    }
+    eprintln!(
+        "label-sections: {skipped} of {} already labeled (skipped), {} to do",
+        playlist.len(),
+        playlist.len() - skipped
+    );
+
+    if let Some(dir) = render_clips_dir {
+        let todo: Vec<&PathBuf> = playlist
+            .iter()
+            .zip(&hashes)
+            .filter(|(_, h)| !labeled.contains(*h))
+            .map(|(p, _)| p)
+            .collect();
+        return render_label_clips(&todo, cache_dir, dir);
+    }
+
+    run_label_sections_interactive(playlist, &hashes, &labeled, labels_path, cache_dir)
+}
+
+/// `--render-clips DIR`: for every candidate on both sides of every track in
+/// `playlist`, write the same click-track clip an interactive session would
+/// have played, as WAV. No labels are written — this path exists so the
+/// clip synthesis can be verified without an audio output device (e.g.
+/// inside the dev container).
+fn render_label_clips(playlist: &[&PathBuf], cache_dir: &Path, out_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
+    for path in playlist {
+        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let analysis =
+            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("track");
+
+        let mut n = 0usize;
+        for side in [Side::Intro, Side::Outro] {
+            for &bars in side.candidates() {
+                let clip = label_session::build_candidate_clip(
+                    &buf,
+                    &analysis,
+                    side,
+                    bars,
+                    label_session::NORMAL_HALF_WIDTH_BARS,
+                );
+                let clip_path =
+                    out_dir.join(format!("{stem}_{}_{bars:03}bars.wav", side.label()));
+                let mut w = WavStreamWriter::create(&clip_path, buf.sample_rate, WavFormat::F32)?;
+                w.write_interleaved(&clip)?;
+                w.finalize()?;
+                n += 1;
+            }
+        }
+        println!("wrote {n} candidate clips for {}", path.display());
+    }
+    Ok(())
+}
+
+/// Sentinel `pos` value meaning "not currently playing".
+const CLIP_PLAYER_IDLE: usize = usize::MAX;
+
+/// Minimal single-buffer cpal player for `--label-sections` candidate
+/// clips. Bypasses the mixing engine entirely (per plan constraints): the
+/// audio callback just streams whichever interleaved-stereo f32 buffer
+/// [`ClipPlayer::play`] last handed it, so a new candidate can interrupt
+/// mid-playback the same way the live engine's nav keys do.
+struct ClipPlayer {
+    // Kept alive only for its Drop impl (stops the stream); never read.
+    _stream: cpal::Stream,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    pos: Arc<AtomicUsize>,
+}
+
+impl ClipPlayer {
+    fn new(device: &cpal::Device, config: &StreamConfig, channels: u16) -> Result<Self> {
+        let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let pos = Arc::new(AtomicUsize::new(CLIP_PLAYER_IDLE));
+        let buffer_cb = Arc::clone(&buffer);
+        let pos_cb = Arc::clone(&pos);
+        let stream = device
+            .build_output_stream(
+                config.clone(),
+                move |data: &mut [f32], _| {
+                    data.fill(0.0);
+                    let p = pos_cb.load(Ordering::SeqCst);
+                    if p == CLIP_PLAYER_IDLE {
+                        return;
+                    }
+                    // try_lock: never block the audio thread on the UI
+                    // thread's play()/stop() swap.
+                    let Ok(buf) = buffer_cb.try_lock() else {
+                        return;
+                    };
+                    let frames_total = buf.len() / 2;
+                    let frames = data.len() / channels as usize;
+                    let mut idx = p;
+                    for i in 0..frames {
+                        if idx >= frames_total {
+                            break;
+                        }
+                        write_frame(data, i, channels, buf[idx * 2], buf[idx * 2 + 1]);
+                        idx += 1;
+                    }
+                    pos_cb.store(
+                        if idx >= frames_total {
+                            CLIP_PLAYER_IDLE
+                        } else {
+                            idx
+                        },
+                        Ordering::SeqCst,
+                    );
+                },
+                |err| eprintln!("audio stream error: {err}"),
+                None,
+            )
+            .context("failed to build label-sections audio output stream")?;
+        stream
+            .play()
+            .context("failed to start label-sections audio stream")?;
+        Ok(Self {
+            _stream: stream,
+            buffer,
+            pos,
+        })
+    }
+
+    /// Stop whatever is playing and start `clip` from the top.
+    fn play(&self, clip: Vec<f32>) {
+        self.pos.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
+        {
+            let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            *buf = clip;
+        }
+        self.pos.store(0, Ordering::SeqCst);
+    }
+
+    fn stop(&self) {
+        self.pos.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
+    }
+}
+
+const LABEL_SECTIONS_KEY_HELP: &str =
+    "keys: y/Enter=accept  \u{2190}/\u{2192}=candidate  +=widen/narrow window  \
+     r=replay  a=ambiguous(toggle set)  n=note  s=skip track  q=save & quit";
+
+fn print_label_key_help() {
+    println!("\r{LABEL_SECTIONS_KEY_HELP}\r");
+}
+
+fn print_label_track_header(progress: &str, path: &Path) {
+    println!("\r{progress} {}\r", file_name(path));
+}
+
+fn print_label_status(session: &TrackSession) {
+    let mut line = format!(
+        "\r  [{}] candidate={} bars  window=\u{b1}{} bars",
+        session.current_side().label(),
+        session.current_bars(),
+        session.context_half_width_bars(),
+    );
+    if let Some(selected) = session.ambiguous_selected() {
+        let set = selected
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("|");
+        line.push_str(&format!("  ambiguous-set={set}"));
+    }
+    if !session.note().is_empty() {
+        line.push_str(&format!("  note=\"{}\"", session.note()));
+    }
+    line.push_str(&format!("  | {LABEL_SECTIONS_KEY_HELP}\r"));
+    println!("{line}");
+}
+
+/// Read one line from stdin for `n` (note entry). Raw mode is disabled for
+/// the duration so the terminal echoes normally, then restored.
+fn read_note_line() -> Result<String> {
+    disable_raw_mode().ok();
+    print!("\rnote: ");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    enable_raw_mode().context("failed to re-enable raw mode after note entry")?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// Decode one crossterm key press into a [`LabelKey`], or `None` for a key
+/// with no meaning here. `n` needs a blocking line read (outside raw mode)
+/// to collect the note text, so it's resolved here rather than deferred.
+fn map_label_key(key: KeyEvent) -> Result<Option<LabelKey>> {
+    if key.kind == KeyEventKind::Release {
+        return Ok(None);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        return Ok(Some(LabelKey::Quit));
+    }
+    Ok(match key.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Some(LabelKey::Accept),
+        KeyCode::Left => Some(LabelKey::Left),
+        KeyCode::Right => Some(LabelKey::Right),
+        KeyCode::Char('+') => Some(LabelKey::ToggleWidth),
+        KeyCode::Char('r') | KeyCode::Char('R') => Some(LabelKey::Replay),
+        KeyCode::Char('a') | KeyCode::Char('A') => Some(LabelKey::Ambiguous),
+        KeyCode::Char('n') | KeyCode::Char('N') => Some(LabelKey::Note(read_note_line()?)),
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(LabelKey::Skip),
+        KeyCode::Char('q') | KeyCode::Char('Q') => Some(LabelKey::Quit),
+        _ => None,
+    })
+}
+
+/// Persist one finished track: append/replace its row in `labels.tsv`, then
+/// reflect the intro side onto the analysis cache.
+fn save_label_and_cache(
+    labels_path: &Path,
+    cache_dir: &Path,
+    hash: &str,
+    path: &Path,
+    intro: &label_session::LabelChoice,
+    outro: &label_session::LabelChoice,
+    note: &str,
+) -> Result<()> {
+    let label = SectionLabel {
+        hash: hash.to_string(),
+        file_name: file_name(path),
+        intro_best: intro.best,
+        intro_ok: intro.ok.clone(),
+        outro_best: outro.best,
+        outro_ok: outro.ok.clone(),
+        note: note.to_string(),
+    };
+    upsert_label(labels_path, label).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Reflect the intro side onto the cache immediately (so live/render
+    // playback picks it up, and `--purge-auto-cache` keeps it). The outro
+    // side is deliberately *not* written here: `cache::set_manual_bars`'s
+    // `outro` argument sets `TrackAnalysis::outro_bars`, the DJ mix-trigger,
+    // which is *not* a fixed offset from the structural boundary this tool
+    // collects (see `funkot_core::labels` module docs and the
+    // `outro_structure_bars` doc comment in `funkot-core/src/lib.rs`).
+    // Synthesizing a lead-in here to convert one into the other would plant
+    // a guessed value in the cache that the analyzer itself doesn't stand
+    // behind -- the exact outro_bars/outro_structure_bars conflation Stage 0
+    // introduced `outro_structure_bars` to avoid. The cached outro stays
+    // whatever `analysis::analyze` computed; only the label file records the
+    // structural ground truth, for Stage 2+ to use.
+    cache::set_manual_bars(cache_dir, hash, Some(intro.best), None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+fn run_label_sections_interactive(
+    playlist: &[PathBuf],
+    hashes: &[String],
+    labeled: &std::collections::HashSet<String>,
+    labels_path: &Path,
+    cache_dir: &Path,
+) -> Result<()> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .context("no default audio output device available (use --render-clips instead)")?;
+    let (config, channels) = pick_output_config(&device, None)?;
+    let player = ClipPlayer::new(&device, &config, channels)?;
+
+    enable_raw_mode().context("failed to enable raw mode (needed for --label-sections)")?;
+    let _raw_guard = RawModeGuard;
+
+    print_label_key_help();
+
+    let total = playlist.len();
+    'tracks: for (i, path) in playlist.iter().enumerate() {
+        let hash = &hashes[i];
+        if labeled.contains(hash) {
+            continue;
+        }
+        let progress = format!("[{}/{total}]", i + 1);
+
+        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let analysis =
+            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let mut session = TrackSession::new(analysis.intro_bars, analysis.outro_structure_bars);
+        print_label_track_header(&progress, path);
+        player.play(label_session::build_candidate_clip(
+            &buf,
+            &analysis,
+            session.current_side(),
+            session.current_bars(),
+            session.context_half_width_bars(),
+        ));
+        print_label_status(&session);
+
+        loop {
+            if !event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                continue;
+            }
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(_) => break 'tracks,
+            };
+            let Event::Key(key) = ev else { continue };
+            let Some(label_key) = map_label_key(key)? else {
+                continue;
+            };
+            match session.apply_key(label_key) {
+                LabelOutcome::Continue => print_label_status(&session),
+                LabelOutcome::Replay => {
+                    let clip = label_session::build_candidate_clip(
+                        &buf,
+                        &analysis,
+                        session.current_side(),
+                        session.current_bars(),
+                        session.context_half_width_bars(),
+                    );
+                    player.play(clip);
+                    print_label_status(&session);
+                }
+                LabelOutcome::Skip => {
+                    player.stop();
+                    println!("\r  skipped {}\r", file_name(path));
+                    continue 'tracks;
+                }
+                LabelOutcome::Quit => {
+                    player.stop();
+                    println!("\rsaved & quit\r");
+                    break 'tracks;
+                }
+                LabelOutcome::Done { intro, outro } => {
+                    player.stop();
+                    save_label_and_cache(
+                        labels_path,
+                        cache_dir,
+                        hash,
+                        path,
+                        &intro,
+                        &outro,
+                        session.note(),
+                    )?;
+                    println!(
+                        "\r  saved {} (intro={} outro={})\r",
+                        file_name(path),
+                        intro.best,
+                        outro.best
+                    );
+                    continue 'tracks;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
