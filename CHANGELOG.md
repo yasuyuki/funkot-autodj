@@ -11,6 +11,7 @@ All notable changes to this project are documented in this file.
 ### Added
 
 - Engine `TrackSource` trait and `Engine::new_with_source`: the loader asks the host for each track instead of owning a fixed `Vec<PathBuf>`, so a host-owned queue can be appended to, reordered or trimmed without restarting playback. `Engine::new` is unchanged and now wraps the same default shuffle/loop behaviour.
+- `cache::set_manual_bars` hand-edits `intro_bars` / `outro_bars` on a cached entry and persists it, recomputing `outro_start` so callers no longer have to. The side passed as `None` is untouched, including its `*_manual` flag, and `needs_reanalysis` is preserved.
 
 ## [0.3.1] - 2026-07-25
 

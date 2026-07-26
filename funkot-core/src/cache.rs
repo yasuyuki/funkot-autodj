@@ -184,6 +184,16 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
     };
 }
 
+/// Recompute `outro_start` from `outro_bars`, `outro_bpm`, `sample_rate` and `total_frames`.
+fn recompute_outro_start(a: &mut TrackAnalysis) {
+    let bar_len = (60.0 / a.outro_bpm * f64::from(a.sample_rate) * f64::from(BEATS_PER_BAR))
+        .round()
+        .max(1.0) as u64;
+    a.outro_start = a
+        .total_frames
+        .saturating_sub(u64::from(a.outro_bars) * bar_len);
+}
+
 /// Re-apply hand-edited intro/outro bars onto a fresh analysis.
 pub fn apply_manual_overrides(manual: &TrackAnalysis, mut fresh: TrackAnalysis) -> TrackAnalysis {
     if manual.intro_bars_manual {
@@ -195,18 +205,43 @@ pub fn apply_manual_overrides(manual: &TrackAnalysis, mut fresh: TrackAnalysis) 
         fresh.outro_bars = manual.outro_bars;
         fresh.outro_bars_manual = true;
         fresh.outro_bars_low_confidence = false;
-        let bar_len =
-            (60.0 / fresh.outro_bpm * f64::from(fresh.sample_rate) * f64::from(BEATS_PER_BAR))
-                .round()
-                .max(1.0) as u64;
-        fresh.outro_start = fresh
-            .total_frames
-            .saturating_sub(u64::from(fresh.outro_bars) * bar_len);
+        recompute_outro_start(&mut fresh);
     }
     fresh.bars_estimated_low_confidence =
         fresh.intro_bars_low_confidence || fresh.outro_bars_low_confidence;
     fresh.needs_reanalysis = false;
     fresh
+}
+
+/// Hand-edit `intro_bars` and/or `outro_bars` on a cached entry and persist it.
+///
+/// The side left as `None` is untouched, including its `*_manual` flag.
+/// `needs_reanalysis` is preserved as-is (unlike [`apply_manual_overrides`],
+/// which always clears it): editing bar counts by hand doesn't change
+/// whether the rest of the auto-analyzed fields are complete.
+pub fn set_manual_bars(
+    cache_dir: &Path,
+    hash: &str,
+    intro: Option<u32>,
+    outro: Option<u32>,
+) -> Result<TrackAnalysis> {
+    let mut analysis = load(cache_dir, hash)
+        .ok_or_else(|| Error::Cache(format!("no cache entry for hash '{hash}'")))?;
+    if let Some(n) = intro {
+        analysis.intro_bars = n;
+        analysis.intro_bars_manual = true;
+        analysis.intro_bars_low_confidence = false;
+    }
+    if let Some(n) = outro {
+        analysis.outro_bars = n;
+        analysis.outro_bars_manual = true;
+        analysis.outro_bars_low_confidence = false;
+        recompute_outro_start(&mut analysis);
+    }
+    analysis.bars_estimated_low_confidence =
+        analysis.intro_bars_low_confidence || analysis.outro_bars_low_confidence;
+    store(cache_dir, hash, &analysis)?;
+    Ok(analysis)
 }
 
 /// Hash the file, try load, else analyze `buffer` and store.
@@ -312,5 +347,137 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         needs_reanalysis: false,
         rms_dbfs: TARGET_RMS_DBFS,
         gain_db: 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn sample_analysis() -> TrackAnalysis {
+        TrackAnalysis {
+            version: CACHE_VERSION,
+            file_name: "test.wav".to_string(),
+            sample_rate: 44_100,
+            total_frames: 10_000_000,
+            intro_bpm: 150.0,
+            outro_bpm: 150.0,
+            first_downbeat: 0,
+            outro_start: 0,
+            intro_bars: 8,
+            outro_bars: 16,
+            bars_estimated_low_confidence: true,
+            intro_bars_low_confidence: true,
+            outro_bars_low_confidence: true,
+            intro_bars_manual: false,
+            outro_bars_manual: false,
+            needs_reanalysis: false,
+            rms_dbfs: TARGET_RMS_DBFS,
+            gain_db: 0.0,
+        }
+    }
+
+    /// Process-unique scratch dir under the system temp dir, cleaned up on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "funkot-cache-test-{tag}-{}-{}-{n}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn set_manual_bars_outro_recomputes_outro_start() {
+        let dir = TempDir::new("outro");
+        let hash = "hash-outro";
+        let analysis = sample_analysis();
+        store(dir.path(), hash, &analysis).unwrap();
+
+        let result = set_manual_bars(dir.path(), hash, None, Some(32)).unwrap();
+
+        let bar_len = (60.0 / result.outro_bpm
+            * f64::from(result.sample_rate)
+            * f64::from(BEATS_PER_BAR))
+        .round()
+        .max(1.0) as u64;
+        let expected_outro_start = result.total_frames - 32 * bar_len;
+
+        assert_eq!(result.outro_bars, 32);
+        assert!(result.outro_bars_manual);
+        assert!(!result.outro_bars_low_confidence);
+        assert_eq!(result.outro_start, expected_outro_start);
+
+        let reloaded = load(dir.path(), hash).unwrap();
+        assert_eq!(reloaded.outro_start, expected_outro_start);
+        assert_eq!(reloaded.outro_bars, 32);
+    }
+
+    #[test]
+    fn set_manual_bars_keeps_an_existing_manual_side() {
+        let dir = TempDir::new("intro-manual");
+        let hash = "hash-intro-manual";
+        let mut analysis = sample_analysis();
+        analysis.intro_bars = 12;
+        analysis.intro_bars_manual = true;
+        analysis.intro_bars_low_confidence = false;
+        store(dir.path(), hash, &analysis).unwrap();
+
+        let result = set_manual_bars(dir.path(), hash, None, Some(20)).unwrap();
+
+        assert_eq!(result.intro_bars, 12);
+        assert!(result.intro_bars_manual);
+    }
+
+    /// The dangerous direction: editing one side must not mark the *other* side
+    /// manual. A wrongly-set flag pins an auto-detected value forever and is
+    /// indistinguishable from real hand-editing afterwards.
+    #[test]
+    fn set_manual_bars_does_not_mark_the_other_side_manual() {
+        let dir = TempDir::new("intro-auto");
+        let hash = "hash-intro-auto";
+        let analysis = sample_analysis(); // both *_manual are false
+        store(dir.path(), hash, &analysis).unwrap();
+
+        let result = set_manual_bars(dir.path(), hash, None, Some(20)).unwrap();
+        assert_eq!(result.intro_bars, analysis.intro_bars);
+        assert!(!result.intro_bars_manual);
+        assert!(result.intro_bars_low_confidence);
+
+        let result = set_manual_bars(dir.path(), hash, Some(48), None).unwrap();
+        assert_eq!(result.outro_bars, 20);
+        assert!(result.outro_bars_manual, "the earlier outro edit must survive");
+        assert!(result.intro_bars_manual);
+    }
+
+    #[test]
+    fn set_manual_bars_missing_hash_errors() {
+        let dir = TempDir::new("missing");
+        let err = set_manual_bars(dir.path(), "does-not-exist", Some(4), None).unwrap_err();
+        match err {
+            Error::Cache(msg) => assert!(msg.contains("does-not-exist")),
+            other => panic!("expected Error::Cache, got {other:?}"),
+        }
     }
 }
