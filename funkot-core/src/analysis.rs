@@ -43,7 +43,7 @@ const SEGMENT_SECS: f64 = 110.0;
 const MIN_DURATION_SECS: f64 = 30.0;
 const BPM_MIN: f64 = 172.0;
 const BPM_MAX: f64 = 188.0;
-const HOP: usize = 256;
+pub(crate) const HOP: usize = 256;
 const LOWPASS_HZ: f64 = 150.0;
 const HIGHPASS_HZ: f64 = 1500.0;
 /// Onset must exceed this fraction of the segment peak to count as a beat.
@@ -828,7 +828,10 @@ fn finite_or_err(v: f64, name: &str) -> Result<f64> {
 }
 
 /// Onset-strength envelope: 2nd-order LPF (~150 Hz) → hop energy → half-wave Δ.
-fn onset_envelope(mono: &[f32], sample_rate: u32, hop: usize) -> Result<OnsetData> {
+///
+/// `pub(crate)` so [`crate::features`] can reuse the exact same kick-oriented
+/// novelty for per-bar onset-density aggregation instead of reimplementing it.
+pub(crate) fn onset_envelope(mono: &[f32], sample_rate: u32, hop: usize) -> Result<OnsetData> {
     if mono.len() < hop * 4 {
         return Err(Error::Analysis(
             "segment too short for onset envelope".into(),
@@ -869,9 +872,9 @@ fn onset_envelope(mono: &[f32], sample_rate: u32, hop: usize) -> Result<OnsetDat
     Ok(OnsetData { novelty, energy })
 }
 
-struct OnsetData {
-    novelty: Vec<f64>,
-    energy: Vec<f64>,
+pub(crate) struct OnsetData {
+    pub(crate) novelty: Vec<f64>,
+    pub(crate) energy: Vec<f64>,
 }
 
 /// RBJ biquad low-pass, Q = 1/√2 (Butterworth).
@@ -1088,18 +1091,21 @@ fn find_first_downbeat_hop(
 }
 
 #[derive(Clone, Copy)]
-enum SectionDir {
+pub(crate) enum SectionDir {
     Forward,
     Backward,
 }
 
-fn detect_section_bars(
+/// Bar-start frame offsets for a head/tail scan window, shared by
+/// [`detect_section_bars`] and [`bar_diag_rows`] (and reused by
+/// [`crate::features`] callers via [`SectionDiag`]) so the feature-frontend
+/// bar grid is always identical to the grid the existing detector scores.
+fn section_bar_starts(
     buffer: &AudioBuffer,
     anchor: u64,
-    bar_len: f64,
+    bar_len_frames: u64,
     dir: SectionDir,
-) -> Result<SectionEstimate> {
-    let bar_len_frames = bar_len.round().max(1.0) as u64;
+) -> Vec<u64> {
     let max_scan = match dir {
         SectionDir::Forward => MAX_SCAN_BARS_INTRO,
         SectionDir::Backward => MAX_SCAN_BARS_OUTRO,
@@ -1110,8 +1116,24 @@ fn detect_section_bars(
         }
         SectionDir::Backward => max_scan.min((anchor / bar_len_frames) as usize),
     };
+    (0..n_bars)
+        .map(|i| match dir {
+            SectionDir::Forward => anchor + i as u64 * bar_len_frames,
+            SectionDir::Backward => anchor.saturating_sub((i as u64 + 1) * bar_len_frames),
+        })
+        .collect()
+}
+
+fn detect_section_bars(
+    buffer: &AudioBuffer,
+    anchor: u64,
+    bar_len: f64,
+    dir: SectionDir,
+) -> Result<SectionEstimate> {
+    let bar_len_frames = bar_len.round().max(1.0) as u64;
+    let starts = section_bar_starts(buffer, anchor, bar_len_frames, dir);
     // Need at least one snap candidate + a short after-window.
-    if n_bars < SNAP_CANDIDATES[0] as usize + 4 {
+    if starts.len() < SNAP_CANDIDATES[0] as usize + 4 {
         return Ok(SectionEstimate {
             bars: FALLBACK_BARS,
             low_confidence: true,
@@ -1120,13 +1142,6 @@ fn detect_section_bars(
             structure_bars: FALLBACK_BARS,
         });
     }
-
-    let starts: Vec<u64> = (0..n_bars)
-        .map(|i| match dir {
-            SectionDir::Forward => anchor + i as u64 * bar_len_frames,
-            SectionDir::Backward => anchor.saturating_sub((i as u64 + 1) * bar_len_frames),
-        })
-        .collect();
 
     let feats = bar_features(buffer, &starts, bar_len_frames);
     Ok(match dir {
@@ -2083,6 +2098,10 @@ pub struct BarDiag {
     pub rms_db: f64,
     pub hf_db: f64,
     pub centroid_hz: f64,
+    /// Stage 2 spectral-frontend features for this bar ([`crate::features::BarFeatures`]).
+    /// `None` unless requested via [`diagnose_section_bars_ext`]. `analyze()`
+    /// never reads this; it exists purely for `examples/section_diag.rs`.
+    pub new_features: Option<crate::features::BarFeatures>,
 }
 
 /// Aggregated head/tail bar features for offline inspection.
@@ -2090,10 +2109,32 @@ pub struct BarDiag {
 pub struct SectionDiag {
     pub intro: Vec<BarDiag>,
     pub outro: Vec<BarDiag>,
+    /// Stage 2 structure signals over the intro bar sequence ([`crate::structure::compute`]).
+    /// `None` unless requested via [`diagnose_section_bars_ext`].
+    pub intro_structure: Option<crate::structure::StructureSignals>,
+    /// Structure signals over the outro bar sequence. The outro's bar grid
+    /// is already ordered nearest-file-end-first (see [`section_bar_starts`]
+    /// / [`crate::structure`]'s module docs), so this is the *same*
+    /// intro-prefix-model / novelty computation as `intro_structure`, not a
+    /// separately time-reversed variant.
+    pub outro_structure: Option<crate::structure::StructureSignals>,
 }
 
-/// Compute per-bar features for intro (forward) and outro (backward) scan windows.
+/// Compute per-bar features for intro (forward) and outro (backward) scan
+/// windows, using only the legacy `BarFeat` frontend — identical behavior to
+/// before Stage 2. Equivalent to `diagnose_section_bars_ext(buffer, false)`.
 pub fn diagnose_section_bars(buffer: &AudioBuffer) -> Result<SectionDiag> {
+    diagnose_section_bars_ext(buffer, false)
+}
+
+/// Like [`diagnose_section_bars`], optionally also computing the Stage 2
+/// spectral-frontend per-bar features and derived structure signals for both
+/// sides (`with_new_features: true`). Purely diagnostic: never affects
+/// [`analyze`], and the legacy columns are byte-for-byte the same either way.
+pub fn diagnose_section_bars_ext(
+    buffer: &AudioBuffer,
+    with_new_features: bool,
+) -> Result<SectionDiag> {
     let sr = buffer.sample_rate as f64;
     let segment_frames = (SEGMENT_SECS * sr).round() as u64;
     let head_len = segment_frames.min(buffer.frames);
@@ -2123,9 +2164,36 @@ pub fn diagnose_section_bars(buffer: &AudioBuffer) -> Result<SectionDiag> {
         .round()
         .max(1.0);
 
+    let head_window = with_new_features.then_some((head.as_slice(), 0u64));
+    let tail_window = with_new_features.then_some((tail.as_slice(), tail_start));
+
+    let (intro, intro_new_feats) = bar_diag_rows(
+        buffer,
+        first_downbeat,
+        intro_bar_len,
+        SectionDir::Forward,
+        head_window,
+    )?;
+    let (outro, outro_new_feats) = bar_diag_rows(
+        buffer,
+        buffer.frames,
+        outro_bar_len,
+        SectionDir::Backward,
+        tail_window,
+    )?;
+
+    let intro_structure = intro_new_feats
+        .as_deref()
+        .map(|f| crate::structure::compute(f, crate::structure::DEFAULT_PREFIX_BARS));
+    let outro_structure = outro_new_feats
+        .as_deref()
+        .map(|f| crate::structure::compute(f, crate::structure::DEFAULT_PREFIX_BARS));
+
     Ok(SectionDiag {
-        intro: bar_diag_rows(buffer, first_downbeat, intro_bar_len, SectionDir::Forward)?,
-        outro: bar_diag_rows(buffer, buffer.frames, outro_bar_len, SectionDir::Backward)?,
+        intro,
+        outro,
+        intro_structure,
+        outro_structure,
     })
 }
 
@@ -2134,26 +2202,15 @@ fn bar_diag_rows(
     anchor: u64,
     bar_len: f64,
     dir: SectionDir,
-) -> Result<Vec<BarDiag>> {
+    window: Option<(&[f32], u64)>,
+) -> Result<(Vec<BarDiag>, Option<Vec<crate::features::BarFeatures>>)> {
     let bar_len_frames = bar_len.round().max(1.0) as u64;
-    let max_scan = match dir {
-        SectionDir::Forward => MAX_SCAN_BARS_INTRO,
-        SectionDir::Backward => MAX_SCAN_BARS_OUTRO,
-    };
-    let n_bars = match dir {
-        SectionDir::Forward => {
-            max_scan.min(((buffer.frames.saturating_sub(anchor)) / bar_len_frames) as usize)
-        }
-        SectionDir::Backward => max_scan.min((anchor / bar_len_frames) as usize),
-    };
-    let starts: Vec<u64> = (0..n_bars)
-        .map(|i| match dir {
-            SectionDir::Forward => anchor + i as u64 * bar_len_frames,
-            SectionDir::Backward => anchor.saturating_sub((i as u64 + 1) * bar_len_frames),
-        })
-        .collect();
+    let starts = section_bar_starts(buffer, anchor, bar_len_frames, dir);
     let feats = bar_features(buffer, &starts, bar_len_frames);
-    Ok(feats
+    let new_feats = window.map(|(mono, offset)| {
+        crate::features::bar_features(mono, offset, buffer.sample_rate, &starts, bar_len_frames)
+    });
+    let rows = feats
         .into_iter()
         .enumerate()
         .map(|(i, f)| BarDiag {
@@ -2170,8 +2227,10 @@ fn bar_diag_rows(
                 -120.0
             },
             centroid_hz: f.centroid_hz,
+            new_features: new_feats.as_ref().and_then(|v| v.get(i).copied()),
         })
-        .collect())
+        .collect();
+    Ok((rows, new_feats))
 }
 
 #[derive(Clone, Copy)]

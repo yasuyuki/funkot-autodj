@@ -18,10 +18,12 @@ pub mod analysis;
 pub mod cache;
 pub mod decode;
 pub mod engine;
+pub mod features;
 pub mod ffi;
 pub mod filter;
 pub mod labels;
 pub mod stretch;
+pub mod structure;
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
