@@ -1,5 +1,8 @@
 # Rust build artifacts
 /target/
+# Host builds need their own dir: /target is the dev container's named-volume
+# mount point and is root-owned, so host cargo cannot write there.
+/target-host/
 /target-cross/
 /dist/
 
