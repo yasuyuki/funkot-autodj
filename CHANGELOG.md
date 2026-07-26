@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file.
 
 - Outro floor sampling falls back to the lower quartile when a bright final fill spikes the near-end window (max ≫ median), so true 32-bar outros are no longer reported as 48 (Starmine). Purge auto-cache to refresh older analyses.
 
+### Added
+
+- Engine `TrackSource` trait and `Engine::new_with_source`: the loader asks the host for each track instead of owning a fixed `Vec<PathBuf>`, so a host-owned queue can be appended to, reordered or trimmed without restarting playback. `Engine::new` is unchanged and now wraps the same default shuffle/loop behaviour.
+
 ## [0.3.1] - 2026-07-25
 
 ### Fixed
