@@ -29,6 +29,8 @@
   `render` はブロックさせない。
 - 解析ゴールデンを変える場合は下記コマンドで再生成し、差分を確認して
   `golden.json` だけを必要に応じてコミットする。生成 WAV は ignore 対象である。
+- 依存を追加・更新したら `./cross-build.sh android` が通ることを確認する。
+  制約は下記「モバイル (Android) ビルド」を正とする。
 
 ## 確認手順
 
@@ -53,6 +55,7 @@
 - `work.sh`: `./work.sh --self-check`
 - Windows 配布・`work.ps1`: `./cross-build.sh` の後に
   `pwsh.exe -File ./work.ps1 --self-check`
+- 依存の追加・更新: `./cross-build.sh android`
 
 解析、マーカー、遷移、フェード、ストレッチ、ナビゲーションを変えた場合は、
 単体テストだけで完了にしない。手元に ignore 対象の実音源がある環境で、
@@ -84,3 +87,35 @@
 
 最後に `git diff --check` と差分をレビューし、秘密情報、個人パス、実音源、
 キャッシュ、WAV、ビルド成果物が含まれないことを確認する。
+
+## モバイル (Android) ビルド
+
+`funkot-core` は GUI アプリ (`funkot-player`) から Cargo 依存として使われる。
+このリポジトリで Android ターゲットを持つのは、依存追加で NDK ビルドが壊れたときに
+下流ではなくここで気付くための回帰ガードと、他ターゲットと同様の C ABI SDK 配布のため。
+
+```sh
+./cross-build.sh android   # → dist/android-arm64/
+```
+
+`funkot-cli` は cpal と端末キー操作に依存するため Android では作らない。
+
+実機 (Pixel 10 Pro / Android 17) で検証済みの制約。**いずれも推測ではなく実測**である。
+
+- **API レベルは 26 が下限。** `libaaudio.so` が NDK sysroot に現れるのが 26 からで、
+  24 では `ld.lld: error: unable to find library -laaudio` になる。ホスト側アプリの
+  `minSdkVersion` も 26 以上にすること
+- **bindgen の libclang は NDK ではなくホストのものを使う。** NDK は clang ドライバと
+  サニタイザランタイムしか同梱せず `libclang.so` を持たない。`--sysroot` だけ NDK を
+  指す。`signalsmith-stretch` の `src/wrapper.h` は `stddef.h` / `stdbool.h` しか
+  include しないため、ホスト clang のリソースディレクトリで足りる
+- **`libc++_shared.so` を同梱する。** `cc` クレートが `cargo::rustc-link-lib=c++_shared`
+  を出すため、`-static-libstdc++` では消せない。アプリが複数の `.so` を読む場合に
+  静的 libc++ を各所に埋めるのは Google が明示的に避けるよう言っている構成なので、
+  共有版を配ること
+- **リンク時に 16KB ページアライメントを指定する。** Android 15 以降の要件。
+  `-Wl,-z,max-page-size=16384` を入れないと、端末起動時に
+  「16 KB アライメントではありません」の互換性ダイアログが出る
+- **メモリ**: `prepare_track` は曲を丸ごとデコード＋ストレッチして `Arc<Vec<f32>>` に
+  載せる。合成3曲の再生中で PSS 353MB / RSS 500MB（WebView 込み）を実測した。
+  デッキ数やストリーミング化を検討する際はこの数字を基準にする
