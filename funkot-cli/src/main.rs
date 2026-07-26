@@ -150,6 +150,20 @@ struct Args {
     /// without an audio output device (e.g. inside the dev container).
     #[arg(long, value_name = "DIR", requires = "label_sections")]
     render_clips: Option<PathBuf>,
+
+    /// `--label-sections` click peak level, in dB above the clip's own RMS
+    /// loudness (not a fixed absolute amplitude — real Funkot masters run
+    /// hot enough that a fixed number either got lost or clipped). Raise
+    /// this if clicks are still hard to hear on a given track.
+    #[arg(long, default_value_t = label_session::ClickOptions::default().click_db_above_rms, requires = "label_sections")]
+    click_db: f32,
+
+    /// `--label-sections`: how many dB to duck the music under each bar-head
+    /// click (sidechain-style, so the click cuts through dense/loud
+    /// material). The boundary click ducks deeper and longer automatically
+    /// on top of this, so it stays distinguishable from a normal bar head.
+    #[arg(long, default_value_t = label_session::ClickOptions::default().duck_db, requires = "label_sections")]
+    click_duck_db: f32,
 }
 
 fn main() {
@@ -180,11 +194,16 @@ fn run() -> Result<()> {
         // clap's `requires` guarantees this is Some.
         let labels_path = args.labels.clone().expect("--labels required by clap");
         let playlist = resolve_playlist(&args)?;
+        let click_opts = label_session::ClickOptions {
+            click_db_above_rms: args.click_db,
+            duck_db: args.click_duck_db,
+        };
         return run_label_sections(
             &playlist,
             &labels_path,
             &args.cache_dir,
             args.render_clips.as_deref(),
+            &click_opts,
         );
     }
 
@@ -1446,6 +1465,7 @@ fn run_label_sections(
     labels_path: &Path,
     cache_dir: &Path,
     render_clips_dir: Option<&Path>,
+    click_opts: &label_session::ClickOptions,
 ) -> Result<()> {
     let existing = if labels_path.exists() {
         funkot_core::labels::load_labels(labels_path).map_err(|e| anyhow::anyhow!("{e}"))?
@@ -1477,10 +1497,10 @@ fn run_label_sections(
             .filter(|(_, h)| !labeled.contains(*h))
             .map(|(p, _)| p)
             .collect();
-        return render_label_clips(&todo, cache_dir, dir);
+        return render_label_clips(&todo, cache_dir, dir, click_opts);
     }
 
-    run_label_sections_interactive(playlist, &hashes, &labeled, labels_path, cache_dir)
+    run_label_sections_interactive(playlist, &hashes, &labeled, labels_path, cache_dir, click_opts)
 }
 
 /// `--render-clips DIR`: for every candidate on both sides of every track in
@@ -1488,7 +1508,12 @@ fn run_label_sections(
 /// have played, as WAV. No labels are written — this path exists so the
 /// clip synthesis can be verified without an audio output device (e.g.
 /// inside the dev container).
-fn render_label_clips(playlist: &[&PathBuf], cache_dir: &Path, out_dir: &Path) -> Result<()> {
+fn render_label_clips(
+    playlist: &[&PathBuf],
+    cache_dir: &Path,
+    out_dir: &Path,
+    click_opts: &label_session::ClickOptions,
+) -> Result<()> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
     for path in playlist {
         let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1508,6 +1533,7 @@ fn render_label_clips(playlist: &[&PathBuf], cache_dir: &Path, out_dir: &Path) -
                     side,
                     bars,
                     label_session::NORMAL_HALF_WIDTH_BARS,
+                    click_opts,
                 );
                 let clip_path =
                     out_dir.join(format!("{stem}_{}_{bars:03}bars.wav", side.label()));
@@ -1520,6 +1546,76 @@ fn render_label_clips(playlist: &[&PathBuf], cache_dir: &Path, out_dir: &Path) -
         println!("wrote {n} candidate clips for {}", path.display());
     }
     Ok(())
+}
+
+/// Resample a `--label-sections` click clip from the source file's own
+/// sample rate to the output device's rate. [`ClipPlayer`] streams whatever
+/// buffer it's handed straight into the device callback with no rate
+/// conversion of its own, so without this, a device default that differs
+/// from the file's rate (e.g. a 48 kHz device against 44.1 kHz Funkot
+/// masters) played every clip audibly fast/sharp or slow/flat. `speed` is
+/// pinned to `1.0` and [`PitchMode::Shift`] used deliberately: this needs an
+/// exact sample-rate match for correct playback speed, not a tempo change,
+/// so the plain-resample path (reused from the loader's existing
+/// [`funkot_core::stretch`]) is the right one, not the pitch-preserving
+/// stretch.
+fn resample_clip_for_device(clip: Vec<f32>, source_rate: u32, device_rate: u32) -> Vec<f32> {
+    if source_rate == device_rate {
+        return clip;
+    }
+    match funkot_core::stretch::render_track(&clip, source_rate, device_rate, 1.0, PitchMode::Shift)
+    {
+        Ok(resampled) => resampled,
+        Err(e) => {
+            eprintln!(
+                "warn: could not resample label-sections clip {source_rate} Hz -> \
+                 {device_rate} Hz ({e}); playing at source rate (pitch/tempo will be off)"
+            );
+            clip
+        }
+    }
+}
+
+#[cfg(test)]
+mod resample_clip_for_device_tests {
+    use super::*;
+
+    fn stereo_sine(frames: usize, freq: f32, sr: u32) -> Vec<f32> {
+        let mut out = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let t = i as f32 / sr as f32;
+            let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.5;
+            out[i * 2] = s;
+            out[i * 2 + 1] = s;
+        }
+        out
+    }
+
+    #[test]
+    fn matching_rates_pass_through_unchanged() {
+        let clip = stereo_sine(2_000, 440.0, 44_100);
+        let out = resample_clip_for_device(clip.clone(), 44_100, 44_100);
+        assert_eq!(out, clip, "same source/device rate must be a no-op");
+    }
+
+    #[test]
+    fn mismatched_rates_resample_to_the_device_length() {
+        // The mismatch this fixes: a 44.1 kHz file on a 48 kHz device
+        // (common WASAPI/CoreAudio default) previously played ~8.8% fast
+        // with no rate conversion at all.
+        let source_rate = 44_100;
+        let device_rate = 48_000;
+        let clip = stereo_sine(4_410, 440.0, source_rate); // 100 ms
+        let out = resample_clip_for_device(clip, source_rate, device_rate);
+
+        let expected_frames = 4_410 * device_rate as usize / source_rate as usize;
+        let out_frames = out.len() / 2;
+        assert!(
+            out_frames.abs_diff(expected_frames) <= expected_frames / 50 + 8,
+            "out_frames={out_frames} expected≈{expected_frames}"
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
 }
 
 /// Sentinel `pos` value meaning "not currently playing".
@@ -1723,12 +1819,14 @@ fn run_label_sections_interactive(
     labeled: &std::collections::HashSet<String>,
     labels_path: &Path,
     cache_dir: &Path,
+    click_opts: &label_session::ClickOptions,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .context("no default audio output device available (use --render-clips instead)")?;
     let (config, channels) = pick_output_config(&device, None)?;
+    let device_rate = config.sample_rate;
     let player = ClipPlayer::new(&device, &config, channels)?;
 
     enable_raw_mode().context("failed to enable raw mode (needed for --label-sections)")?;
@@ -1747,16 +1845,29 @@ fn run_label_sections_interactive(
         let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
         let analysis =
             cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if buf.sample_rate != device_rate {
+            eprintln!(
+                "note: {} is {} Hz, output device is {device_rate} Hz; resampling clips for playback",
+                file_name(path),
+                buf.sample_rate
+            );
+        }
 
         let mut session = TrackSession::new(analysis.intro_bars, analysis.outro_structure_bars);
+        let build_clip = |session: &TrackSession| -> Vec<f32> {
+            let clip = label_session::build_candidate_clip(
+                &buf,
+                &analysis,
+                session.current_side(),
+                session.current_bars(),
+                session.context_half_width_bars(),
+                click_opts,
+            );
+            resample_clip_for_device(clip, buf.sample_rate, device_rate)
+        };
+
         print_label_track_header(&progress, path);
-        player.play(label_session::build_candidate_clip(
-            &buf,
-            &analysis,
-            session.current_side(),
-            session.current_bars(),
-            session.context_half_width_bars(),
-        ));
+        player.play(build_clip(&session));
         print_label_status(&session);
 
         loop {
@@ -1774,14 +1885,7 @@ fn run_label_sections_interactive(
             match session.apply_key(label_key) {
                 LabelOutcome::Continue => print_label_status(&session),
                 LabelOutcome::Replay => {
-                    let clip = label_session::build_candidate_clip(
-                        &buf,
-                        &analysis,
-                        session.current_side(),
-                        session.current_bars(),
-                        session.context_half_width_bars(),
-                    );
-                    player.play(clip);
+                    player.play(build_clip(&session));
                     print_label_status(&session);
                 }
                 LabelOutcome::Skip => {

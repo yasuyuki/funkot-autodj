@@ -293,21 +293,82 @@ pub fn boundary_frame(analysis: &TrackAnalysis, side: Side, bars: u32) -> i64 {
     }
 }
 
+/// Click loudness and ducking knobs for [`build_candidate_clip`]. Real
+/// Funkot masters run near 0 dBFS peak / -10 dBFS RMS with dense high-hats
+/// in the same band the click used to occupy, so a fixed absolute click
+/// amplitude either got lost in the mix or (turned up) clipped. Two things
+/// fix that: size the click off the clip's own RMS instead of an absolute
+/// number, and duck the music under it like a DJ cue click.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClickOptions {
+    /// Normal-click peak level, in dB above the clip's own RMS loudness.
+    /// The boundary click is louder still (see [`BOUNDARY_AMP_FIRST_SCALE`]);
+    /// this only sets the base.
+    pub click_db_above_rms: f32,
+    /// How many dB to duck the underlying music under each click
+    /// (magnitude: 15.0 means the music drops by 15 dB, not rises).
+    /// The boundary click ducks [`BOUNDARY_EXTRA_DUCK_DB`] deeper and for
+    /// longer, so it reads as structurally different, not just lower-pitched.
+    pub duck_db: f32,
+}
+
+impl Default for ClickOptions {
+    fn default() -> Self {
+        Self {
+            click_db_above_rms: 12.0,
+            duck_db: 18.0,
+        }
+    }
+}
+
+/// Fallback absolute click amplitude used only when the clip is fully
+/// silent (RMS 0 — e.g. a candidate window that lands entirely off the end
+/// of the file), so the click marking the position stays audible instead of
+/// scaling to nothing.
+const SILENT_CLIP_FALLBACK_AMP: f32 = 0.5;
+
+const NORMAL_CLICK_FREQ: f32 = 2200.0;
+const NORMAL_CLICK_DUR_SECS: f64 = 0.020;
+const BOUNDARY_CLICK_FREQ: f32 = 900.0;
+const BOUNDARY_CLICK_DUR_SECS: f64 = 0.035;
+const BOUNDARY_SECOND_HIT_OFFSET_SECS: f64 = 0.045;
+/// Boundary click peak, relative to the normal click's base amplitude.
+const BOUNDARY_AMP_FIRST_SCALE: f32 = 1.5;
+/// Boundary click's second hit, relative to the normal click's base
+/// amplitude (quieter than the first hit, same as before this change).
+const BOUNDARY_AMP_SECOND_SCALE: f32 = 1.2;
+/// Extra ducking depth (added to `duck_db`) for the boundary bar, on top of
+/// the longer hold that naturally follows from covering the double-hit.
+const BOUNDARY_EXTRA_DUCK_DB: f32 = 6.0;
+
+/// Duck envelope attack/release slope lengths. Short enough not to blunt
+/// the click's transient, long enough that the gain change doesn't itself
+/// click (a hard step would add its own audible pop).
+const DUCK_ATTACK_SECS: f64 = 0.005;
+const DUCK_RELEASE_SECS: f64 = 0.035;
+/// Hold covers the click tone's own decay plus a small margin.
+const NORMAL_DUCK_HOLD_SECS: f64 = NORMAL_CLICK_DUR_SECS + 0.010;
+/// Boundary hold covers both hits of the double-tap plus a small margin.
+const BOUNDARY_DUCK_HOLD_SECS: f64 =
+    BOUNDARY_SECOND_HIT_OFFSET_SECS + BOUNDARY_CLICK_DUR_SECS + 0.010;
+
 /// Build the interleaved-stereo listening clip for one candidate: the
 /// original audio from `half_width_bars` before to `half_width_bars` after
 /// the boundary, with a click synthesized on every bar head in that range
-/// and a distinct (lower, longer, double-hit) click on the boundary bar
-/// itself, so the candidate is unmistakable by ear.
+/// and a distinct (lower, longer, double-hit, deeper-ducked) click on the
+/// boundary bar itself, so the candidate is unmistakable by ear even over
+/// dense, loud source material.
 pub fn build_candidate_clip(
     buffer: &AudioBuffer,
     analysis: &TrackAnalysis,
     side: Side,
     bars: u32,
     half_width_bars: u32,
+    click_opts: &ClickOptions,
 ) -> Vec<f32> {
     let bar_frames = bar_frames_for(analysis, side);
     let boundary = boundary_frame(analysis, side, bars);
-    render_click_clip(buffer, boundary, bar_frames, half_width_bars)
+    render_click_clip(buffer, boundary, bar_frames, half_width_bars, click_opts)
 }
 
 fn render_click_clip(
@@ -315,6 +376,7 @@ fn render_click_clip(
     boundary_frame: i64,
     bar_frames: f64,
     half_width_bars: u32,
+    click_opts: &ClickOptions,
 ) -> Vec<f32> {
     let total_bars = 2 * half_width_bars;
     let clip_frames = (bar_frames * f64::from(total_bars)).round().max(0.0) as i64;
@@ -334,6 +396,7 @@ fn render_click_clip(
     }
 
     let sr = f64::from(buffer.sample_rate);
+    let base_amp = click_base_amplitude(rms(&out), click_opts.click_db_above_rms);
     for k in 0..total_bars {
         let offset = (bar_frames * f64::from(k)).round() as usize;
         let kind = if k == half_width_bars {
@@ -341,9 +404,27 @@ fn render_click_clip(
         } else {
             ClickKind::Normal
         };
-        add_click(&mut out, offset, sr, kind);
+        add_click(&mut out, offset, sr, kind, base_amp, click_opts.duck_db);
     }
     out
+}
+
+/// Root-mean-square amplitude of an interleaved-stereo buffer (both
+/// channels pooled), used to size the click relative to how loud the clip
+/// itself is rather than to a fixed absolute number.
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+    (sum_sq / samples.len() as f64).sqrt() as f32
+}
+
+fn click_base_amplitude(clip_rms: f32, click_db_above_rms: f32) -> f32 {
+    if clip_rms <= 0.0 {
+        return SILENT_CLIP_FALLBACK_AMP;
+    }
+    clip_rms * 10f32.powf(click_db_above_rms / 20.0)
 }
 
 #[derive(Clone, Copy)]
@@ -352,15 +433,111 @@ enum ClickKind {
     Boundary,
 }
 
-/// Overlay a bar-head click on `out` (interleaved stereo) at frame `start`.
-fn add_click(out: &mut [f32], start: usize, sr: f64, kind: ClickKind) {
+/// Overlay a bar-head click on `out` (interleaved stereo) at frame `start`,
+/// ducking the underlying music first so the click cuts through dense
+/// source material instead of being masked by it.
+fn add_click(out: &mut [f32], start: usize, sr: f64, kind: ClickKind, base_amp: f32, duck_db: f32) {
     match kind {
-        ClickKind::Normal => add_click_tone(out, start, sr, 2200.0, 0.020, 0.5),
-        ClickKind::Boundary => {
-            add_click_tone(out, start, sr, 900.0, 0.035, 0.75);
-            let second = start + (0.045 * sr).round() as usize;
-            add_click_tone(out, second, sr, 900.0, 0.035, 0.6);
+        ClickKind::Normal => {
+            duck_music(out, start, sr, NORMAL_DUCK_HOLD_SECS, duck_db);
+            let amp = safe_click_amplitude(out, start, NORMAL_CLICK_DUR_SECS, sr, base_amp);
+            add_click_tone(out, start, sr, NORMAL_CLICK_FREQ, NORMAL_CLICK_DUR_SECS, amp);
         }
+        ClickKind::Boundary => {
+            duck_music(
+                out,
+                start,
+                sr,
+                BOUNDARY_DUCK_HOLD_SECS,
+                duck_db + BOUNDARY_EXTRA_DUCK_DB,
+            );
+            let amp1 = safe_click_amplitude(
+                out,
+                start,
+                BOUNDARY_CLICK_DUR_SECS,
+                sr,
+                base_amp * BOUNDARY_AMP_FIRST_SCALE,
+            );
+            add_click_tone(out, start, sr, BOUNDARY_CLICK_FREQ, BOUNDARY_CLICK_DUR_SECS, amp1);
+            let second = start + (BOUNDARY_SECOND_HIT_OFFSET_SECS * sr).round() as usize;
+            let amp2 = safe_click_amplitude(
+                out,
+                second,
+                BOUNDARY_CLICK_DUR_SECS,
+                sr,
+                base_amp * BOUNDARY_AMP_SECOND_SCALE,
+            );
+            add_click_tone(out, second, sr, BOUNDARY_CLICK_FREQ, BOUNDARY_CLICK_DUR_SECS, amp2);
+        }
+    }
+}
+
+/// Peak of `out` (both channels) within `len` frames starting at `start`,
+/// used to see how much headroom a click actually has *after* ducking —
+/// measured, not assumed, so a quiet passage can get a louder click than a
+/// pessimistic worst-case bound would allow.
+fn local_peak(out: &[f32], start: i64, len: i64) -> f32 {
+    let frames = (out.len() / 2) as i64;
+    let lo = start.max(0);
+    let hi = (start + len).min(frames);
+    let mut peak = 0.0f32;
+    for f in lo..hi {
+        let idx = f as usize * 2;
+        peak = peak.max(out[idx].abs()).max(out[idx + 1].abs());
+    }
+    peak
+}
+
+/// Highest instantaneous sample magnitude a click + its already-ducked
+/// residual are allowed to sum to. Slightly below 1.0 for float rounding
+/// margin, not because samples at exactly 1.0 are a problem.
+const CLIP_SAFETY_CEILING: f32 = 0.97;
+
+/// Clamp `target` amplitude to what's actually safe given the ducked
+/// residual under this specific click, instead of assuming the worst case
+/// (source peaking at 1.0 right under every click). Funkot masters run hot,
+/// but ducking already pulls the local residual down to a fraction of that,
+/// so this recovers headroom the flat/absolute old design left unused.
+fn safe_click_amplitude(out: &[f32], start: usize, dur_secs: f64, sr: f64, target: f32) -> f32 {
+    let len = (dur_secs * sr).round().max(1.0) as i64;
+    let residual = local_peak(out, start as i64, len);
+    let headroom = (CLIP_SAFETY_CEILING - residual).max(0.0);
+    target.min(headroom)
+}
+
+/// Sidechain-style gain dip: ramps the music down over `DUCK_ATTACK_SECS`,
+/// holds it down for `hold_secs` (covering the click tone(s) that land on
+/// top), then ramps back up over `DUCK_RELEASE_SECS`. Slopes avoid the
+/// ducking itself adding an audible step.
+fn duck_music(out: &mut [f32], start: usize, sr: f64, hold_secs: f64, depth_db: f32) {
+    let frames = (out.len() / 2) as i64;
+    if frames == 0 {
+        return;
+    }
+    let start = start as i64;
+    let duck_gain = 10f32.powf(-depth_db / 20.0);
+    let attack_frames = (DUCK_ATTACK_SECS * sr).round().max(1.0) as i64;
+    let hold_frames = (hold_secs * sr).round().max(0.0) as i64;
+    let release_frames = (DUCK_RELEASE_SECS * sr).round().max(1.0) as i64;
+    let window_start = start - attack_frames;
+    let window_end = start + hold_frames + release_frames;
+
+    for f in window_start..window_end {
+        if f < 0 || f >= frames {
+            continue;
+        }
+        let gain = if f < start {
+            let t = (f - window_start) as f32 / attack_frames as f32;
+            1.0 + (duck_gain - 1.0) * t
+        } else if f < start + hold_frames {
+            duck_gain
+        } else {
+            let t = (f - (start + hold_frames)) as f32 / release_frames as f32;
+            duck_gain + (1.0 - duck_gain) * t
+        };
+        let idx = f as usize * 2;
+        out[idx] *= gain;
+        out[idx + 1] *= gain;
     }
 }
 
@@ -558,7 +735,14 @@ mod tests {
         let analysis = sample_analysis(sr, 180.0, 180.0, 0, 0);
         let half_width = 2u32;
         let bars = 2u32; // boundary coincides with half_width for a clean check
-        let clip = build_candidate_clip(&buffer, &analysis, Side::Intro, bars, half_width);
+        let clip = build_candidate_clip(
+            &buffer,
+            &analysis,
+            Side::Intro,
+            bars,
+            half_width,
+            &ClickOptions::default(),
+        );
 
         let bar_frames = 240usize;
         let total_bars = (2 * half_width) as usize;
@@ -583,6 +767,216 @@ mod tests {
         assert!(
             !is_active(bar_frames / 2),
             "expected silence between bar heads"
+        );
+    }
+
+    // --- click audibility over dense/loud material --------------------------
+    //
+    // Real Funkot masters run near 0 dBFS peak / -10 dBFS RMS with dense
+    // high-hats occupying the same band the click used to. The synthesized
+    // clip fixtures above are too thin to expose that — the click was never
+    // actually competing with anything. `synth_dense_loud_stereo` stands in
+    // for a hot, busy master so a masking regression shows up here instead
+    // of only on a user's real playlist.
+
+    /// Deterministic xorshift32 PRNG (no new crate dependency for test noise).
+    fn xorshift32(state: &mut u32) -> f32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        // [-1, 1)
+        (*state as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    /// Broadband noise floor (~-14 dBFS-ish) plus a dense 16th-note "hat"
+    /// layer of short noise bursts reaching near full scale — deliberately
+    /// unrelated to the bar grid, so some hits land right on top of a click,
+    /// the worst case for masking.
+    fn synth_dense_loud_stereo(frames: usize, sr: u32) -> Vec<f32> {
+        let mut state = 0x1234_5678u32;
+        let sr_f = f64::from(sr);
+        let hat_period_secs = 0.0625; // ~16th notes at a Funkot-ish tempo
+        let hat_decay_secs = 0.006;
+        let mut out = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let t = i as f64 / sr_f;
+            let base = xorshift32(&mut state) * 0.2;
+            let phase = t % hat_period_secs;
+            let hat_env = (-(phase / hat_decay_secs)) as f32;
+            let hat_env = hat_env.exp();
+            let hat = xorshift32(&mut state) * hat_env * 0.9;
+            let s = (base + hat).clamp(-1.0, 1.0);
+            out[i * 2] = s;
+            out[i * 2 + 1] = s;
+        }
+        out
+    }
+
+    /// Peak |sample| (both channels) of an interleaved-stereo buffer over
+    /// frames `[lo, hi)`.
+    fn peak_in(samples: &[f32], lo: usize, hi: usize) -> f32 {
+        samples[lo * 2..hi * 2]
+            .iter()
+            .fold(0.0f32, |acc, &s| acc.max(s.abs()))
+    }
+
+    /// Peak |a - b| (both channels) over `[lo, hi)`. Used to isolate a
+    /// click's own contribution from a render pair that share the same
+    /// ducked residual: `full - music_only` cancels the residual and leaves
+    /// just the click tone(s).
+    fn diff_peak_in(a: &[f32], b: &[f32], lo: usize, hi: usize) -> f32 {
+        a[lo * 2..hi * 2]
+            .iter()
+            .zip(&b[lo * 2..hi * 2])
+            .fold(0.0f32, |acc, (&x, &y)| acc.max((x - y).abs()))
+    }
+
+    /// A ±200 ms-median-vs-onset-peak ratio (an earlier version of this
+    /// test used exactly that) looks worse the louder/denser the
+    /// surrounding music is, *by construction*, regardless of whether the
+    /// click is actually audible: real Funkot masters are loud almost
+    /// everywhere, so a wide window mostly samples unrelated transients
+    /// that have nothing to do with this particular click, and a short
+    /// (60-80 ms) sidechain duck can't move a 400 ms-wide median at all —
+    /// that combination put a same low ceiling on the metric no matter how
+    /// the click/duck were tuned. It also can't separate "the click is
+    /// loud" from "the music happened to be loud right here," so it can't
+    /// actually confirm the duck fired at the right time.
+    ///
+    /// This test instead renders the same clip twice — once normally, once
+    /// with the click amplitude driven to ~0 (`click_db_above_rms` very
+    /// negative) so only the ducked residual remains — and diffs them.
+    /// That directly measures, per bar head:
+    ///   (a) how many dB the residual was actually reduced by at the click's
+    ///       own onset, compared to the true undecked original, and
+    ///   (b) how many dB the click's own peak (full minus music-only, so the
+    ///       residual cancels out) clears that residual by.
+    /// Neither reading is bounded by how loud the surrounding track is.
+    #[test]
+    fn clicks_stay_audible_over_dense_loud_material() {
+        let sr = 44_100u32;
+        let bpm = 180.0;
+        let total_secs = 30.0;
+        let frames = (f64::from(sr) * total_secs) as usize;
+        let source = synth_dense_loud_stereo(frames, sr);
+        let buffer = AudioBuffer {
+            sample_rate: sr,
+            frames: frames as u64,
+            samples: source.clone(),
+        };
+        // first_downbeat 5s in so the ±8-bar intro window stays inside the buffer.
+        let analysis = sample_analysis(sr, bpm, bpm, (f64::from(sr) * 5.0) as u64, frames as u64);
+        let half_width = NORMAL_HALF_WIDTH_BARS;
+        let bars = 8u32; // smallest intro candidate
+
+        let opts = ClickOptions::default();
+        let full = build_candidate_clip(&buffer, &analysis, Side::Intro, bars, half_width, &opts);
+        // Same duck, click amplitude ~0: isolates the ducked residual alone.
+        let music_only_opts = ClickOptions {
+            click_db_above_rms: -200.0,
+            duck_db: opts.duck_db,
+        };
+        let music_only = build_candidate_clip(
+            &buffer,
+            &analysis,
+            Side::Intro,
+            bars,
+            half_width,
+            &music_only_opts,
+        );
+
+        let bar_frames = bar_frames_for(&analysis, Side::Intro);
+        let boundary = boundary_frame(&analysis, Side::Intro, bars);
+        let clip_start = boundary - (bar_frames * f64::from(half_width)).round() as i64;
+        let total_bars = (2 * half_width) as usize;
+
+        for k in 0..total_bars {
+            let onset = (bar_frames * k as f64).round() as usize;
+            let is_boundary = k == half_width as usize;
+            let dur_secs = if is_boundary {
+                BOUNDARY_CLICK_DUR_SECS
+            } else {
+                NORMAL_CLICK_DUR_SECS
+            };
+            let dur_frames = (dur_secs * f64::from(sr)).round().max(1.0) as usize;
+            let hi = (onset + dur_frames).min(full.len() / 2);
+            assert!(hi > onset, "bar {k}: click window ran off the end of the clip");
+
+            // (a) true "no duck at all" reference: the original synthetic
+            // source at the same absolute frames this window covers.
+            let src_lo = clip_start + onset as i64;
+            let src_hi = src_lo + (hi - onset) as i64;
+            assert!(
+                src_lo >= 0 && (src_hi as u64) <= frames as u64,
+                "bar {k}: fixture must keep every candidate window in-bounds"
+            );
+            let undamped_peak = peak_in(&source, src_lo as usize, src_hi as usize);
+            let ducked_peak = peak_in(&music_only, onset, hi);
+            assert!(undamped_peak > 0.0 && ducked_peak > 0.0, "bar {k}: unexpectedly silent");
+            let reduction_db = 20.0 * (undamped_peak / ducked_peak).log10();
+
+            let expected_min_reduction = if is_boundary {
+                opts.duck_db + BOUNDARY_EXTRA_DUCK_DB
+            } else {
+                opts.duck_db
+            } - 1.0; // float-rounding slack
+            assert!(
+                reduction_db >= expected_min_reduction,
+                "bar {k}: residual only reduced by {reduction_db:.2} dB at click onset \
+                 (want >= {expected_min_reduction:.2} dB) — duck isn't engaged in time"
+            );
+
+            // (b) the click's own peak vs. the residual it's riding on.
+            let click_peak = diff_peak_in(&full, &music_only, onset, hi);
+            let margin_db = 20.0 * (click_peak / ducked_peak).log10();
+            assert!(
+                margin_db >= 12.0,
+                "bar {k}: click peak only {margin_db:.2} dB above its ducked residual \
+                 (want >= 12 dB)"
+            );
+        }
+
+        // Source is already near 0 dBFS; ducking must keep the click from
+        // pushing the mix over full scale.
+        let over = full.iter().filter(|&&s| s.abs() > 1.0).count();
+        assert_eq!(over, 0, "clicks over dense material should not clip");
+    }
+
+    #[test]
+    fn boundary_ducks_deeper_and_longer_than_normal() {
+        let sr = 44_100.0;
+        let frames = 2_000usize;
+        let duck_db = ClickOptions::default().duck_db;
+
+        let mut normal_buf = vec![1.0f32; frames * 2];
+        duck_music(&mut normal_buf, 500, sr, NORMAL_DUCK_HOLD_SECS, duck_db);
+        let normal_min = normal_buf.iter().cloned().fold(f32::INFINITY, f32::min);
+
+        let mut boundary_buf = vec![1.0f32; frames * 2];
+        duck_music(
+            &mut boundary_buf,
+            500,
+            sr,
+            BOUNDARY_DUCK_HOLD_SECS,
+            duck_db + BOUNDARY_EXTRA_DUCK_DB,
+        );
+        let boundary_min = boundary_buf.iter().cloned().fold(f32::INFINITY, f32::min);
+
+        assert!(
+            boundary_min < normal_min,
+            "boundary duck should reach a deeper gain floor: \
+             normal_min={normal_min} boundary_min={boundary_min}"
+        );
+
+        let count_at_floor = |buf: &[f32], floor: f32| {
+            buf.iter().filter(|&&s| (s - floor).abs() < 1e-4).count()
+        };
+        let normal_floor_count = count_at_floor(&normal_buf, normal_min);
+        let boundary_floor_count = count_at_floor(&boundary_buf, boundary_min);
+        assert!(
+            boundary_floor_count > normal_floor_count,
+            "boundary hold should stay at the floor longer than normal's: \
+             normal={normal_floor_count} boundary={boundary_floor_count}"
         );
     }
 }
