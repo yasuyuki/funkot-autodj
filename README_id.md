@@ -115,7 +115,7 @@ Jika kedua sisi high-confidence, `intro < outro` tetap dipertahankan
 Jika hanya mengubah `outro_bars`, sesuaikan juga `outro_start` =
 `total_frames − outro_bars × bar_len` (tidak dihitung ulang saat load).
 Perubahan format cache menaikkan `version` dan menonaktifkan JSON lama
-(saat ini v8).
+(saat ini v9).
 
 ## Struktur
 

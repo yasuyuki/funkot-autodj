@@ -115,6 +115,14 @@ pub struct SectionEstimate {
     pub score: f64,
     /// Local edge sharpness at the candidate boundary.
     pub sharpness: f64,
+    /// Musical structural boundary in bars, *before* any mix-lead-in is
+    /// added on top. Equal to `bars` everywhere except the two outro paths
+    /// that walk back an extra [`OUTRO_LEAD_BARS`] from a detected drop
+    /// (`pick_outro_bars`'s full-drop branch and
+    /// `pick_by_candidate_scores_outro`'s accepted-candidate branch): there,
+    /// `bars` is the lead-adjusted mix trigger and `structure_bars` is the
+    /// drop/candidate point itself. See [`TrackAnalysis::outro_structure_bars`].
+    pub structure_bars: u32,
 }
 
 /// Local tempo around a playhead in already-stretched (output-domain) audio.
@@ -254,8 +262,24 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         SectionDir::Backward,
     )?;
 
+    // `outro_est` is `Copy`, so this is still valid after the move-by-value
+    // call below; grab the pre-lead structural boundary before reconcile
+    // potentially rewrites `outro_bars`.
+    let outro_structure_bars_pre_reconcile = outro_est.structure_bars;
+
     let (intro_bars, outro_bars, intro_low_conf, outro_low_conf) =
         reconcile_intro_outro(intro_est, outro_est);
+
+    // Reconcile can shrink `outro_bars` below the pre-reconcile structural
+    // estimate (the "outro low-confidence, intro credible" branch above:
+    // `outro_bars = FALLBACK_BARS.min(intro.bars)`, unrelated to
+    // `structure_bars`). Without this clamp the exported invariant
+    // `outro_structure_bars <= outro_bars` (see
+    // [`TrackAnalysis::outro_structure_bars`]) could be violated. Both sides
+    // already carry `outro_bars_low_confidence: true` in that branch, so
+    // clamping loses no information a caller could otherwise trust.
+    let outro_structure_bars =
+        clamp_outro_structure_bars(outro_structure_bars_pre_reconcile, outro_bars);
 
     let bars_estimated_low_confidence = intro_low_conf || outro_low_conf;
     let outro_start = last_bar_end.saturating_sub(u64::from(outro_bars) * outro_bar_len);
@@ -279,6 +303,7 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         outro_start,
         intro_bars,
         outro_bars,
+        outro_structure_bars,
         bars_estimated_low_confidence,
         intro_bars_low_confidence: intro_low_conf,
         outro_bars_low_confidence: outro_low_conf,
@@ -288,6 +313,19 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         rms_dbfs,
         gain_db,
     })
+}
+
+/// Clamp a pre-reconcile outro structural-boundary estimate to the
+/// post-reconcile `outro_bars`, preserving the invariant documented on
+/// [`crate::TrackAnalysis::outro_structure_bars`]: the structural boundary
+/// can never be reported as farther from the file end than the mix trigger
+/// derived from it. `reconcile_intro_outro`'s low-confidence-outro branch is
+/// the only path that can push `outro_bars` below `structure_bars` (it
+/// derives `outro_bars` from the *intro* side, independent of the outro's
+/// own structural estimate); every other path leaves `outro_bars` at or
+/// above the original per-side outro estimate, so this is a no-op there.
+pub(crate) fn clamp_outro_structure_bars(structure_bars: u32, outro_bars: u32) -> u32 {
+    structure_bars.min(outro_bars)
 }
 
 /// Reconcile independently estimated intro/outro lengths.
@@ -1079,6 +1117,7 @@ fn detect_section_bars(
             low_confidence: true,
             score: 0.0,
             sharpness: 0.0,
+            structure_bars: FALLBACK_BARS,
         });
     }
 
@@ -1116,6 +1155,10 @@ fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
             low_confidence: false,
             score: drop.score,
             sharpness: drop.sharpness,
+            // `drop.structure_bars` is the un-lead-adjusted drop point
+            // (`pick_outro_full_drop` never adds the lead itself); `bars`
+            // above may additionally include OUTRO_LEAD_BARS.
+            structure_bars: drop.structure_bars,
         };
     }
     if let Some(hit) = pick_by_candidate_scores_outro(feats) {
@@ -1126,6 +1169,7 @@ fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
         low_confidence: true,
         score: 0.0,
         sharpness: 0.0,
+        structure_bars: FALLBACK_BARS,
     }
 }
 
@@ -1237,6 +1281,9 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
             low_confidence: false,
             score: peak / floor.max(1e-6),
             sharpness: edge_sharpness(before, after),
+            // This function never adds the mix lead-in itself; `bars` here
+            // already *is* the structural drop point.
+            structure_bars: bars,
         });
     }
     None
@@ -1267,6 +1314,7 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
             low_confidence: false,
             score,
             sharpness,
+            structure_bars: cand,
         });
     }
     if scored.is_empty() {
@@ -1314,6 +1362,10 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
             low_confidence: false,
             score: best.score,
             sharpness: best.sharpness,
+            // `best.bars` (== `best.structure_bars`, this function never
+            // adds the lead before this point) is the candidate boundary
+            // itself; `bars` above may additionally include OUTRO_LEAD_BARS.
+            structure_bars: best.bars,
         })
     } else {
         None
@@ -1352,6 +1404,7 @@ fn pick_section_bars(feats: &[BarFeat]) -> SectionEstimate {
         low_confidence: true,
         score: 0.0,
         sharpness: 0.0,
+        structure_bars: FALLBACK_BARS,
     }
 }
 
@@ -1416,6 +1469,7 @@ fn long_intro_tension_drop(feats: &[BarFeat], cand: u32) -> Option<SectionEstima
         low_confidence: false,
         score,
         sharpness: score,
+        structure_bars: cand,
     })
 }
 
@@ -1476,6 +1530,7 @@ fn pick_medium_intro_48(feats: &[BarFeat]) -> Option<SectionEstimate> {
             .max(local_ratio)
             .max(shout * 10.0),
         sharpness: sharpness.max(local_rise).max(local_ratio),
+        structure_bars: CAND,
     })
 }
 
@@ -1537,6 +1592,7 @@ fn long_intro_candidate(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate>
             .max(local_ratio)
             .max(shout * 10.0),
         sharpness: sharpness.max(local_rise).max(local_ratio),
+        structure_bars: cand,
     })
 }
 
@@ -1685,6 +1741,7 @@ fn pick_by_mainness_onset(feats: &[BarFeat]) -> Option<SectionEstimate> {
             low_confidence: false,
             score: contrast,
             sharpness: sharp,
+            structure_bars: bars,
         });
     }
     None
@@ -1722,6 +1779,7 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
             low_confidence: false,
             score,
             sharpness,
+            structure_bars: cand,
         });
     }
     if scored.is_empty() {

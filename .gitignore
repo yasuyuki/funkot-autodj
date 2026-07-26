@@ -5,7 +5,9 @@
 
 # Local cache and large generated audio
 /funkot-cache/
-/testdata/
+/testdata/*
+# Format sample for funkot_core::labels; no real audio/labels, safe to commit.
+!/testdata/labels.tsv.example
 *.wav
 !funkot-core/tests/data/*.wav
 # Optional listen/debug WAVs under fixtures/ (golden.json + README are committed)

@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Cache format version; bump when the analyzer changes incompatibly.
-pub const CACHE_VERSION: u32 = 8;
+pub const CACHE_VERSION: u32 = 9;
 
 const HASH_CHUNK: u64 = 64 * 1024;
 
@@ -173,6 +173,9 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
         outro_start: 0,
         intro_bars,
         outro_bars,
+        // Stripped alongside the other auto fields; needs_reanalysis pulls
+        // in a fresh value (or a fresh FALLBACK_BARS-based one) next load.
+        outro_structure_bars: 0,
         bars_estimated_low_confidence: true,
         intro_bars_low_confidence: !intro_m,
         outro_bars_low_confidence: !outro_m,
@@ -339,6 +342,9 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         outro_start,
         intro_bars: section_bars,
         outro_bars: section_bars,
+        // Naive placeholder, no structural detection ran; mirrors outro_bars
+        // like every other field here (all low-confidence by construction).
+        outro_structure_bars: section_bars,
         bars_estimated_low_confidence: true,
         intro_bars_low_confidence: true,
         outro_bars_low_confidence: true,
@@ -367,6 +373,7 @@ mod tests {
             outro_start: 0,
             intro_bars: 8,
             outro_bars: 16,
+            outro_structure_bars: 16,
             bars_estimated_low_confidence: true,
             intro_bars_low_confidence: true,
             outro_bars_low_confidence: true,

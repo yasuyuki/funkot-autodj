@@ -125,7 +125,7 @@ If both sides are high-confidence, `intro < outro` is kept as-is (for short-intr
 only the low-confidence side is corrected conservatively as before).
 When changing only `outro_bars`, also update `outro_start` to
 `total_frames − outro_bars × bar_len` (it is not recomputed on load).
-When the cache format changes, `version` is bumped and old JSON is invalidated (currently v8).
+When the cache format changes, `version` is bumped and old JSON is invalidated (currently v9).
 
 Startup options:
 
