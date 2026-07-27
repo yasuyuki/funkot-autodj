@@ -17,6 +17,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use funkot_cli::label_session::{self, LabelKey, LabelOutcome, Side, TrackSession};
 use funkot_cli::nav_keys::{MultiPressAggregator, NavDir, MULTI_PRESS_WINDOW};
 use funkot_cli::playlist::{load_playlist_file, validate_paths_exist};
+use funkot_cli::stream_error::{self, StreamErrorThrottle};
 use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
 use funkot_core::decode::decode_file;
 use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent, NavAction};
@@ -1174,8 +1175,18 @@ fn run_live(
                     let _ = event_tx.send(event);
                 }
             },
-            |err| {
-                eprintln!("audio stream error: {err}");
+            // Same throttle as `--label-sections`: cpal's ALSA worker retries a
+            // generic device error with no backoff, so one line per callback
+            // means tens of thousands of lines a second (see
+            // `funkot_cli::stream_error`). Raw mode is on once the key thread
+            // starts, hence the `\r` framing.
+            {
+                let mut throttle = StreamErrorThrottle::new(stream_error::DEFAULT_SUMMARY_INTERVAL);
+                move |err| {
+                    if let Some(report) = throttle.record_with(Instant::now(), || err.to_string()) {
+                        eprintln!("\r{}\r", report.to_line());
+                    }
+                }
             },
             None,
         )
@@ -1621,27 +1632,100 @@ mod resample_clip_for_device_tests {
 /// Sentinel `pos` value meaning "not currently playing".
 const CLIP_PLAYER_IDLE: usize = usize::MAX;
 
+/// Wait this long before trying to reopen a torn-down output stream. A
+/// wedged WSLg PulseAudio makes `snd_pcm_open` block for ~30 s (measured), and
+/// it is the UI thread that would block, so failed reopens must not be retried
+/// on every keystroke.
+const CLIP_STREAM_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// Printed once when a wedged stream is torn down.
+const CLIP_STREAM_WEDGED_NOTE: &str =
+    "audio output stopped (device kept failing); press r to retry playback";
+
+/// Error bookkeeping shared between the cpal error callback (audio thread) and
+/// the labeling UI thread.
+///
+/// The callback only *records*; the UI thread prints. That ordering matters:
+/// `--label-sections` runs in crossterm raw mode, where a bare `\n` from
+/// another thread leaves the cursor mid-column and staircases the status line.
+/// Queuing the text keeps every line on the UI thread, which frames it
+/// correctly.
+struct ClipStreamErrors {
+    throttle: StreamErrorThrottle,
+    /// Lines the UI thread has not printed yet. Bounded by the throttle: at
+    /// most one entry per [`stream_error::DEFAULT_SUMMARY_INTERVAL`].
+    pending: Vec<String>,
+}
+
+impl ClipStreamErrors {
+    fn new() -> Self {
+        Self {
+            throttle: StreamErrorThrottle::new(stream_error::DEFAULT_SUMMARY_INTERVAL),
+            pending: Vec::new(),
+        }
+    }
+}
+
 /// Minimal single-buffer cpal player for `--label-sections` candidate
 /// clips. Bypasses the mixing engine entirely (per plan constraints): the
 /// audio callback just streams whichever interleaved-stereo f32 buffer
 /// [`ClipPlayer::play`] last handed it, so a new candidate can interrupt
 /// mid-playback the same way the live engine's nav keys do.
+///
+/// The stream is held open across the whole session rather than opened per
+/// clip. Opening lazily was considered and rejected: WSLg's PulseAudio wedges
+/// independently of whether anything is playing (its RDP sink loses the
+/// Windows-side endpoint), and in that state `snd_pcm_open` blocks for ~30 s,
+/// so a per-clip open would freeze the labeling UI for half a minute on every
+/// replay while fixing nothing. Instead the failure is *survived*: see
+/// [`ClipPlayer::poll`].
 struct ClipPlayer {
-    // Kept alive only for its Drop impl (stops the stream); never read.
-    _stream: cpal::Stream,
+    device: cpal::Device,
+    config: StreamConfig,
+    channels: u16,
+    /// `None` while no stream is open, i.e. after a wedged one was torn down.
+    /// Reopened on the next user-initiated playback.
+    stream: Option<cpal::Stream>,
     buffer: Arc<Mutex<Vec<f32>>>,
     pos: Arc<AtomicUsize>,
+    errors: Arc<Mutex<ClipStreamErrors>>,
+    /// Error total already accounted for, so [`ClipPlayer::poll`] can measure
+    /// a rate rather than a running count.
+    seen_errors: u64,
+    last_poll: Instant,
+    /// Earliest time a reopen may be attempted, after one failed.
+    retry_after: Option<Instant>,
 }
 
 impl ClipPlayer {
-    fn new(device: &cpal::Device, config: &StreamConfig, channels: u16) -> Result<Self> {
-        let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-        let pos = Arc::new(AtomicUsize::new(CLIP_PLAYER_IDLE));
-        let buffer_cb = Arc::clone(&buffer);
-        let pos_cb = Arc::clone(&pos);
-        let stream = device
+    fn new(device: cpal::Device, config: StreamConfig, channels: u16) -> Result<Self> {
+        let mut player = Self {
+            device,
+            config,
+            channels,
+            stream: None,
+            buffer: Arc::new(Mutex::new(Vec::<f32>::new())),
+            pos: Arc::new(AtomicUsize::new(CLIP_PLAYER_IDLE)),
+            errors: Arc::new(Mutex::new(ClipStreamErrors::new())),
+            seen_errors: 0,
+            last_poll: Instant::now(),
+            retry_after: None,
+        };
+        // Fail fast at startup: a device that cannot be opened at all is a
+        // setup problem the user needs to see before any track is decoded.
+        player.open_stream()?;
+        Ok(player)
+    }
+
+    fn open_stream(&mut self) -> Result<()> {
+        let buffer_cb = Arc::clone(&self.buffer);
+        let pos_cb = Arc::clone(&self.pos);
+        let errors_cb = Arc::clone(&self.errors);
+        let channels = self.channels;
+        let stream = self
+            .device
             .build_output_stream(
-                config.clone(),
+                self.config,
                 move |data: &mut [f32], _| {
                     data.fill(0.0);
                     let p = pos_cb.load(Ordering::SeqCst);
@@ -1672,28 +1756,111 @@ impl ClipPlayer {
                         Ordering::SeqCst,
                     );
                 },
-                |err| eprintln!("audio stream error: {err}"),
+                move |err| {
+                    let now = Instant::now();
+                    let mut errors = errors_cb.lock().unwrap_or_else(|e| e.into_inner());
+                    // record_with: cpal can land here ~90k times a second, and
+                    // formatting the error is the expensive part.
+                    if let Some(report) = errors.throttle.record_with(now, || err.to_string()) {
+                        errors.pending.push(report.to_line());
+                    }
+                },
                 None,
             )
             .context("failed to build label-sections audio output stream")?;
         stream
             .play()
             .context("failed to start label-sections audio stream")?;
-        Ok(Self {
-            _stream: stream,
-            buffer,
-            pos,
-        })
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    /// Drain queued error lines, and tear the stream down if the device is
+    /// producing errors far faster than any real glitch could.
+    ///
+    /// Tearing down is what actually stops the damage: cpal's ALSA worker
+    /// retries a generic error with no backoff, so a wedged device pins a CPU
+    /// core and calls the error callback forever. Dropping the stream sets
+    /// cpal's `dropping` flag and joins that worker.
+    fn poll(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        let total = {
+            let errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+            errors.throttle.total()
+        };
+        let since = total.saturating_sub(self.seen_errors);
+        let elapsed = now.duration_since(self.last_poll);
+        self.seen_errors = total;
+        self.last_poll = now;
+        if self.stream.is_some() && stream_error::looks_wedged(since, elapsed) {
+            self.shutdown_wedged_stream(now);
+        }
+        let mut errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut errors.pending)
+    }
+
+    fn shutdown_wedged_stream(&mut self, now: Instant) {
+        // Drop *before* touching `errors`: the drop joins cpal's worker
+        // thread, which takes that same lock in the error callback.
+        drop(self.stream.take());
+        self.pos.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
+        {
+            let mut errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(report) = errors.throttle.flush(now) {
+                errors.pending.push(report.to_line());
+            }
+            errors.pending.push(CLIP_STREAM_WEDGED_NOTE.to_string());
+            errors.throttle.reset();
+        }
+        self.seen_errors = 0;
+        self.retry_after = Some(now + CLIP_STREAM_RETRY_COOLDOWN);
+    }
+
+    /// Reopen after a teardown, if the cooldown has passed. Queues a note
+    /// either way so the user learns why `r` did nothing.
+    fn ensure_stream(&mut self) {
+        if self.stream.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(at) = self.retry_after {
+            if now < at {
+                self.note(format!(
+                    "audio output unavailable; retrying in {:.0}s",
+                    at.duration_since(now).as_secs_f64().ceil()
+                ));
+                return;
+            }
+        }
+        match self.open_stream() {
+            Ok(()) => {
+                self.retry_after = None;
+                self.last_poll = Instant::now();
+                self.note("audio output restarted".to_string());
+            }
+            Err(e) => {
+                self.retry_after = Some(Instant::now() + CLIP_STREAM_RETRY_COOLDOWN);
+                self.note(format!("audio output unavailable: {e:#}"));
+            }
+        }
+    }
+
+    fn note(&self, line: String) {
+        let mut errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+        errors.pending.push(line);
     }
 
     /// Stop whatever is playing and start `clip` from the top.
-    fn play(&self, clip: Vec<f32>) {
+    fn play(&mut self, clip: Vec<f32>) {
+        self.ensure_stream();
         self.pos.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
         {
             let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
             *buf = clip;
         }
-        self.pos.store(0, Ordering::SeqCst);
+        if self.stream.is_some() {
+            self.pos.store(0, Ordering::SeqCst);
+        }
     }
 
     fn stop(&self) {
@@ -1707,6 +1874,15 @@ const LABEL_SECTIONS_KEY_HELP: &str =
 
 fn print_label_key_help() {
     println!("\r{LABEL_SECTIONS_KEY_HELP}\r");
+}
+
+/// Print audio-subsystem notices from the UI thread. Raw mode is on, so every
+/// line needs the same `\r` framing the rest of this UI uses -- a bare
+/// `eprintln!` from the cpal thread would staircase the display.
+fn print_label_audio(lines: &[String]) {
+    for line in lines {
+        eprintln!("\r{line}\r");
+    }
 }
 
 fn print_label_track_header(progress: &str, path: &Path) {
@@ -1827,7 +2003,7 @@ fn run_label_sections_interactive(
         .context("no default audio output device available (use --render-clips instead)")?;
     let (config, channels) = pick_output_config(&device, None)?;
     let device_rate = config.sample_rate;
-    let player = ClipPlayer::new(&device, &config, channels)?;
+    let mut player = ClipPlayer::new(device, config, channels)?;
 
     enable_raw_mode().context("failed to enable raw mode (needed for --label-sections)")?;
     let _raw_guard = RawModeGuard;
@@ -1845,6 +2021,10 @@ fn run_label_sections_interactive(
         let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
         let analysis =
             cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Decode + analyze can run for a minute with no key polling; check the
+        // stream now so a device that died meanwhile is torn down here rather
+        // than spinning until the next keystroke.
+        print_label_audio(&player.poll());
         if buf.sample_rate != device_rate {
             eprintln!(
                 "note: {} is {} Hz, output device is {device_rate} Hz; resampling clips for playback",
@@ -1871,7 +2051,11 @@ fn run_label_sections_interactive(
         print_label_status(&session);
 
         loop {
-            if !event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            let waiting = !event::poll(Duration::from_millis(100)).unwrap_or(false);
+            // Runs on every tick, including the idle ones: this is what keeps a
+            // failing device from flooding the terminal while the user thinks.
+            print_label_audio(&player.poll());
+            if waiting {
                 continue;
             }
             let ev = match event::read() {
