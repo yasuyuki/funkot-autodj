@@ -284,6 +284,11 @@ pub fn bar_frames_for(analysis: &TrackAnalysis, side: Side) -> f64 {
 /// the boundary a given candidate bar count implies: intro candidates count
 /// forward from `first_downbeat`, outro candidates count backward from the
 /// file end (matching `outro_structure_bars`, not `outro_bars`).
+///
+/// *Nominal* — this is bar arithmetic on the analysis markers, which is only
+/// as good as those markers' own phase. [`lock_boundary_to_groove`] moves it
+/// onto the beat the music in the preview window actually plays before any
+/// clicks are synthesized; see there for why that is not optional.
 pub fn boundary_frame(analysis: &TrackAnalysis, side: Side, bars: u32) -> i64 {
     let bar_frames = bar_frames_for(analysis, side);
     let span = (bar_frames * f64::from(bars)).round() as i64;
@@ -291,6 +296,57 @@ pub fn boundary_frame(analysis: &TrackAnalysis, side: Side, bars: u32) -> i64 {
         Side::Intro => analysis.first_downbeat as i64 + span,
         Side::Outro => analysis.total_frames as i64 - span,
     }
+}
+
+/// Move a nominal boundary by less than half a beat, onto the beat grid the
+/// music inside the listening window actually plays.
+///
+/// Neither analysis marker is accurate enough to place a click track on its
+/// own:
+///
+/// - The outro side counts back from `total_frames`, on the analyzer's
+///   "production ends on a bar boundary" convention. That holds to within a
+///   bar, not within a sample: measured across the real masters in
+///   `testdata/`, `(total_frames - first_downbeat) mod beat` is spread over
+///   the whole ±0.5 beat range. For `AntonFer - … - 02 IVY.flac` it is
+///   +0.494 beat — every click in the outro preview landed on the off-beat,
+///   which is the bug this exists to fix.
+/// - The intro side counts forward from `first_downbeat`, which is refined to
+///   a kick but still measured tens of bars away from the window being
+///   played, and is off by ~0.2 beat on some masters.
+///
+/// Two anchors that were tried and rejected, both measured on real audio:
+/// snapping the file end onto `first_downbeat + n × intro_bpm beats` breaks
+/// tracks whose end is already right (the tempo estimate's error accumulates
+/// to a full half beat over `Nicho - … - 04 Boom Boom Pow.flac`), and locking
+/// to the last few bars of the file breaks any master that fades into
+/// silence (`DimsR - … - 10 Shirube.flac`, `AntonFer - … - 09 Sakura
+/// Photograph.flac` — their final bars carry no onsets at all). The window
+/// the user is about to hear is the only evidence that is both local and
+/// guaranteed to contain the music being labeled.
+///
+/// The shift is always under half a beat, so bar identity — which bar the
+/// candidate names — comes from the analysis markers exactly as before. This
+/// is not the ±1/±2-beat coarse alignment HANDOFF §3/§8 rules out.
+pub fn lock_boundary_to_groove(
+    buffer: &AudioBuffer,
+    nominal: i64,
+    bar_frames: f64,
+    half_width_bars: u32,
+) -> i64 {
+    let beat_frames = bar_frames / f64::from(BEATS_PER_BAR);
+    let clip_start = nominal - (bar_frames * f64::from(half_width_bars)).round() as i64;
+    if clip_start < 0 || !(beat_frames.is_finite() && beat_frames > 1.0) {
+        return nominal;
+    }
+    let locked = funkot_core::analysis::lock_beat_phase(
+        &buffer.samples,
+        buffer.sample_rate,
+        clip_start as u64,
+        beat_frames,
+        2 * half_width_bars,
+    );
+    nominal + (locked as i64 - clip_start)
 }
 
 /// Click loudness and ducking knobs for [`build_candidate_clip`]. Real
@@ -367,8 +423,24 @@ pub fn build_candidate_clip(
     click_opts: &ClickOptions,
 ) -> Vec<f32> {
     let bar_frames = bar_frames_for(analysis, side);
-    let boundary = boundary_frame(analysis, side, bars);
+    let boundary = locked_boundary_frame(buffer, analysis, side, bars, half_width_bars);
     render_click_clip(buffer, boundary, bar_frames, half_width_bars, click_opts)
+}
+
+/// The boundary [`build_candidate_clip`] actually centres its window and
+/// click grid on: [`boundary_frame`] moved onto the window's own beat grid by
+/// [`lock_boundary_to_groove`]. Callers that need to relate clip frames back
+/// to source frames must use this, not the nominal value.
+pub fn locked_boundary_frame(
+    buffer: &AudioBuffer,
+    analysis: &TrackAnalysis,
+    side: Side,
+    bars: u32,
+    half_width_bars: u32,
+) -> i64 {
+    let bar_frames = bar_frames_for(analysis, side);
+    let nominal = boundary_frame(analysis, side, bars);
+    lock_boundary_to_groove(buffer, nominal, bar_frames, half_width_bars)
 }
 
 fn render_click_clip(
@@ -886,7 +958,10 @@ mod tests {
         );
 
         let bar_frames = bar_frames_for(&analysis, Side::Intro);
-        let boundary = boundary_frame(&analysis, Side::Intro, bars);
+        // The clip is centred on the *locked* boundary, not the nominal one,
+        // so the "same absolute frames" reference below has to be too.
+        let boundary =
+            locked_boundary_frame(&buffer, &analysis, Side::Intro, bars, half_width);
         let clip_start = boundary - (bar_frames * f64::from(half_width)).round() as i64;
         let total_bars = (2 * half_width) as usize;
 
@@ -940,6 +1015,239 @@ mod tests {
         // pushing the mix over full scale.
         let over = full.iter().filter(|&&s| s.abs() > 1.0).count();
         assert_eq!(over, 0, "clicks over dense material should not clip");
+    }
+
+    // --- click phase vs. the music's beat grid --------------------------
+    //
+    // The clip fixtures above are noise-only: they have no beat at all, so
+    // they can confirm *that* a click was synthesized but never *where* it
+    // should have been. The real failure they missed: outro candidates are
+    // measured back from the file end, and a master whose last sample is
+    // not on a beat (IVY: the file ends 0.494 beat past the last beat of the
+    // grid) puts every outro click squarely on the off-beat.
+
+    /// Dense, loud, IVY-shaped fixture with a *known* beat grid: a hard
+    /// 55 Hz kick on every beat starting at `first_downbeat`, 16th-note hats
+    /// with the on-beat hits accented, a clap on beats 2 and 4, and a
+    /// near-full-scale broadband bed (the same hot, busy master
+    /// [`synth_dense_loud_stereo`] stands in for). Every layer marks the same
+    /// grid, as a real Funkot master does — the point of the fixture is the
+    /// *file length*, not an adversarial rhythm.
+    fn synth_gridded_dense_loud_stereo(
+        frames: usize,
+        sr: u32,
+        first_downbeat: u64,
+        beat_frames: f64,
+    ) -> Vec<f32> {
+        let mut state = 0x9E37_79B9u32;
+        let sr_f = f64::from(sr);
+        let mut out = vec![0.0f32; frames * 2];
+
+        for i in 0..frames {
+            let s = xorshift32(&mut state) * 0.15;
+            out[i * 2] = s;
+            out[i * 2 + 1] = s;
+        }
+
+        // Percussion, all on the same grid: 16th hats (on-beat accented),
+        // clap on beats 2 and 4, kick on every beat.
+        let add_noise = |out: &mut Vec<f32>, at: f64, amp: f32, decay_secs: f64, st: &mut u32| {
+            let len = (decay_secs * 6.0 * sr_f) as usize;
+            let s0 = at.round() as usize;
+            for j in 0..len {
+                let f = s0 + j;
+                if f >= frames {
+                    break;
+                }
+                let env = (-(j as f64) / (decay_secs * sr_f)).exp() as f32;
+                let v = xorshift32(st) * amp * env;
+                out[f * 2] += v;
+                out[f * 2 + 1] += v;
+            }
+        };
+        let add_kick = |out: &mut Vec<f32>, at: f64| {
+            let len = (0.25 * sr_f) as usize;
+            let s0 = at.round() as usize;
+            for j in 0..len {
+                let f = s0 + j;
+                if f >= frames {
+                    break;
+                }
+                let t = j as f32 / sr_f as f32;
+                let env = (-(j as f64) / (0.10 * sr_f)).exp() as f32;
+                // Cosine phase: a real kick's low-band energy peaks at the
+                // attack, not a quarter cycle later.
+                out[f * 2] += 0.95 * env * (2.0 * PI * 55.0 * t).cos();
+                out[f * 2 + 1] += 0.95 * env * (2.0 * PI * 55.0 * t).cos();
+            }
+        };
+
+        let mut beat = 0u64;
+        loop {
+            let at = first_downbeat as f64 + beat_frames * beat as f64;
+            if at >= frames as f64 {
+                break;
+            }
+            add_kick(&mut out, at);
+            for sixteenth in 0..4 {
+                let amp = if sixteenth == 0 { 0.65 } else { 0.30 };
+                add_noise(
+                    &mut out,
+                    at + beat_frames * f64::from(sixteenth) / 4.0,
+                    amp,
+                    0.006,
+                    &mut state,
+                );
+            }
+            if beat % u64::from(BEATS_PER_BAR) % 2 == 1 {
+                add_noise(&mut out, at, 0.55, 0.030, &mut state);
+            }
+            beat += 1;
+        }
+        for s in out.iter_mut() {
+            *s = s.clamp(-1.0, 1.0);
+        }
+        out
+    }
+
+    /// Cascaded one-pole low-pass (interleaved stereo in, mono out), enough
+    /// to separate the fixture's 55 Hz kick from its broadband bed/hats.
+    fn lowpass2_mono(clip: &[f32], sr: u32, hz: f64) -> Vec<f32> {
+        let dt = 1.0 / f64::from(sr);
+        let rc = 1.0 / (2.0 * std::f64::consts::PI * hz);
+        let a = dt / (rc + dt);
+        let mut y1 = 0.0f64;
+        let mut y2 = 0.0f64;
+        let mut out = Vec::with_capacity(clip.len() / 2);
+        for f in clip.chunks_exact(2) {
+            let x = 0.5 * (f64::from(f[0]) + f64::from(f[1]));
+            y1 += a * (x - y1);
+            y2 += a * (y1 - y2);
+            out.push(y2 as f32);
+        }
+        out
+    }
+
+    /// Fold the clip's low-band (kick) energy onto one beat period and
+    /// return, in beats, how far the energy peak sits from clip frame 0 —
+    /// which `render_click_clip` always places a click on. `0` means the
+    /// clicks are phase-locked to the music; `±0.5` means they are on the
+    /// off-beat.
+    fn kick_phase_offset_beats(clip: &[f32], sr: u32, beat_frames: f64) -> f64 {
+        const NBINS: usize = 32;
+        let low = lowpass2_mono(clip, sr, 120.0);
+        let mut sum = [0.0f64; NBINS];
+        let mut cnt = [0.0f64; NBINS];
+        for (i, &s) in low.iter().enumerate() {
+            let b = (((i as f64 / beat_frames) % 1.0) * NBINS as f64) as usize % NBINS;
+            sum[b] += f64::from(s).abs();
+            cnt[b] += 1.0;
+        }
+        let prof: Vec<f64> = (0..NBINS).map(|b| sum[b] / cnt[b].max(1.0)).collect();
+        let peak = prof
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        let frac = peak as f64 / NBINS as f64;
+        if frac <= 0.5 {
+            frac
+        } else {
+            frac - 1.0
+        }
+    }
+
+    /// Build the same window three ways: with clicks, with the duck but no
+    /// click, and with neither. `full - music_only` isolates the click tones
+    /// (the differencing idiom `clicks_stay_audible_over_dense_loud_material`
+    /// established); `raw` is the untouched music the clicks must land on.
+    fn render_triplet(
+        buffer: &AudioBuffer,
+        analysis: &TrackAnalysis,
+        side: Side,
+        bars: u32,
+        half_width: u32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let opts = ClickOptions::default();
+        let full = build_candidate_clip(buffer, analysis, side, bars, half_width, &opts);
+        let music_only = build_candidate_clip(
+            buffer,
+            analysis,
+            side,
+            bars,
+            half_width,
+            &ClickOptions {
+                click_db_above_rms: -200.0,
+                duck_db: opts.duck_db,
+            },
+        );
+        let raw = build_candidate_clip(
+            buffer,
+            analysis,
+            side,
+            bars,
+            half_width,
+            &ClickOptions {
+                click_db_above_rms: -200.0,
+                duck_db: 0.0,
+            },
+        );
+        (full, music_only, raw)
+    }
+
+    #[test]
+    fn clicks_stay_on_the_beat_grid_when_the_file_ends_mid_beat() {
+        let sr = 44_100u32;
+        let bpm = 180.0;
+        let beat = f64::from(sr) * 60.0 / bpm; // 14700 exactly
+        let bar = beat * f64::from(BEATS_PER_BAR);
+        let first_downbeat = 7_676u64; // IVY's own value
+        let music_beats = 200u64;
+        // The whole point of the fixture: the last sample is *half a beat*
+        // past the last beat of the grid, the same shape as IVY (measured
+        // (total_frames - first_downbeat) mod beat = 0.494 beat). A grid
+        // counted back from `total_frames` therefore lands on the off-beat.
+        let total = first_downbeat
+            + (beat * music_beats as f64).round() as u64
+            + (beat * 0.5).round() as u64;
+        let frames = total as usize;
+        let samples = synth_gridded_dense_loud_stereo(frames, sr, first_downbeat, beat);
+        let buffer = AudioBuffer {
+            sample_rate: sr,
+            frames: total,
+            samples,
+        };
+        let analysis = sample_analysis(sr, bpm, bpm, first_downbeat, total);
+        let half_width = NORMAL_HALF_WIDTH_BARS;
+
+        for (side, bars) in [(Side::Outro, 8u32), (Side::Outro, 16), (Side::Intro, 8)] {
+            let (full, music_only, raw) =
+                render_triplet(&buffer, &analysis, side, bars, half_width);
+
+            // The click grid itself: clicks must sit on multiples of one bar
+            // from clip frame 0 (this is what the phase measurement below is
+            // measured against).
+            let total_bars = (2 * half_width) as usize;
+            for k in 0..total_bars {
+                let onset = (bar * k as f64).round() as usize;
+                let hi = (onset + (0.02 * f64::from(sr)) as usize).min(full.len() / 2);
+                let click_peak = diff_peak_in(&full, &music_only, onset, hi);
+                assert!(
+                    click_peak > 1e-4,
+                    "{:?} {bars}bars: no click at bar head {k}",
+                    side
+                );
+            }
+
+            let offset = kick_phase_offset_beats(&raw, sr, beat);
+            assert!(
+                offset.abs() <= 0.06,
+                "{:?} {bars}bars: the music's kicks sit {offset:+.3} beat away from the \
+                 click grid (want |offset| <= 0.06 beat). The clicks are on the off-beat.",
+                side
+            );
+        }
     }
 
     #[test]

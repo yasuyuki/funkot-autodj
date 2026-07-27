@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use funkot_core::analysis::{analyze, refine_groove_phase};
+use funkot_core::analysis::{analyze, lock_beat_phase, refine_groove_phase};
 use funkot_core::testutil::{synth_track_with_options, SynthOptions};
 use funkot_core::BEATS_PER_BAR;
 use serde_json::Value;
@@ -161,6 +161,102 @@ fn groove_refine_stays_within_half_beat_of_marker() {
         assert!(
             jump_beats.abs() < 0.5,
             "groove refine must not jump a whole beat, got {jump_beats:.3}"
+        );
+    }
+}
+
+/// Dense, loud stand-in for a Funkot master: kick on every beat, 16th hats
+/// with the on-beat hit accented, and a broadband bed. Thin fixtures do not
+/// exercise a phase lock — see HANDOFF §9 ("合成フィクスチャは音が薄すぎて
+/// 実音源の問題を検出できない").
+fn synth_gridded_stereo(frames: usize, sr: u32, first_beat: u64, beat: f64) -> Vec<f32> {
+    let mut state = 0x1234_5678u32;
+    let rnd = move |st: &mut u32| -> f32 {
+        *st ^= *st << 13;
+        *st ^= *st >> 17;
+        *st ^= *st << 5;
+        (*st as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let sr_f = f64::from(sr);
+    let mut out = vec![0.0f32; frames * 2];
+    for i in 0..frames {
+        let s = rnd(&mut state) * 0.12;
+        out[i * 2] = s;
+        out[i * 2 + 1] = s;
+    }
+    let mut b = 0u64;
+    loop {
+        let at = first_beat as f64 + beat * b as f64;
+        if at >= frames as f64 {
+            break;
+        }
+        // kick (cosine phase: low-band energy peaks at the attack)
+        let klen = (0.20 * sr_f) as usize;
+        for j in 0..klen {
+            let f = at.round() as usize + j;
+            if f >= frames {
+                break;
+            }
+            let t = j as f32 / sr_f as f32;
+            let env = (-(j as f64) / (0.08 * sr_f)).exp() as f32;
+            let v = 0.9 * env * (2.0 * std::f32::consts::PI * 55.0 * t).cos();
+            out[f * 2] += v;
+            out[f * 2 + 1] += v;
+        }
+        // 16th hats, on-beat accented
+        for sixteenth in 0..4 {
+            let amp = if sixteenth == 0 { 0.6 } else { 0.28 };
+            let start = (at + beat * f64::from(sixteenth) / 4.0).round() as usize;
+            let hlen = (0.03 * sr_f) as usize;
+            for j in 0..hlen {
+                let f = start + j;
+                if f >= frames {
+                    break;
+                }
+                let env = (-(j as f64) / (0.005 * sr_f)).exp() as f32;
+                let v = rnd(&mut state) * amp * env;
+                out[f * 2] += v;
+                out[f * 2 + 1] += v;
+            }
+        }
+        b += 1;
+    }
+    for s in out.iter_mut() {
+        *s = s.clamp(-1.0, 1.0);
+    }
+    out
+}
+
+/// `lock_beat_phase` exists because a marker counted back from the file end
+/// can be up to half a beat off (real case: `AntonFer - … - 02 IVY.flac`,
+/// +0.494 beat), which `refine_groove_phase`'s ±0.45-beat window cannot
+/// reach. Check both halves of its contract: it recovers a near-half-beat
+/// error, and it never moves a marker by half a beat or more (that would
+/// change which beat the marker names).
+#[test]
+fn beat_phase_lock_recovers_near_half_beat_error() {
+    let sr = 44_100u32;
+    let bpm = 180.0;
+    let beat = f64::from(sr) * 60.0 / bpm;
+    let n_bars = 8u32;
+    let true_beat = (2.0 * beat).round() as u64;
+    let frames = true_beat as usize + (f64::from(n_bars * BEATS_PER_BAR + 4) * beat) as usize;
+    let stereo = synth_gridded_stereo(frames, sr, true_beat, beat);
+
+    for &off in &[0.0_f64, 0.12, -0.30, 0.47, -0.47] {
+        let wrong = (true_beat as i64 + (off * beat).round() as i64).max(0) as u64;
+        let locked = lock_beat_phase(&stereo, sr, wrong, beat, n_bars);
+
+        let residual = (locked as i64 - true_beat as i64) as f64 / beat;
+        assert!(
+            residual.abs() < 0.05,
+            "start {off:+.2} beat off → residual {residual:+.4} beat \
+             (locked={locked} true={true_beat})"
+        );
+        let moved = (locked as i64 - wrong as i64) as f64 / beat;
+        assert!(
+            moved.abs() < 0.5,
+            "phase lock must not move a whole beat (bar identity): moved {moved:+.4} beat"
         );
     }
 }

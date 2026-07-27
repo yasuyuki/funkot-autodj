@@ -31,6 +31,9 @@
 //!    high-confidence sides are kept even when `intro < outro`.
 //! 8. Measure full-track mono RMS and derive a clamped gain.
 
+use rustfft::num_complex::Complex32;
+use rustfft::FftPlanner;
+
 use crate::cache::CACHE_VERSION;
 use crate::decode::AudioBuffer;
 use crate::{
@@ -534,6 +537,181 @@ pub fn refine_groove_phase(
         return coarse.min(frames as u64 - 1);
     }
     best_frame.min(frames as u64 - 1)
+}
+
+/// STFT window and hop for [`broadband_onset_flux`]. Short window on purpose:
+/// what matters is localizing transients in time, not frequency detail.
+const FLUX_WIN: usize = 512;
+const FLUX_HOP: usize = 128;
+/// How much better than "don't move" a candidate phase must score before
+/// [`lock_beat_phase`] adopts it.
+const LOCK_CLEAR_WIN_RATIO: f64 = 1.05;
+
+/// Broadband spectral-flux onset envelope: half-wave-rectified magnitude
+/// difference summed over the whole spectrum, one value per [`FLUX_HOP`]
+/// frames (value `i` is centred on frame `i * FLUX_HOP + FLUX_WIN / 2`), with
+/// its median subtracted so a steady bed does not count as onsets.
+///
+/// Distinct from [`onset_envelope`], which low-passes to ~150 Hz first
+/// because it is looking for *kicks* specifically (BPM comb, first-downbeat
+/// anchor). That is the wrong signal for deciding beat phase in dense
+/// mid-track Funkot: measured on the real masters in `testdata/`, a
+/// full-period comb over the low band reports mutually inconsistent phases
+/// for different windows of the same track, while the same comb over
+/// broadband flux — which sees the hats and percussion that actually mark the
+/// grid there — agrees with the analyzer's own intro downbeat to within a
+/// few hundredths of a beat.
+fn broadband_onset_flux(mono: &[f32]) -> Vec<f64> {
+    if mono.len() < FLUX_WIN + FLUX_HOP {
+        return Vec::new();
+    }
+    let n = (mono.len() - FLUX_WIN) / FLUX_HOP + 1;
+    let window: Vec<f32> = (0..FLUX_WIN)
+        .map(|i| {
+            let x = 2.0 * std::f32::consts::PI * i as f32 / FLUX_WIN as f32;
+            0.5 - 0.5 * x.cos()
+        })
+        .collect();
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(FLUX_WIN);
+    let mut buf = vec![Complex32::new(0.0, 0.0); FLUX_WIN];
+    let mut prev = vec![0.0f32; FLUX_WIN / 2 + 1];
+    let mut out = Vec::with_capacity(n);
+    for f in 0..n {
+        let base = f * FLUX_HOP;
+        for i in 0..FLUX_WIN {
+            buf[i] = Complex32::new(mono[base + i] * window[i], 0.0);
+        }
+        fft.process(&mut buf);
+        let mut sum = 0.0f64;
+        for k in 0..=FLUX_WIN / 2 {
+            let m = buf[k].norm();
+            if f > 0 && m > prev[k] {
+                sum += f64::from(m - prev[k]);
+            }
+            prev[k] = m;
+        }
+        out.push(sum);
+    }
+    let mut sorted = out.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    for v in out.iter_mut() {
+        *v = (*v - median).max(0.0);
+    }
+    out
+}
+
+/// Lock a marker onto the music's beat phase, searching a **full** beat period.
+///
+/// [`refine_groove_phase`] and [`refine_periodic_phase`] both search only
+/// ±0.45 beat around their input. That is deliberate — they are *micro*
+/// alignments for markers that are already approximately right — and it makes
+/// them the wrong tool for a marker whose phase is unknown a priori. A section
+/// boundary counted back from `total_frames` is exactly that: "production ends
+/// on a bar boundary" holds to within a bar, not within a sample, and across
+/// the real masters in `testdata/` the file end lands anywhere in the beat,
+/// including within a hundredth of a beat of the exact half-beat ambiguity
+/// point that no ±0.45-beat search can resolve either way.
+///
+/// So this combs [`broadband_onset_flux`] over `n_bars` bars at every phase in
+/// the beat and takes the best (`±1` flux hop of slack absorbs quantization),
+/// then snaps to the nearest kick body with [`refine_kick_marker`] so the
+/// result follows the same "downbeat = low-band peak" convention as
+/// `first_downbeat`.
+///
+/// The result stays within half a beat of `approx_frame`, so **bar identity is
+/// unchanged** — this is a beat-phase lock, not the ±1/±2-beat coarse
+/// alignment HANDOFF §3/§8 rules out (which is about *which* beat starts the
+/// bar). Falls back to `approx_frame` when the window is too short or carries
+/// no onsets at all.
+pub fn lock_beat_phase(
+    interleaved_stereo: &[f32],
+    sample_rate: u32,
+    approx_frame: u64,
+    beat_frames: f64,
+    n_bars: u32,
+) -> u64 {
+    let frames = interleaved_stereo.len() / 2;
+    if frames == 0 || sample_rate == 0 || !(beat_frames.is_finite() && beat_frames > 1.0) {
+        return approx_frame.min(frames.saturating_sub(1) as u64);
+    }
+    let approx = approx_frame.min(frames as u64 - 1);
+    let n_beats = n_bars.saturating_mul(BEATS_PER_BAR).clamp(4, 128);
+    let radius = (beat_frames / 2.0).round().max(1.0) as i64;
+    let span = (f64::from(n_beats) * beat_frames).ceil() as i64 + radius;
+    let lo = (approx as i64 - radius).max(0) as usize;
+    let hi = ((approx as i64 + span) as usize).min(frames);
+    if hi <= lo + FLUX_WIN + FLUX_HOP {
+        return approx;
+    }
+
+    let mut mono = Vec::with_capacity(hi - lo);
+    for i in lo..hi {
+        mono.push(0.5 * (interleaved_stereo[i * 2] + interleaved_stereo[i * 2 + 1]));
+    }
+    let flux = broadband_onset_flux(&mono);
+    if flux.is_empty() {
+        return approx;
+    }
+
+    let centre = FLUX_WIN as f64 / 2.0;
+    let at = |pos: f64| -> f64 {
+        let h = ((pos - centre) / FLUX_HOP as f64).round() as i64;
+        let mut best = 0.0f64;
+        for d in -1..=1 {
+            let i = h + d;
+            if i >= 0 && (i as usize) < flux.len() {
+                best = best.max(flux[i as usize]);
+            }
+        }
+        best
+    };
+
+    let approx_local = (approx as i64 - lo as i64) as f64;
+    let step = FLUX_HOP as i64;
+    let steps = radius / step;
+    let score_at = |delta: i64| -> f64 {
+        let base = approx_local + delta as f64;
+        (0..n_beats)
+            .map(|k| at(base + f64::from(k) * beat_frames))
+            .sum()
+    };
+    // `delta == 0` is scored explicitly (and is one of the `k` steps below),
+    // so the "don't move" option is always in the comparison set exactly.
+    let zero_score = score_at(0);
+    let mut best_delta = 0i64;
+    let mut best_score = zero_score;
+    for k in -steps..=steps {
+        let delta = k * step;
+        let score = score_at(delta);
+        if score > best_score {
+            best_score = score;
+            best_delta = delta;
+        }
+    }
+    if !best_score.is_finite() || best_score <= 0.0 {
+        return approx;
+    }
+    // Only move on a clear win. A comb over a window whose rhythm is
+    // ambiguous (half-time breakdown, sparse pad) can prefer a wrong phase by
+    // a hair; keeping the analysis marker in that case is the same
+    // clear-margin-only rule `align_next_entry_scored` uses for bar identity,
+    // and it is what stops this from *introducing* phase errors on windows
+    // the markers already had right.
+    if zero_score.is_finite()
+        && zero_score > 0.0
+        && best_score < zero_score * LOCK_CLEAR_WIN_RATIO
+    {
+        best_delta = 0;
+    }
+    let coarse = ((approx as i64 + best_delta).max(0) as u64).min(frames as u64 - 1);
+    refine_kick_marker(
+        interleaved_stereo,
+        sample_rate,
+        coarse,
+        KICK_REFINE_RADIUS_MS,
+    )
 }
 
 /// Refine a downbeat by scoring low-band onset energy across several following beats.
