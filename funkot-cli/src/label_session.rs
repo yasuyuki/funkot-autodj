@@ -289,13 +289,52 @@ pub fn bar_frames_for(analysis: &TrackAnalysis, side: Side) -> f64 {
 /// as good as those markers' own phase. [`lock_boundary_to_groove`] moves it
 /// onto the beat the music in the preview window actually plays before any
 /// clicks are synthesized; see there for why that is not optional.
+///
+/// The outro side does not simply subtract from `total_frames`: "the file
+/// ends on a bar boundary" only holds to whole bars, not samples. Measured
+/// across `testdata/`, `((total_frames - first_downbeat) / bar_frames) mod
+/// 1` is spread across almost the entire ±0.5-bar range (worst case
+/// `Nicho - … - 06 Love & Joy.flac` at +0.4948 bar), so counting candidates
+/// back from `total_frames` verbatim puts every one of them a bar or more
+/// off the phrase grid on those tracks. Instead the outro side rounds
+/// `(total_frames - first_downbeat) / bar_frames` to the nearest *integer*
+/// bar count and re-derives the file-end anchor from `first_downbeat` plus
+/// that many bars, then counts candidates back from the anchor. This only
+/// fixes bar *identity* (which bar a candidate names); it is not the
+/// rejected "propagate `first_downbeat + n × intro_bpm beats` to the file
+/// end" anchor documented in HANDOFF §9, which failed because tempo
+/// estimation error accumulates over hundreds of beats and moved sub-beat
+/// phase by up to half a beat on `Boom Boom Pow`. Rounding to the nearest
+/// *integer bar* is far more forgiving: HANDOFF's own measurements put that
+/// accumulated error at well under half a beat (= 0.125 bar), so it never
+/// flips which integer bar is nearest. Sub-beat phase is left entirely to
+/// [`lock_boundary_to_groove`], exactly as before.
 pub fn boundary_frame(analysis: &TrackAnalysis, side: Side, bars: u32) -> i64 {
     let bar_frames = bar_frames_for(analysis, side);
     let span = (bar_frames * f64::from(bars)).round() as i64;
     match side {
         Side::Intro => analysis.first_downbeat as i64 + span,
-        Side::Outro => analysis.total_frames as i64 - span,
+        Side::Outro => outro_anchor_frame(analysis, bar_frames) - span,
     }
+}
+
+/// The outro-side file-end anchor `boundary_frame` counts candidates back
+/// from: `first_downbeat` plus the nearest whole number of outro bars to
+/// `total_frames`. Falls back to `total_frames` verbatim (the old
+/// behaviour) if the markers needed to propagate the grid are unusable.
+fn outro_anchor_frame(analysis: &TrackAnalysis, bar_frames: f64) -> i64 {
+    let total_frames = analysis.total_frames as f64;
+    let first_downbeat = analysis.first_downbeat as f64;
+    if !bar_frames.is_finite()
+        || bar_frames <= 1.0
+        || !total_frames.is_finite()
+        || !first_downbeat.is_finite()
+        || total_frames < first_downbeat
+    {
+        return analysis.total_frames as i64;
+    }
+    let bars_to_end = ((total_frames - first_downbeat) / bar_frames).round();
+    (first_downbeat + bars_to_end * bar_frames).round() as i64
 }
 
 /// Move a nominal boundary by less than half a beat, onto the beat grid the
@@ -791,6 +830,70 @@ mod tests {
     fn intro_boundary_counts_forward_from_first_downbeat() {
         let analysis = sample_analysis(180, 180.0, 180.0, 100, 0);
         assert_eq!(boundary_frame(&analysis, Side::Intro, 2), 100 + 480);
+    }
+
+    /// Regression: when `total_frames` already sits exactly on the bar grid
+    /// propagated from `first_downbeat`, the anchor rounding must reproduce
+    /// the same result as counting back from `total_frames` directly (a
+    /// nonzero `first_downbeat` this time, unlike the test above).
+    #[test]
+    fn outro_boundary_unchanged_when_file_end_is_already_on_grid() {
+        // bar_frames = 240; first_downbeat + 12 bars = 100 + 2880 = 2980,
+        // exactly total_frames -> no correction should apply.
+        let analysis = sample_analysis(180, 180.0, 180.0, 100, 2980);
+        assert_eq!(boundary_frame(&analysis, Side::Outro, 2), 2980 - 480);
+    }
+
+    /// The bug this exists to fix: `total_frames` sits two bars *and* a
+    /// sub-bar residual (90 of 240 frames, well under the half-bar/half-beat
+    /// range `lock_boundary_to_groove` is responsible for) past the true
+    /// phrase grid. The anchor must snap to the nearest whole bar from
+    /// `first_downbeat`, discarding the residual, not propagate it.
+    #[test]
+    fn outro_boundary_snaps_to_bar_grid_when_file_end_is_off_grid() {
+        let first_downbeat = 100u64;
+        let bar_frames = 240u64; // sr=180, bpm=180
+        let true_grid_end = first_downbeat + 12 * bar_frames; // 2980
+        let total_frames = true_grid_end + 2 * bar_frames + 90; // 2 bars + noise
+        let analysis = sample_analysis(180, 180.0, 180.0, first_downbeat, total_frames);
+
+        // New anchor is first_downbeat + 14 bars (the extra 2 bars survive,
+        // the 90-frame residual does not): 100 + 14*240 = 3460.
+        let candidate = boundary_frame(&analysis, Side::Outro, 2);
+        assert_eq!(candidate, first_downbeat as i64 + 12 * bar_frames as i64);
+
+        // The naive "subtract straight from total_frames" formula this
+        // replaces would have kept the 90-frame residual.
+        let naive = total_frames as i64 - 2 * bar_frames as i64;
+        assert_ne!(candidate, naive);
+        assert_eq!(naive - candidate, 90);
+    }
+
+    /// Fallback: `total_frames < first_downbeat` is nonsensical input the
+    /// anchor propagation can't use, so it must fall back to the old
+    /// "subtract from total_frames" formula instead of producing garbage.
+    #[test]
+    fn outro_boundary_falls_back_when_total_frames_precedes_first_downbeat() {
+        let analysis = sample_analysis(180, 180.0, 180.0, 100, 50);
+        let bar_frames = bar_frames_for(&analysis, Side::Outro);
+        assert!((bar_frames - 240.0).abs() < 1e-9);
+        assert_eq!(boundary_frame(&analysis, Side::Outro, 1), 50 - 240);
+    }
+
+    /// Fallback: a degenerate (near-zero) `bar_frames`, e.g. from a bogus
+    /// BPM, must not be used to propagate a grid; fall back instead of
+    /// dividing into a meaningless bar count.
+    #[test]
+    fn outro_boundary_falls_back_when_bar_frames_is_degenerate() {
+        // outro_bpm absurdly high -> bar_frames_for(..) << 1.0.
+        let analysis = sample_analysis(180, 180.0, 1_000_000_000.0, 100, 2980);
+        let bar_frames = bar_frames_for(&analysis, Side::Outro);
+        assert!(bar_frames <= 1.0);
+        let span = (bar_frames * 2.0).round() as i64;
+        assert_eq!(
+            boundary_frame(&analysis, Side::Outro, 2),
+            2980 - span
+        );
     }
 
     // --- click clip: length and bar-head placement ------------------------
