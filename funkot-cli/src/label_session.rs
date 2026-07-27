@@ -294,9 +294,12 @@ pub fn bar_frames_for(analysis: &TrackAnalysis, side: Side) -> f64 {
 /// ends on a bar boundary" only holds to whole bars, not samples. Measured
 /// across `testdata/`, `((total_frames - first_downbeat) / bar_frames) mod
 /// 1` is spread across almost the entire ±0.5-bar range (worst case
-/// `Nicho - … - 06 Love & Joy.flac` at +0.4948 bar), so counting candidates
-/// back from `total_frames` verbatim puts every one of them a bar or more
-/// off the phrase grid on those tracks. Instead the outro side rounds
+/// `Surya Groxyn - … - 06 Love & Joy.flac` at +0.4948 bar), so counting
+/// candidates back from `total_frames` verbatim puts every one of them up
+/// to half a bar — nearly two beats — off the grid on those tracks. That
+/// residual is far outside the sub-half-beat range
+/// [`lock_boundary_to_groove`] can absorb, so the guide click survives it
+/// and fires mid-bar. Instead the outro side rounds
 /// `(total_frames - first_downbeat) / bar_frames` to the nearest *integer*
 /// bar count and re-derives the file-end anchor from `first_downbeat` plus
 /// that many bars, then counts candidates back from the anchor. This only
