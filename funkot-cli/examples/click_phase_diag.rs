@@ -13,7 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use funkot_cli::label_session::{
-    bar_frames_for, boundary_frame, locked_boundary_frame, Side, NORMAL_HALF_WIDTH_BARS,
+    bar_frames_for, boundary_frame_on_grid, grid_bar_frames, locked_boundary_frame, Side,
+    NORMAL_HALF_WIDTH_BARS,
 };
 use funkot_core::{cache, decode::decode_file};
 
@@ -68,9 +69,21 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
     println!("  file end vs intro beat grid: {end_phase:+.4} beat");
 
     for side in [Side::Intro, Side::Outro] {
-        let beat = bar_frames_for(&analysis, side) / 4.0;
+        // The grid the clicks are actually built on: for the outro that is
+        // the refined period, so `shift` keeps meaning "how far off the
+        // music's beats was the position we were about to click on".
+        let grid = grid_bar_frames(&buf, &analysis, side);
+        let beat = grid / 4.0;
+        if side == Side::Outro {
+            println!(
+                "  outro period refit: {:.3} -> {:.3} frames/beat ({:+.4}%)",
+                bar_frames_for(&analysis, side) / 4.0,
+                beat,
+                (grid / bar_frames_for(&analysis, side) - 1.0) * 100.0,
+            );
+        }
         for &bars in side.candidates() {
-            let nominal = boundary_frame(&analysis, side, bars);
+            let nominal = boundary_frame_on_grid(&analysis, side, bars, grid);
             let locked = locked_boundary_frame(
                 &buf,
                 &analysis,

@@ -308,12 +308,34 @@ pub fn bar_frames_for(analysis: &TrackAnalysis, side: Side) -> f64 {
 /// end" anchor documented in HANDOFF §9, which failed because tempo
 /// estimation error accumulates over hundreds of beats and moved sub-beat
 /// phase by up to half a beat on `Boom Boom Pow`. Rounding to the nearest
-/// *integer bar* is far more forgiving: HANDOFF's own measurements put that
-/// accumulated error at well under half a beat (= 0.125 bar), so it never
-/// flips which integer bar is nearest. Sub-beat phase is left entirely to
-/// [`lock_boundary_to_groove`], exactly as before.
+/// *integer bar* is far more forgiving, and sub-beat phase is still left to
+/// [`lock_boundary_to_groove`].
+///
+/// That accumulated error is real and was measured after the fact: pass
+/// `bar_frames` from [`bar_frames_for`] and the nominal boundary lands on the
+/// intro downbeat's propagated bar grid by construction, so whatever
+/// [`lock_boundary_to_groove`] then has to move *is* the drift. Across
+/// `testdata/` it is under 0.1 beat on 9 of 14 masters but reaches 0.47 on
+/// `03. KazuyaP - Monitoring Db` and 0.49 on `Nicho - … - 04 Boom Boom Pow`
+/// — right at the lock's half-beat radius, where which beat it snaps to is a
+/// coin flip, and close enough to flip the nearest-integer-bar rounding above
+/// on a master whose own residual already sits at 0.4948 bar
+/// (`… - 06 Love & Joy`), which shifts every candidate by a whole bar. Pass
+/// `bar_frames` from [`outro_bar_frames_refit`] instead and the drift is
+/// removed at the source; [`grid_bar_frames`] is the entry point that picks
+/// the right one per side.
 pub fn boundary_frame(analysis: &TrackAnalysis, side: Side, bars: u32) -> i64 {
-    let bar_frames = bar_frames_for(analysis, side);
+    boundary_frame_on_grid(analysis, side, bars, bar_frames_for(analysis, side))
+}
+
+/// [`boundary_frame`] on a caller-supplied bar grid, so the refined outro
+/// period from [`outro_bar_frames_refit`] can drive the same arithmetic.
+pub fn boundary_frame_on_grid(
+    analysis: &TrackAnalysis,
+    side: Side,
+    bars: u32,
+    bar_frames: f64,
+) -> i64 {
     let span = (bar_frames * f64::from(bars)).round() as i64;
     match side {
         Side::Intro => analysis.first_downbeat as i64 + span,
@@ -338,6 +360,120 @@ fn outro_anchor_frame(analysis: &TrackAnalysis, bar_frames: f64) -> i64 {
     }
     let bars_to_end = ((total_frames - first_downbeat) / bar_frames).round();
     (first_downbeat + bars_to_end * bar_frames).round() as i64
+}
+
+/// Shortest lever arm, in beats from `first_downbeat`, a reference point has
+/// to sit at before its position says anything useful about the beat period.
+const REFIT_MIN_LEVER_BEATS: f64 = 64.0;
+/// How far [`outro_bar_frames_refit`] may move the analyzer's period, as a
+/// fraction. The drifts this exists to cancel are tenths of a beat over
+/// hundreds of beats — 0.2% is already an order of magnitude more room than
+/// any master in `testdata/` needs (worst: 0.041% on `Boom Boom Pow`), so a
+/// larger correction means a reference point locked onto the wrong beat, not
+/// a mis-estimated tempo.
+const REFIT_MAX_REL_ADJUST: f64 = 0.002;
+/// A reference point agrees with a candidate period if the period predicts
+/// its position to within this many beats.
+const REFIT_MAX_RESIDUAL_BEATS: f64 = 0.25;
+/// Reference points that must agree before the refined period is trusted.
+const REFIT_MIN_AGREEING_POINTS: usize = 3;
+
+/// The outro-side bar length, with the analyzer's tempo refined against the
+/// audio near the outro.
+///
+/// `outro_bpm` is estimated from the tail alone and is good to about 0.05%,
+/// which is invisible locally and fatal after propagation: the anchor
+/// [`boundary_frame`] builds counts hundreds of bars forward from
+/// `first_downbeat`, and 0.04% over 577 bars is half a beat
+/// (`Nicho - … - 04 Boom Boom Pow`, measured). At that size the guide click
+/// stops being reliable in two separate ways — [`lock_boundary_to_groove`]
+/// can only pull by less than half a beat, so it lands on whichever beat the
+/// coin came up, and the nearest-integer-bar rounding inside
+/// [`outro_anchor_frame`] can flip, moving every candidate by a whole bar.
+///
+/// The fix is to stop propagating a period the audio disagrees with. Each
+/// outro candidate is locked onto the music with the analyzer's period, which
+/// gives a position that is (a) local, so drift-free, and (b) a whole number
+/// of beats from `first_downbeat` — unambiguous because the drift being
+/// corrected is under half a beat in the first place. Dividing distance by
+/// that whole number pins the period to ~0.001%; the median over the
+/// candidates ignores up to two points that locked onto the wrong beat, and
+/// the result is only accepted if [`REFIT_MIN_AGREEING_POINTS`] of them agree
+/// with it and it stays within [`REFIT_MAX_REL_ADJUST`]. Otherwise the
+/// analyzer's period is returned unchanged.
+///
+/// Bar *identity* is untouched: bar heads are still `first_downbeat` plus a
+/// whole number of bars, and nothing here searches ±N beats for a better
+/// correlation (HANDOFF §3/§8). Only the length of a bar changes.
+///
+/// Measured on `testdata/` (14 masters, all five outro candidates), the
+/// residual left for the lock to absorb drops from up to 0.59 beat to 0.11 —
+/// while the boundary itself moves by at most 0.09 beat, so this is a
+/// robustness fix, not a repositioning.
+///
+/// Known limit, and the reason [`REFIT_MAX_REL_ADJUST`] is deliberately
+/// tight: the reference points are found by locking the *drifted* nominal
+/// positions, so this only recovers the true period while that drift is under
+/// half a beat — which it is on every master measured (worst 0.49), but not by
+/// much. Past that the references snap onto the neighbouring beat and the
+/// refined period comes out one beat per lever arm too long. That outcome is
+/// still internally consistent (every candidate lands on one grid, so a
+/// labeler who trusts one candidate's clicks can trust the rest), but its
+/// absolute beat identity is not recoverable from this evidence, and no
+/// residual check here can tell the two apart. Resolving that needs downbeat
+/// evidence from the audio (HANDOFF §11-5), not a better fit.
+pub fn outro_bar_frames_refit(buffer: &AudioBuffer, analysis: &TrackAnalysis) -> f64 {
+    let bar_nominal = bar_frames_for(analysis, Side::Outro);
+    let beat_nominal = bar_nominal / f64::from(BEATS_PER_BAR);
+    if !(beat_nominal.is_finite() && beat_nominal > 1.0) {
+        return bar_nominal;
+    }
+    let first_downbeat = analysis.first_downbeat as f64;
+
+    // (whole beats from first_downbeat, measured distance in frames)
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(OUTRO_CANDIDATES.len());
+    for &bars in OUTRO_CANDIDATES.iter() {
+        let nominal = boundary_frame_on_grid(analysis, Side::Outro, bars, bar_nominal);
+        let locked = lock_boundary_to_groove(buffer, nominal, bar_nominal, NORMAL_HALF_WIDTH_BARS);
+        let dist = locked as f64 - first_downbeat;
+        let beats = (dist / beat_nominal).round();
+        if beats >= REFIT_MIN_LEVER_BEATS {
+            points.push((beats, dist));
+        }
+    }
+    if points.len() < REFIT_MIN_AGREEING_POINTS {
+        return bar_nominal;
+    }
+
+    let mut periods: Vec<f64> = points.iter().map(|(beats, dist)| dist / beats).collect();
+    periods.sort_by(|a, b| a.partial_cmp(b).expect("periods are finite"));
+    let beat_refit = periods[periods.len() / 2];
+    if !(beat_refit.is_finite() && beat_refit > 1.0)
+        || (beat_refit / beat_nominal - 1.0).abs() > REFIT_MAX_REL_ADJUST
+    {
+        return bar_nominal;
+    }
+    let agreeing = points
+        .iter()
+        .filter(|(beats, dist)| {
+            ((dist - beats * beat_refit) / beat_refit).abs() <= REFIT_MAX_RESIDUAL_BEATS
+        })
+        .count();
+    if agreeing < REFIT_MIN_AGREEING_POINTS {
+        return bar_nominal;
+    }
+    beat_refit * f64::from(BEATS_PER_BAR)
+}
+
+/// The bar grid the guide clicks are actually built on: the analyzer's
+/// period for intro candidates (they are propagated at most 96 bars, where
+/// drift is negligible), the refined one for outro candidates (hundreds of
+/// bars — see [`outro_bar_frames_refit`]).
+pub fn grid_bar_frames(buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) -> f64 {
+    match side {
+        Side::Intro => bar_frames_for(analysis, Side::Intro),
+        Side::Outro => outro_bar_frames_refit(buffer, analysis),
+    }
 }
 
 /// Move a nominal boundary by less than half a beat, onto the beat grid the
@@ -464,8 +600,9 @@ pub fn build_candidate_clip(
     half_width_bars: u32,
     click_opts: &ClickOptions,
 ) -> Vec<f32> {
-    let bar_frames = bar_frames_for(analysis, side);
-    let boundary = locked_boundary_frame(buffer, analysis, side, bars, half_width_bars);
+    let bar_frames = grid_bar_frames(buffer, analysis, side);
+    let boundary =
+        locked_boundary_on_grid(buffer, analysis, side, bars, half_width_bars, bar_frames);
     render_click_clip(buffer, boundary, bar_frames, half_width_bars, click_opts)
 }
 
@@ -480,8 +617,22 @@ pub fn locked_boundary_frame(
     bars: u32,
     half_width_bars: u32,
 ) -> i64 {
-    let bar_frames = bar_frames_for(analysis, side);
-    let nominal = boundary_frame(analysis, side, bars);
+    let bar_frames = grid_bar_frames(buffer, analysis, side);
+    locked_boundary_on_grid(buffer, analysis, side, bars, half_width_bars, bar_frames)
+}
+
+/// [`locked_boundary_frame`] on a caller-supplied bar grid, so
+/// [`build_candidate_clip`] can lay out its click grid on the same period it
+/// placed the boundary with instead of paying for [`grid_bar_frames`] twice.
+fn locked_boundary_on_grid(
+    buffer: &AudioBuffer,
+    analysis: &TrackAnalysis,
+    side: Side,
+    bars: u32,
+    half_width_bars: u32,
+    bar_frames: f64,
+) -> i64 {
+    let nominal = boundary_frame_on_grid(analysis, side, bars, bar_frames);
     lock_boundary_to_groove(buffer, nominal, bar_frames, half_width_bars)
 }
 
@@ -1391,6 +1542,149 @@ mod tests {
             boundary_floor_count > normal_floor_count,
             "boundary hold should stay at the floor longer than normal's: \
              normal={normal_floor_count} boundary={boundary_floor_count}"
+        );
+    }
+
+    // --- outro tempo refit -------------------------------------------------
+
+    /// How far `pos` sits from the nearest bar head of the *true* grid the
+    /// fixture's music was synthesized on, in beats. Zero means the guide
+    /// click would fire on a downbeat; ±1 means it fires on a beat, but the
+    /// wrong one, which is the audible failure `outro_bar_frames_refit`
+    /// exists to remove.
+    fn beats_from_true_bar_head(pos: i64, first_downbeat: u64, beat_true: f64) -> f64 {
+        let bars = (pos - first_downbeat as i64) as f64 / (beat_true * 4.0);
+        (bars - bars.round()) * 4.0
+    }
+
+    /// Fixture shaped like `Nicho - … - 04 Boom Boom Pow`: the music is on an
+    /// exact grid, but the analyzer's tempo is slightly wrong, so the grid
+    /// propagated from `first_downbeat` to the outro has drifted past the
+    /// half-beat point by the time the outro candidates are placed.
+    fn drifting_tempo_fixture(rel_tempo_error: f64) -> (AudioBuffer, TrackAnalysis, f64) {
+        let sr = 22_050u32;
+        let bpm_true = 180.0;
+        let beat_true = f64::from(sr) * 60.0 / bpm_true; // 7350 exactly
+        let first_downbeat = 1_820u64; // Shuki Shuki Song's own value
+        let music_beats = 1_024u64;
+        // End the file a fraction of a beat past the last beat, as every real
+        // master does, so `outro_anchor_frame`'s rounding is in play too.
+        let total = first_downbeat
+            + (beat_true * music_beats as f64).round() as u64
+            + (beat_true * 0.3).round() as u64;
+        let samples =
+            synth_gridded_dense_loud_stereo(total as usize, sr, first_downbeat, beat_true);
+        let buffer = AudioBuffer {
+            sample_rate: sr,
+            frames: total,
+            samples,
+        };
+        // The analyzer reports a tempo that is off by `rel_tempo_error`; the
+        // bar length it implies is what drifts.
+        let bpm_reported = bpm_true / (1.0 + rel_tempo_error);
+        let analysis = sample_analysis(sr, bpm_reported, bpm_reported, first_downbeat, total);
+        (buffer, analysis, beat_true)
+    }
+
+    #[test]
+    fn outro_refit_stops_the_lock_from_having_to_rescue_a_drifted_grid() {
+        // 0.04% is the worst tempo error measured across `testdata/`
+        // (`Nicho - … - 04 Boom Boom Pow`). Over a thousand beats it leaves
+        // every outro candidate a third of a beat or more off the music, which
+        // `lock_boundary_to_groove` can still just about rescue — that is the
+        // fragility being removed, so the assertions are on the *nominal*
+        // positions the lock is handed.
+        let (buffer, analysis, beat_true) = drifting_tempo_fixture(0.0004);
+        let first_downbeat = analysis.first_downbeat;
+        let bar_nominal = bar_frames_for(&analysis, Side::Outro);
+
+        let bar_refit = outro_bar_frames_refit(&buffer, &analysis);
+        let beat_refit = bar_refit / f64::from(BEATS_PER_BAR);
+        assert!(
+            (beat_refit / beat_true - 1.0).abs() < 1e-4,
+            "refit should recover the real beat period: {beat_refit:.3} vs true {beat_true:.3}"
+        );
+
+        let mut worst_nominal_without = 0.0f64;
+        for &bars in OUTRO_CANDIDATES.iter() {
+            let without = boundary_frame_on_grid(&analysis, Side::Outro, bars, bar_nominal);
+            worst_nominal_without = worst_nominal_without
+                .max(beats_from_true_bar_head(without, first_downbeat, beat_true).abs());
+
+            let with = boundary_frame_on_grid(&analysis, Side::Outro, bars, bar_refit);
+            let off = beats_from_true_bar_head(with, first_downbeat, beat_true);
+            assert!(
+                off.abs() <= 0.1,
+                "{bars}bars: refit nominal sits {off:+.3} beat from a bar head, so the \
+                 lock is still being asked to rescue it (want |off| <= 0.1)"
+            );
+
+            let locked = locked_boundary_frame(
+                &buffer,
+                &analysis,
+                Side::Outro,
+                bars,
+                NORMAL_HALF_WIDTH_BARS,
+            );
+            let locked_off = beats_from_true_bar_head(locked, first_downbeat, beat_true);
+            assert!(
+                locked_off.abs() <= 0.15,
+                "{bars}bars: refit boundary sits {locked_off:+.3} beat from a bar head"
+            );
+        }
+        assert!(
+            worst_nominal_without >= 0.25,
+            "fixture is not exercising the drift: worst pre-refit nominal was only \
+             {worst_nominal_without:+.3} beat off a bar head"
+        );
+    }
+
+    #[test]
+    fn outro_refit_leaves_an_already_correct_tempo_alone() {
+        let (buffer, analysis, beat_true) = drifting_tempo_fixture(0.0);
+        let bar_nominal = bar_frames_for(&analysis, Side::Outro);
+        let bar_refit = outro_bar_frames_refit(&buffer, &analysis);
+        assert!(
+            (bar_refit / bar_nominal - 1.0).abs() < 1e-4,
+            "refit moved an exact tempo by {:+.5}%",
+            (bar_refit / bar_nominal - 1.0) * 100.0
+        );
+        for &bars in OUTRO_CANDIDATES.iter() {
+            let locked = locked_boundary_frame(
+                &buffer,
+                &analysis,
+                Side::Outro,
+                bars,
+                NORMAL_HALF_WIDTH_BARS,
+            );
+            let off = beats_from_true_bar_head(locked, analysis.first_downbeat, beat_true);
+            assert!(
+                off.abs() <= 0.15,
+                "{bars}bars: boundary drifted {off:+.3} beat off a bar head on an exact tempo"
+            );
+        }
+    }
+
+    #[test]
+    fn outro_refit_falls_back_when_there_is_too_little_track_to_measure() {
+        // Two bars of audio: every candidate is either past the file start or
+        // too close to `first_downbeat` to say anything about the period, so
+        // the analyzer's value has to survive untouched.
+        let sr = 22_050u32;
+        let bpm = 180.0;
+        let beat = f64::from(sr) * 60.0 / bpm;
+        let first_downbeat = 100u64;
+        let total = first_downbeat + (beat * 8.0).round() as u64;
+        let samples = synth_gridded_dense_loud_stereo(total as usize, sr, first_downbeat, beat);
+        let buffer = AudioBuffer {
+            sample_rate: sr,
+            frames: total,
+            samples,
+        };
+        let analysis = sample_analysis(sr, bpm, bpm, first_downbeat, total);
+        assert_eq!(
+            outro_bar_frames_refit(&buffer, &analysis),
+            bar_frames_for(&analysis, Side::Outro)
         );
     }
 }
