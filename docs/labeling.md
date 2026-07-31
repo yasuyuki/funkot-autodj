@@ -52,6 +52,34 @@ PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
 クリックが小節頭から外れて聞こえた場合も `n` メモを残す
 （[guide-clicks.md](guide-clicks.md) の「テンポ refit の限界」に該当しうる）。
 
+## ラベルを捨ててやり直すとき
+
+`labels.tsv` を消すだけでは元に戻らない。**ラベリングはキャッシュも書き換える**:
+1曲終えるたびに `cache::set_manual_bars` が `intro_bars` をラベル値で上書きし
+`intro_bars_manual: true` を立てる（アウトロ側は書かない。書くと mix リード +16 を
+推測することになるため）。この上書きは**元に戻せない** — `set_manual_bars` の
+`None` は「変更しない」であって「クリアする」ではなく、解析器が本来出した
+`intro_bars` はキャッシュのどこにも残っていない。
+
+放置すると、UI の初期候補も `eval_sections` の入力も旧ラベル由来の値に
+引きずられる。やり直すときは該当エントリを**捨てて作り直す**:
+
+```sh
+rm -f testdata/labels.tsv
+rm -f $(grep -lE '"(intro|outro)_bars_manual" *: *true' funkot-cache/*.json)
+./dev.sh cargo run -p funkot-cli --release -- \
+  -l testdata/file_list.txt --cache-dir funkot-cache --fill-missing-cache --jobs 0
+grep -lE '"(intro|outro)_bars_manual" *: *true' funkot-cache/*.json | wc -l   # 0 を確認
+```
+
+解析は決定的なので再解析で元の推定値に戻る。**中断したセッションの残骸**が混じる点にも
+注意（`labels.tsv` に行が無くてもキャッシュにだけ manual フラグが立っていることがある。
+実際 2026-07-31 のやり直しでは 5行に対して 6件が該当した）。
+
+ガイドクリックの位置を変える修正を入れたあとにやり直す場合は、**ホストの
+`target-host/release/funkot-autodj` を再ビルドしてから**始めること。古いバイナリは
+修正前のアンカーでクリップを作る。
+
 ## WSLg の PulseAudio は勝手に死ぬ
 
 Windows 側の RDP オーディオエンドポイントが落ちると `/mnt/wslg/pulseaudio.log` に
