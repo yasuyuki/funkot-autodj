@@ -2196,12 +2196,15 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
             },
             json!({
                 "intro_bars": 8,
-                "outro_bars": 8,
+                // 8-bar structural outro; the mix trigger is that plus the
+                // lead-in, clamped by a 24-bar track with an 8-bar intro.
+                "outro_structure_bars": 8,
+                "outro_bars": 16,
                 "first_downbeat_secs": 0.0,
                 "first_downbeat_tol_secs": 0.05,
                 "intro_bpm": 180.0,
                 "bpm_tol": 0.3,
-                "outro_start_bars_from_fd": 16,
+                "outro_start_bars_from_fd": 8,
                 "outro_start_tol_secs": 0.12
             }),
         ),
@@ -2218,12 +2221,13 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
             },
             json!({
                 "intro_bars": 8,
-                "outro_bars": 8,
+                "outro_structure_bars": 8,
+                "outro_bars": 16,
                 "first_downbeat_secs": 0.25,
                 "first_downbeat_tol_secs": 0.05,
                 "intro_bpm": 180.0,
                 "bpm_tol": 0.3,
-                "outro_start_bars_from_fd": 16,
+                "outro_start_bars_from_fd": 8,
                 "outro_start_tol_secs": 0.12
             }),
         ),

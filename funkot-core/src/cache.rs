@@ -12,7 +12,13 @@ use crate::{
 };
 
 /// Cache format version; bump when the analyzer changes incompatibly.
-pub const CACHE_VERSION: u32 = 9;
+///
+/// 10: `outro_bars` is now `outro_structure_bars + OUTRO_LEAD_BARS` on every
+/// track (`analysis::outro_trigger_bars`). Version 9 entries carry triggers
+/// from the old conditional rule, which collapsed onto the structural
+/// boundary on tracks whose outro starts 64 bars from the end — the
+/// transition ran inside the outro there.
+pub const CACHE_VERSION: u32 = 10;
 
 const HASH_CHUNK: u64 = 64 * 1024;
 

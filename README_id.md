@@ -13,9 +13,11 @@ sebagai BGM tanpa putus dengan crossfade ala DJ.
 - Intro/outro adalah ritme mesin tetap untuk transisi. Intro: 8/16/32/48/64/80/96
   bar. Outro punya dua angka berbeda: *batas struktural* (titik lagu benar-benar
   turun) bernilai 8/16/32/64 bar, sedangkan *pemicu mix* yang dipakai saat
-  transisi menambah lead 16 bar dari batas itu lalu dibulatkan ke grid 8 bar,
-  sehingga nilainya salah satu dari 8/16/24/32/48/64 bar. BPM di tengah lagu
-  tidak tetap/bisa berubah, jadi analisis hanya memakai awal dan akhir track
+  transisi selalu berada 16 bar sebelum batas itu, sehingga nilainya salah satu
+  dari 24/32/48/80 bar. Panjang transisi 16 bar, jadi transisi *selesai* tepat di
+  awal outro: campuran memakai 16 bar sebelum outro dan tidak pernah menimpa
+  outro itu sendiri. BPM di tengah lagu tidak tetap/bisa berubah, jadi analisis
+  hanya memakai awal dan akhir track
 - Playback default dipercepat 10% (198 BPM). Default mempertahankan pitch;
   opsi menaikkan pitch seiring rate (gaya turntable) juga tersedia. Rate bisa
   diubah

@@ -11,10 +11,11 @@ DJ-style for continuous BGM playback.
 - Base BPM is 180. Tracks that drift slightly (e.g. 178 or 181) are time-stretched to match
 - Intro/outro are fixed machine-rhythm sections for mixing. Intro: 8/16/32/48/64/80/96 bars.
   The outro has two distinct numbers: the *structural boundary* (where the track actually
-  collapses) is one of 8/16/32/64 bars, while the *mix trigger* used for the transition adds
-  a 16-bar lead-in to that boundary and snaps to the 8-bar grid, so the trigger length is one
-  of 8/16/24/32/48/64 bars. Mid-track BPM is irregular/variable, so analysis uses only the
-  start and end of each track
+  collapses) is one of 8/16/32/64 bars, while the *mix trigger* used for the transition sits a
+  fixed 16-bar lead-in ahead of it, so the trigger length is one of 24/32/48/80 bars. The
+  transition is 16 bars long, so it *finishes* exactly where the outro begins: the mix uses the
+  16 bars leading up to the outro and never plays over the outro itself. Mid-track BPM is
+  irregular/variable, so analysis uses only the start and end of each track
 - Playback defaults to 10% faster (198 BPM). Pitch is preserved by default; optionally
   raise pitch with rate (turntable-style). The rate itself is also configurable
 

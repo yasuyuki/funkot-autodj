@@ -60,10 +60,10 @@ PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
 クリックが聞き取りにくい／ダッキングが邪魔なら `--click-db`（既定 12.0）と
 `--click-duck-db`（既定 18.0）で調整する。
 
-**注意**: UI の `OUTRO_CANDIDATES {8,16,32,48,64}` は**構造境界**の集合としては妥当
-（24 はトリガ側にしか現れない = 8+リード16）。ただし候補格子に載らない構造境界に
-遭遇したら、無理に近い候補を選ばず **`n` でメモを残す**こと。数が溜まったら
-候補集合の拡張を検討する。
+**注意**: UI の `OUTRO_CANDIDATES {8,16,32,48,64}` は**構造境界**の集合として妥当
+（ラベルは構造境界を記録する。mix トリガはそこから `+16小節` で導出され、
+集合は {24,32,48,80}）。ただし候補格子に載らない構造境界に遭遇したら、
+無理に近い候補を選ばず **`n` でメモを残す**こと。数が溜まったら候補集合の拡張を検討する。
 
 クリックが小節頭から外れて聞こえた場合も `n` メモを残す
 （[guide-clicks.md](guide-clicks.md) の「テンポ refit の限界」に該当しうる）。
@@ -72,8 +72,9 @@ PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
 
 `labels.tsv` を消すだけでは元に戻らない。**ラベリングはキャッシュも書き換える**:
 1曲終えるたびに `cache::set_manual_bars` が `intro_bars` をラベル値で上書きし
-`intro_bars_manual: true` を立てる（アウトロ側は書かない。書くと mix リード +16 を
-推測することになるため）。この上書きは**元に戻せない** — `set_manual_bars` の
+`intro_bars_manual: true` を立てる（アウトロ側は書かない。cache v10 でリードは
+`+16小節` 固定になったので推測ではなくなったが、書き込みはまだ実装していない
+→ section-analysis-redesign.md の Stage 4 残り）。この上書きは**元に戻せない** — `set_manual_bars` の
 `None` は「変更しない」であって「クリアする」ではなく、解析器が本来出した
 `intro_bars` はキャッシュのどこにも残っていない。
 

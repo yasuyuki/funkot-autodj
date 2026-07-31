@@ -81,28 +81,31 @@ pub struct TrackAnalysis {
     pub outro_start: u64,
     /// Intro length in bars.
     pub intro_bars: u32,
-    /// Outro mix-trigger length in bars (from file end). Full energy-drop
-    /// boundary plus ~16 bars of lead-in so DJ mixing starts before collapse.
+    /// Outro mix-trigger length in bars (from file end): where the
+    /// transition *starts*. [`Self::outro_structure_bars`] plus the mix
+    /// lead-in, so that the transition — two fades and [`MAIN_GAP_BARS`],
+    /// 16 bars in total — finishes exactly where the outro begins. The outro
+    /// itself is never mixed over.
     pub outro_bars: u32,
     /// Musical main→outro *structural* boundary in bars from file end —
     /// where the energy/mid-high content actually collapses, independent of
-    /// DJ mix timing. `outro_bars` is derived from this (structural
-    /// boundary, walked back by an additional mix lead-in) but the two are
-    /// **not** related by a fixed offset: the lead-in is only added when
-    /// there's room for it (see `analysis::pick_outro_bars`), and both
-    /// values separately clamp against [`FALLBACK_BARS`]. Do not derive one
-    /// from the other by arithmetic; use this field directly when the
-    /// structural boundary (not the mix trigger) is what's needed, e.g. for
-    /// offline evaluation against hand-labeled ground truth.
+    /// DJ mix timing. This is the value hand labels record, and the one an
+    /// analyzer is judged on.
     ///
-    /// **Invariant: `outro_structure_bars <= outro_bars` always holds.** The
-    /// structural boundary is never farther from the file end than the mix
-    /// trigger derived from it. `analysis::analyze` enforces this with a
-    /// final clamp (`analysis::clamp_outro_structure_bars`) after
-    /// reconciliation, since `reconcile_intro_outro`'s low-confidence-outro
-    /// branch can shrink `outro_bars` below the outro side's own structural
-    /// estimate (it substitutes a bound derived from the *intro* side
-    /// instead). `0` only in stripped/manual-only cache entries pending
+    /// `outro_bars` is derived from it by one fixed rule
+    /// (`analysis::outro_trigger_bars`: plus `OUTRO_LEAD_BARS`, bounded only
+    /// by the track being long enough to hold it). Before cache version 10
+    /// that lead was conditional and separately clamped, so the two were
+    /// *not* related by a fixed offset and neither could be recovered from
+    /// the other; that is why this field exists. It still reads more clearly
+    /// than re-deriving, and it is what offline evaluation against
+    /// hand-labeled ground truth compares.
+    ///
+    /// **Invariant: `outro_structure_bars <= outro_bars` always holds** —
+    /// the structural boundary is never farther from the file end than the
+    /// mix trigger derived from it. True by construction since cache version
+    /// 10: `analysis::outro_trigger_bars` never returns less than the
+    /// boundary it is handed. `0` only in stripped/manual-only cache entries pending
     /// reanalysis (see `cache::purge_auto`); a completed analysis always
     /// sets a real value. Added in cache version 9; absent (defaults to 0)
     /// on entries written before that, but those are already invalidated by
