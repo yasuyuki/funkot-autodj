@@ -819,6 +819,19 @@ fn locked_boundary_on_grid(
     lock_boundary_to_groove(buffer, nominal, grid.bar_frames, half_width_bars)
 }
 
+/// How far past the listening window a candidate clip keeps playing, in bars.
+///
+/// The window on its own answers "is the boundary click on a bar line", but
+/// not the two questions that actually decide a label: when the click comes
+/// too early, how far off is it (you have to hear where the section really
+/// turns over), and when the outro steps down in stages, does the anchor
+/// match the stage the ear calls the end. Both need the material *after* the
+/// window. 64 bars is enough to reach the file end from the deepest outro
+/// candidate (64 bars, minus the 8 already inside the window), and the clip
+/// is truncated at the file end anyway, so nothing is padded with silence
+/// that was not already inside the window.
+pub const CONTINUE_AFTER_WINDOW_BARS: u32 = 64;
+
 fn render_click_clip(
     buffer: &AudioBuffer,
     boundary_frame: i64,
@@ -826,12 +839,21 @@ fn render_click_clip(
     half_width_bars: u32,
     click_opts: &ClickOptions,
 ) -> Vec<f32> {
-    let total_bars = 2 * half_width_bars;
-    let clip_frames = (bar_frames * f64::from(total_bars)).round().max(0.0) as i64;
+    let window_bars = 2 * half_width_bars;
+    let window_frames = (bar_frames * f64::from(window_bars)).round().max(0.0) as i64;
     let clip_start = boundary_frame - (bar_frames * f64::from(half_width_bars)).round() as i64;
 
-    // Copy source audio where the window overlaps the file; out-of-range
-    // parts (window starts before frame 0, or runs past EOF) stay silent —
+    // Play on past the window, stopping at the file end. The window itself is
+    // always rendered in full even if it runs past that end (those frames stay
+    // silent, as before) — it is what the boundary click is judged against.
+    let with_tail = (bar_frames * f64::from(window_bars + CONTINUE_AFTER_WINDOW_BARS))
+        .round()
+        .max(0.0) as i64;
+    let to_file_end = (buffer.frames as i64 - clip_start).max(0);
+    let clip_frames = with_tail.min(to_file_end).max(window_frames);
+
+    // Copy source audio where the clip overlaps the file; out-of-range parts
+    // (clip starts before frame 0, or the window runs past EOF) stay silent —
     // clicks are synthesized independently and still land correctly.
     let mut out = vec![0.0f32; clip_frames as usize * 2];
     for i in 0..clip_frames {
@@ -844,9 +866,24 @@ fn render_click_clip(
     }
 
     let sr = f64::from(buffer.sample_rate);
-    let base_amp = click_base_amplitude(rms(&out), click_opts.click_db_above_rms);
-    for k in 0..total_bars {
+    // Size the clicks off the window, not the whole clip: the continuation
+    // runs into the outro and often into a fade, and letting that pull the
+    // clip's RMS down would quieten every click — including the ones inside
+    // the window, where they have to cut through a full-level master.
+    let window_len = (window_frames as usize * 2).min(out.len());
+    let base_amp = click_base_amplitude(rms(&out[..window_len]), click_opts.click_db_above_rms);
+    // The bar grid is a ruler; it keeps ticking past the window so bars can be
+    // counted from the boundary click to wherever the music actually turns.
+    let click_bars = if bar_frames > 1.0 {
+        (clip_frames as f64 / bar_frames).ceil() as u32
+    } else {
+        window_bars
+    };
+    for k in 0..click_bars {
         let offset = (bar_frames * f64::from(k)).round() as usize;
+        if offset * 2 >= out.len() {
+            break;
+        }
         let kind = if k == half_width_bars {
             ClickKind::Boundary
         } else {

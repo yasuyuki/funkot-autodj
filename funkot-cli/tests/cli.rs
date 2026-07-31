@@ -357,7 +357,9 @@ fn gen_test_fixtures_writes_golden() {
 
 #[test]
 fn label_sections_render_clips_writes_expected_clip_lengths() {
-    use funkot_cli::label_session::{Side, INTRO_CANDIDATES, OUTRO_CANDIDATES};
+    use funkot_cli::label_session::{
+        Side, CONTINUE_AFTER_WINDOW_BARS, INTRO_CANDIDATES, OUTRO_CANDIDATES,
+    };
 
     let dir = temp_dir("label_render_clips");
     let track = dir.join("track.wav");
@@ -398,27 +400,70 @@ fn label_sections_render_clips_writes_expected_clip_lengths() {
         "expected one clip per intro/outro candidate"
     );
 
-    // Every clip is 16 bars (±8 around the boundary) long; at 180 BPM that's
-    // 16 * (60/180*4) = 21.333...s, independent of which candidate it is.
-    let expected_secs = 16.0 * (60.0 / 180.0 * 4.0);
-    for &bars in Side::Intro.candidates() {
-        let path = clips_dir.join(format!("track_intro_{bars:03}bars.wav"));
+    // A clip is the ±8-bar window plus however much of the track follows it,
+    // capped at `CONTINUE_AFTER_WINDOW_BARS` and truncated at the file end
+    // (label_session::render_click_clip). The fixture is 64 bars at 180 BPM,
+    // so every candidate hits the file end well before the cap: intro clips
+    // get shorter the deeper the candidate sits (less track left after it) and
+    // outro clips get longer (they start further back and all run to the end).
+    let bar_secs = 60.0 / 180.0 * 4.0;
+    let window_secs = 16.0 * bar_secs;
+    let max_secs = f64::from(16 + CONTINUE_AFTER_WINDOW_BARS) * bar_secs;
+    let duration = |side: Side, bars: u32| -> f64 {
+        let path = clips_dir.join(format!("track_{}_{bars:03}bars.wav", side.label()));
         let reader = hound::WavReader::open(&path)
             .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
         let spec = reader.spec();
         assert_eq!(spec.channels, 2);
         assert_eq!(spec.sample_rate, sr);
-        let frames = reader.len() as u64 / 2;
-        let duration = frames as f64 / f64::from(sr);
-        assert!(
-            (duration - expected_secs).abs() < 0.01,
-            "intro {bars} bars: duration {duration:.3}s, expected ~{expected_secs:.3}s"
-        );
+        (reader.len() as f64 / 2.0) / f64::from(sr)
+    };
+
+    for (side, candidates) in [
+        (Side::Intro, Side::Intro.candidates()),
+        (Side::Outro, Side::Outro.candidates()),
+    ] {
+        let mut previous: Option<f64> = None;
+        for &bars in candidates {
+            let secs = duration(side, bars);
+            assert!(
+                secs >= window_secs - 0.01,
+                "{side:?} {bars} bars: {secs:.3}s is shorter than the {window_secs:.3}s window"
+            );
+            assert!(
+                secs <= max_secs + 0.01,
+                "{side:?} {bars} bars: {secs:.3}s runs past the {max_secs:.3}s cap"
+            );
+            if let Some(prev) = previous {
+                // One bar of slack: which frame the boundary lands on moves
+                // with the analyzer, the ordering does not.
+                match side {
+                    Side::Intro => assert!(
+                        secs <= prev + bar_secs,
+                        "intro {bars} bars: {secs:.3}s is longer than the previous \
+                         candidate's {prev:.3}s; deeper candidates leave less track"
+                    ),
+                    Side::Outro => assert!(
+                        secs >= prev - bar_secs,
+                        "outro {bars} bars: {secs:.3}s is shorter than the previous \
+                         candidate's {prev:.3}s; deeper candidates start further back"
+                    ),
+                }
+            }
+            previous = Some(secs);
+        }
     }
-    for &bars in Side::Outro.candidates() {
-        let path = clips_dir.join(format!("track_outro_{bars:03}bars.wav"));
-        assert!(path.is_file(), "missing {}", path.display());
-    }
+
+    // The shallowest candidate on each side has most of the track after its
+    // window, so it is the one that proves playback really continues.
+    assert!(
+        duration(Side::Intro, 8) > window_secs + bar_secs,
+        "intro 8 bars: clip stops at the window instead of playing on"
+    );
+    assert!(
+        duration(Side::Outro, 64) > window_secs + bar_secs,
+        "outro 64 bars: clip stops at the window instead of playing on"
+    );
 }
 
 #[test]

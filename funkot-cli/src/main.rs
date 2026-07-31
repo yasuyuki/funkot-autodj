@@ -1738,6 +1738,10 @@ impl ClipPlayer {
                         return;
                     };
                     let frames_total = buf.len() / 2;
+                    if frames_total == 0 {
+                        pos_cb.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
+                        return;
+                    }
                     let frames = data.len() / channels as usize;
                     let mut idx = p;
                     for i in 0..frames {
@@ -1870,7 +1874,8 @@ impl ClipPlayer {
 
 const LABEL_SECTIONS_KEY_HELP: &str =
     "keys: y/Enter=accept  \u{2190}/\u{2192}=candidate  +=widen/narrow window  \
-     r=replay  a=ambiguous(toggle set)  n=note  s=skip track  q=save & quit";
+     r=replay  a=ambiguous(toggle set)  n=note  s=skip track  q=save & quit  \
+     (plays on past the window)";
 
 fn print_label_key_help() {
     println!("\r{LABEL_SECTIONS_KEY_HELP}\r");
