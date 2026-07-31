@@ -355,6 +355,132 @@ fn gen_test_fixtures_writes_golden() {
     assert!(dir.join("README.md").is_file());
 }
 
+#[test]
+fn label_sections_render_clips_writes_expected_clip_lengths() {
+    use funkot_cli::label_session::{Side, INTRO_CANDIDATES, OUTRO_CANDIDATES};
+
+    let dir = temp_dir("label_render_clips");
+    let track = dir.join("track.wav");
+    let sr = 44_100u32;
+    write_wav(&track, &synth_track(180.0, 16, 32, 16, sr)).expect("track");
+    let list = dir.join("list.txt");
+    fs::write(&list, "track.wav\n").expect("list");
+    let cache = dir.join("cache");
+    let labels = dir.join("labels.tsv");
+    let clips_dir = dir.join("clips");
+
+    let status = bin()
+        .args([
+            "--label-sections",
+            "-l",
+            list.to_str().unwrap(),
+            "--labels",
+            labels.to_str().unwrap(),
+            "--cache-dir",
+            cache.to_str().unwrap(),
+            "--render-clips",
+            clips_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn");
+    assert!(status.success(), "exit status {status}");
+
+    // --render-clips never writes labels; it's a verification-only path.
+    assert!(!labels.exists(), "render-clips must not write labels.tsv");
+
+    let entries: Vec<_> = fs::read_dir(&clips_dir)
+        .expect("read clips dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        INTRO_CANDIDATES.len() + OUTRO_CANDIDATES.len(),
+        "expected one clip per intro/outro candidate"
+    );
+
+    // Every clip is 16 bars (±8 around the boundary) long; at 180 BPM that's
+    // 16 * (60/180*4) = 21.333...s, independent of which candidate it is.
+    let expected_secs = 16.0 * (60.0 / 180.0 * 4.0);
+    for &bars in Side::Intro.candidates() {
+        let path = clips_dir.join(format!("track_intro_{bars:03}bars.wav"));
+        let reader = hound::WavReader::open(&path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, sr);
+        let frames = reader.len() as u64 / 2;
+        let duration = frames as f64 / f64::from(sr);
+        assert!(
+            (duration - expected_secs).abs() < 0.01,
+            "intro {bars} bars: duration {duration:.3}s, expected ~{expected_secs:.3}s"
+        );
+    }
+    for &bars in Side::Outro.candidates() {
+        let path = clips_dir.join(format!("track_outro_{bars:03}bars.wav"));
+        assert!(path.is_file(), "missing {}", path.display());
+    }
+}
+
+#[test]
+fn label_sections_render_clips_skips_already_labeled_tracks() {
+    use funkot_core::cache::content_hash;
+    use funkot_core::labels::{save_labels, SectionLabel};
+
+    let dir = temp_dir("label_skip_labeled");
+    let track = dir.join("track.wav");
+    write_wav(&track, &synth_track(180.0, 16, 32, 16, 44_100)).expect("track");
+    let list = dir.join("list.txt");
+    fs::write(&list, "track.wav\n").expect("list");
+    let cache = dir.join("cache");
+    let labels = dir.join("labels.tsv");
+    let clips_dir = dir.join("clips");
+
+    let hash = content_hash(&track).expect("hash");
+    save_labels(
+        &labels,
+        &[SectionLabel {
+            hash,
+            file_name: "track.wav".to_string(),
+            intro_best: 16,
+            intro_ok: vec![],
+            outro_best: 16,
+            outro_ok: vec![],
+            note: String::new(),
+        }],
+    )
+    .expect("seed labels");
+
+    let output = bin()
+        .args([
+            "--label-sections",
+            "-l",
+            list.to_str().unwrap(),
+            "--labels",
+            labels.to_str().unwrap(),
+            "--cache-dir",
+            cache.to_str().unwrap(),
+            "--render-clips",
+            clips_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 of 1 already labeled"),
+        "stderr={stderr}"
+    );
+
+    let entries: Vec<_> = fs::read_dir(&clips_dir)
+        .expect("read clips dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "already-labeled track should produce no clips"
+    );
+}
+
 fn write_minimal_wav(path: &Path) {
     // Tiny valid WAV so path existence checks pass; render tests use synth tracks.
     write_wav(path, &synth_track(180.0, 1, 1, 1, 8_000)).expect("minimal wav");

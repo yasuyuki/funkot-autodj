@@ -143,6 +143,7 @@ fn seed_constant_analysis(
         outro_start,
         intro_bars,
         outro_bars,
+        outro_structure_bars: outro_bars,
         bars_estimated_low_confidence: false,
         intro_bars_low_confidence: false,
         outro_bars_low_confidence: false,
