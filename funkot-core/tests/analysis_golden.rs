@@ -76,6 +76,13 @@ fn golden_downbeat_and_section_tolerances() {
         if let Some(bars) = expect["intro_bars"].as_u64() {
             assert_eq!(a.intro_bars as u64, bars, "{file}: intro_bars");
         }
+        if let Some(bars) = expect["outro_structure_bars"].as_u64() {
+            assert_eq!(
+                a.outro_structure_bars as u64, bars,
+                "{file}: outro_structure_bars (the boundary the analyzer is judged on; \
+                 outro_bars is derived from it)"
+            );
+        }
         if let Some(bars) = expect["outro_bars"].as_u64() {
             assert_eq!(a.outro_bars as u64, bars, "{file}: outro_bars");
         }

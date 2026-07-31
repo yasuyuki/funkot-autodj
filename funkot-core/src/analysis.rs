@@ -93,9 +93,37 @@ const MIN_SHARP_SHORT: f64 = 2.2;
 const MIN_SHARP_SHORT_GRADUAL: f64 = 3.6;
 /// Before-window RMS spread (dB) treated as a gradual layering ramp.
 const GRADUAL_SPREAD_DB: f64 = 2.5;
-/// Bars before the full energy-drop to place the DJ outro / mix trigger.
-/// Real Funkot full-drop ≈ end−32; mix trigger ≈ end−48.
+/// Bars before the structural outro boundary that the mix trigger sits at.
+///
+/// The transition is [`crate::MAIN_GAP_BARS`] + two fades = 16 bars long, so
+/// starting it this far ahead means it *finishes* exactly where the outro
+/// begins: the mix uses the 16 bars leading up to the outro, and the outro
+/// itself is never mixed over. Real Funkot full-drop ≈ end−32, so the trigger
+/// lands ≈ end−48.
 const OUTRO_LEAD_BARS: u32 = 16;
+
+/// Where the transition starts, given the structural boundary: one fixed
+/// rule, applied to every track.
+///
+/// It used to be conditional — the lead was dropped when the outro analysis
+/// window was too short to also cover it, and the result was clamped to
+/// [`FALLBACK_BARS`]. Both conditions fired on real material: a track whose
+/// outro starts 64 bars from the end got trigger == boundary, so the whole
+/// transition ran *inside* the outro, which is the one place it must not
+/// (measured: 3 of the 34 masters in the working cache). Neither condition
+/// was about the trigger being right — the lead is arithmetic on the
+/// boundary, not something the analysis window has to cover.
+///
+/// The only real limit is the track: the trigger cannot precede the intro it
+/// would cut into, and never sits before the structural boundary it is
+/// derived from.
+pub(crate) fn outro_trigger_bars(structure_bars: u32, intro_bars: u32, track_bars: u32) -> u32 {
+    let room = track_bars.saturating_sub(intro_bars).max(structure_bars);
+    structure_bars
+        .saturating_add(OUTRO_LEAD_BARS)
+        .min(room)
+        .max(SNAP_CANDIDATES[0])
+}
 /// Short full-drop snaps (≤16) whose after-window sits in this fraction of the
 /// far-body mid/high median are mid-outro plateaus (recovered vs floor, but not
 /// yet full main). Below the band = still sparse (Sakura); at/above ~1.0 = main
@@ -265,24 +293,24 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         SectionDir::Backward,
     )?;
 
-    // `outro_est` is `Copy`, so this is still valid after the move-by-value
-    // call below; grab the pre-lead structural boundary before reconcile
-    // potentially rewrites `outro_bars`.
-    let outro_structure_bars_pre_reconcile = outro_est.structure_bars;
-
-    let (intro_bars, outro_bars, intro_low_conf, outro_low_conf) =
+    // Both sides now carry structural boundaries, so reconcile compares like
+    // with like; the mix trigger is derived from the result below.
+    let (intro_bars, outro_structure_bars, intro_low_conf, outro_low_conf) =
         reconcile_intro_outro(intro_est, outro_est);
 
-    // Reconcile can shrink `outro_bars` below the pre-reconcile structural
-    // estimate (the "outro low-confidence, intro credible" branch above:
-    // `outro_bars = FALLBACK_BARS.min(intro.bars)`, unrelated to
-    // `structure_bars`). Without this clamp the exported invariant
-    // `outro_structure_bars <= outro_bars` (see
-    // [`TrackAnalysis::outro_structure_bars`]) could be violated. Both sides
-    // already carry `outro_bars_low_confidence: true` in that branch, so
-    // clamping loses no information a caller could otherwise trust.
-    let outro_structure_bars =
-        clamp_outro_structure_bars(outro_structure_bars_pre_reconcile, outro_bars);
+    // One rule, every track: start the transition `OUTRO_LEAD_BARS` before the
+    // outro so it finishes exactly where the outro begins. This is also what
+    // keeps the exported invariant `outro_structure_bars <= outro_bars` true
+    // by construction (`outro_trigger_bars` never returns less than the
+    // boundary it is given).
+    // Rounded, not floored: these are nominal bar counts, and flooring
+    // would shave a bar off the room every time the division came out just
+    // under a whole number.
+    let track_bars = ((last_bar_end.saturating_sub(first_downbeat)) as f64
+        / (outro_bar_len.max(1) as f64))
+        .round()
+        .max(0.0) as u32;
+    let outro_bars = outro_trigger_bars(outro_structure_bars, intro_bars, track_bars);
 
     let bars_estimated_low_confidence = intro_low_conf || outro_low_conf;
     let outro_start = last_bar_end.saturating_sub(u64::from(outro_bars) * outro_bar_len);
@@ -305,6 +333,7 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         first_downbeat,
         outro_start,
         intro_bars,
+        track_bars,
         outro_bars,
         outro_structure_bars,
         bars_estimated_low_confidence,
@@ -312,24 +341,13 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         outro_bars_low_confidence: outro_low_conf,
         intro_bars_manual: false,
         outro_bars_manual: false,
+        outro_structure_bars_manual: false,
         needs_reanalysis: false,
         rms_dbfs,
         gain_db,
     })
 }
 
-/// Clamp a pre-reconcile outro structural-boundary estimate to the
-/// post-reconcile `outro_bars`, preserving the invariant documented on
-/// [`crate::TrackAnalysis::outro_structure_bars`]: the structural boundary
-/// can never be reported as farther from the file end than the mix trigger
-/// derived from it. `reconcile_intro_outro`'s low-confidence-outro branch is
-/// the only path that can push `outro_bars` below `structure_bars` (it
-/// derives `outro_bars` from the *intro* side, independent of the outro's
-/// own structural estimate); every other path leaves `outro_bars` at or
-/// above the original per-side outro estimate, so this is a no-op there.
-pub(crate) fn clamp_outro_structure_bars(structure_bars: u32, outro_bars: u32) -> u32 {
-    structure_bars.min(outro_bars)
-}
 
 /// Reconcile independently estimated intro/outro lengths.
 ///
@@ -562,6 +580,32 @@ const LOCK_CLEAR_WIN_RATIO: f64 = 1.05;
 /// grid there — agrees with the analyzer's own intro downbeat to within a
 /// few hundredths of a beat.
 fn broadband_onset_flux(mono: &[f32]) -> Vec<f64> {
+    let mut out = onset_flux_envelope(mono);
+    if out.is_empty() {
+        return out;
+    }
+    let mut sorted = out.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    for v in out.iter_mut() {
+        *v = (*v - median).max(0.0);
+    }
+    out
+}
+
+/// Frames between successive values of [`onset_flux_envelope`].
+pub const ONSET_FLUX_HOP: usize = FLUX_HOP;
+
+/// The same envelope as [`broadband_onset_flux`], without the median
+/// subtraction: half-wave-rectified magnitude difference summed over the
+/// spectrum, one value per [`ONSET_FLUX_HOP`] frames.
+///
+/// The median is a sensible baseline when the question is "where are the
+/// onsets in this window" and every window is music. It is the wrong one when
+/// the question is "has the music stopped": subtract the median of a slice
+/// that is mostly music and the quiet-but-still-playing bars at the end go to
+/// zero along with the silence after them.
+pub fn onset_flux_envelope(mono: &[f32]) -> Vec<f64> {
     if mono.len() < FLUX_WIN + FLUX_HOP {
         return Vec::new();
     }
@@ -592,12 +636,6 @@ fn broadband_onset_flux(mono: &[f32]) -> Vec<f64> {
             prev[k] = m;
         }
         out.push(sum);
-    }
-    let mut sorted = out.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[sorted.len() / 2];
-    for v in out.iter_mut() {
-        *v = (*v - median).max(0.0);
     }
     out
 }
@@ -1328,30 +1366,22 @@ fn detect_section_bars(
     })
 }
 
-/// Outro mix-trigger length: full mid-energy drop + [`OUTRO_LEAD_BARS`].
+/// Outro *structural* boundary: the full mid-energy drop.
 ///
-/// Mixing at the collapse itself is too late; walking back 16 bars lands near
-/// the mid-energy DJ outro (~end−48 when the drop is ~end−32). Falls back to
-/// candidate scoring without the "prefer longer" bias used on intros.
+/// The mix trigger is no longer decided here. It is one fixed rule away —
+/// [`outro_trigger_bars`], applied once in [`analyze`] — so that this function
+/// answers only "where does the outro start", the same question the labeler
+/// answers by ear. Falls back to candidate scoring without the "prefer longer"
+/// bias used on intros.
 fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
     if let Some(drop) = pick_outro_full_drop(feats) {
-        let can_lead = drop.bars < FALLBACK_BARS
-            && feats.len() >= drop.bars as usize + OUTRO_LEAD_BARS as usize + AFTER_WIN_BARS;
-        let bars = if can_lead {
-            snap_to_bar_grid(drop.bars.saturating_add(OUTRO_LEAD_BARS)).min(FALLBACK_BARS)
-        } else {
-            drop.bars
-        }
-        .max(SNAP_CANDIDATES[0]);
+        let bars = drop.bars.max(SNAP_CANDIDATES[0]);
         return SectionEstimate {
             bars,
             low_confidence: false,
             score: drop.score,
             sharpness: drop.sharpness,
-            // `drop.structure_bars` is the un-lead-adjusted drop point
-            // (`pick_outro_full_drop` never adds the lead itself); `bars`
-            // above may additionally include OUTRO_LEAD_BARS.
-            structure_bars: drop.structure_bars,
+            structure_bars: bars,
         };
     }
     if let Some(hit) = pick_by_candidate_scores_outro(feats) {
@@ -1542,14 +1572,9 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
 
     let accept = margin >= MIN_SCORE_MARGIN || best_score >= MIN_BOUNDARY_SCORE * 2.0;
     if accept {
-        // Fallback path: still walk back from a credible boundary when short.
-        let bars = if best.bars < FALLBACK_BARS
-            && feats.len() >= best.bars as usize + OUTRO_LEAD_BARS as usize + AFTER_WIN_BARS
-        {
-            snap_to_bar_grid(best.bars.saturating_add(OUTRO_LEAD_BARS)).min(FALLBACK_BARS)
-        } else {
-            best.bars
-        };
+        // The candidate boundary *is* the structural one; the mix lead-in is
+        // added once, in `analyze` (see `outro_trigger_bars`).
+        let bars = best.bars;
         Some(SectionEstimate {
             bars,
             low_confidence: false,
@@ -1565,14 +1590,6 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
     }
 }
 
-/// Round to the nearest multiple of 8 bars (Funkot phrase grid).
-fn snap_to_bar_grid(bars: u32) -> u32 {
-    if bars <= 8 {
-        return 8;
-    }
-    let q = ((bars + 4) / 8) * 8;
-    q.max(8)
-}
 
 /// Choose a snap length from per-bar features, or fall back when ambiguous.
 ///

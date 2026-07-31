@@ -1738,6 +1738,10 @@ impl ClipPlayer {
                         return;
                     };
                     let frames_total = buf.len() / 2;
+                    if frames_total == 0 {
+                        pos_cb.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
+                        return;
+                    }
                     let frames = data.len() / channels as usize;
                     let mut idx = p;
                     for i in 0..frames {
@@ -1870,7 +1874,8 @@ impl ClipPlayer {
 
 const LABEL_SECTIONS_KEY_HELP: &str =
     "keys: y/Enter=accept  \u{2190}/\u{2192}=candidate  +=widen/narrow window  \
-     r=replay  a=ambiguous(toggle set)  n=note  s=skip track  q=save & quit";
+     r=replay  a=ambiguous(toggle set)  n=note  s=skip track  q=save & quit  \
+     (plays on past the window)";
 
 fn print_label_key_help() {
     println!("\r{LABEL_SECTIONS_KEY_HELP}\r");
@@ -1913,14 +1918,76 @@ fn print_label_status(session: &TrackSession) {
 
 /// Read one line from stdin for `n` (note entry). Raw mode is disabled for
 /// the duration so the terminal echoes normally, then restored.
+///
+/// Reads bytes rather than a `String`, and decodes them lossily. Crossterm
+/// buffers stdin ahead while it is reading key events, so typing into an IME
+/// straight after pressing `n` can leave it holding the leading byte of a
+/// multi-byte character while the continuation bytes are still queued for
+/// this read. `read_line` rejects those with "stream did not contain valid
+/// UTF-8", and when that error propagated it took the whole session down --
+/// which lost the note *and* the label for the track being worked on, because
+/// a track is only written once both sides are accepted. A mangled first
+/// character is a far better outcome than that, so nothing here is fatal:
+/// whatever was read is kept, raw mode is restored on every path, and the
+/// session carries on.
 fn read_note_line() -> Result<String> {
     disable_raw_mode().ok();
     print!("\rnote: ");
     io::stdout().flush().ok();
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    enable_raw_mode().context("failed to re-enable raw mode after note entry")?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+
+    let mut bytes = Vec::new();
+    let read = io::stdin().lock().read_until(b'\n', &mut bytes);
+
+    // Restore raw mode before reporting anything: the UI it belongs to is
+    // still running whether or not the read worked.
+    let raw = enable_raw_mode().context("failed to re-enable raw mode after note entry");
+
+    if let Err(e) = read {
+        eprintln!("\rnote not recorded ({e})\r");
+        bytes.clear();
+    }
+    raw?;
+
+    let text = note_from_bytes(&bytes);
+    if text.contains('\u{fffd}') {
+        eprintln!("\rnote contained bytes that are not valid UTF-8; kept as \"{text}\"\r");
+    }
+    Ok(text)
+}
+
+/// Decode one typed note. Lossy on purpose -- see [`read_note_line`].
+fn note_from_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim_end_matches(['\n', '\r'])
+        .to_string()
+}
+
+#[cfg(test)]
+mod note_from_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_multibyte_text_and_strips_the_newline() {
+        assert_eq!(note_from_bytes("1\u{5c0f}\u{7bc0}\u{9045}\u{3044}\n".as_bytes()), "1小節遅い");
+        assert_eq!(note_from_bytes(b"plain\r\n"), "plain");
+        assert_eq!(note_from_bytes(b""), "");
+    }
+
+    #[test]
+    fn survives_a_character_whose_leading_byte_was_eaten_by_crossterm() {
+        // Continuation bytes of a UTF-8 sequence with the lead byte missing:
+        // what is left in the queue when crossterm's key reader has already
+        // consumed the start of an IME-committed character.
+        let mut bytes = "\u{5c0f}\u{7bc0}".as_bytes().to_vec();
+        bytes.remove(0);
+        bytes.push(b'\n');
+        let note = note_from_bytes(&bytes);
+        assert!(
+            note.ends_with('\u{7bc0}'),
+            "the intact characters must survive, got {note:?}"
+        );
+        assert!(!note.is_empty());
+    }
 }
 
 /// Decode one crossterm key press into a [`LabelKey`], or `None` for a key
@@ -2129,12 +2196,15 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
             },
             json!({
                 "intro_bars": 8,
-                "outro_bars": 8,
+                // 8-bar structural outro; the mix trigger is that plus the
+                // lead-in, clamped by a 24-bar track with an 8-bar intro.
+                "outro_structure_bars": 8,
+                "outro_bars": 16,
                 "first_downbeat_secs": 0.0,
                 "first_downbeat_tol_secs": 0.05,
                 "intro_bpm": 180.0,
                 "bpm_tol": 0.3,
-                "outro_start_bars_from_fd": 16,
+                "outro_start_bars_from_fd": 8,
                 "outro_start_tol_secs": 0.12
             }),
         ),
@@ -2151,12 +2221,13 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
             },
             json!({
                 "intro_bars": 8,
-                "outro_bars": 8,
+                "outro_structure_bars": 8,
+                "outro_bars": 16,
                 "first_downbeat_secs": 0.25,
                 "first_downbeat_tol_secs": 0.05,
                 "intro_bpm": 180.0,
                 "bpm_tol": 0.3,
-                "outro_start_bars_from_fd": 16,
+                "outro_start_bars_from_fd": 8,
                 "outro_start_tol_secs": 0.12
             }),
         ),

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::analysis::{
-    analyze, analyze_local_tempo, clamp_outro_structure_bars, reconcile_intro_outro,
+    analyze, analyze_local_tempo, outro_trigger_bars, reconcile_intro_outro,
     refine_kick_marker, SectionEstimate,
 };
 use crate::cache::{self, get_cached_or_provisional, get_or_analyze};
@@ -129,7 +129,12 @@ fn long_track_64_bar_sections() {
     assert!((a.intro_bpm - bpm).abs() < 0.3, "intro_bpm {}", a.intro_bpm);
     assert!((a.outro_bpm - bpm).abs() < 0.3, "outro_bpm {}", a.outro_bpm);
     assert_eq!(a.intro_bars, 64);
-    assert_eq!(a.outro_bars, 64);
+    // The case the conditional lead-in used to get wrong: a 64-bar outro hit
+    // the `FALLBACK_BARS` clamp, `outro_bars` came out equal to the boundary,
+    // and the whole transition then ran inside the outro. The trigger is the
+    // boundary plus the lead now, and this track is long enough to hold it.
+    assert_eq!(a.outro_structure_bars, 64);
+    assert_eq!(a.outro_bars, 80);
     assert!(!a.bars_estimated_low_confidence);
     assert!(!a.intro_bars_low_confidence);
     assert!(!a.outro_bars_low_confidence);
@@ -537,21 +542,18 @@ fn reconcile_rules_unit() {
 /// [`crate::TrackAnalysis::outro_structure_bars`]: it must never exceed the
 /// reconciled `outro_bars`.
 ///
-/// `pick_outro_bars`'s final fallback returns `low_confidence: true,
-/// structure_bars: FALLBACK_BARS` (64). When the intro is confident and
-/// short (e.g. 16 bars), `reconcile_intro_outro`'s "outro low / intro
-/// credible" branch derives `outro_bars = min(FALLBACK_BARS, intro.bars)`
-/// from the *intro* side, ignoring the outro's own (pre-reconcile)
-/// structural estimate entirely. Without clamping afterward,
-/// `outro_structure_bars` (64) would end up larger than the reconciled
-/// `outro_bars` (16) -- i.e. the structural boundary would be reported as
-/// farther from the file end than the mix trigger derived from it, which
-/// contradicts the field's own doc comment. This exercises
-/// `clamp_outro_structure_bars` directly (the same helper `analyze()`
-/// calls), not a re-implementation of its `.min()`, so a regression in the
-/// real code path is guaranteed to fail this test too.
+/// `TrackAnalysis::outro_structure_bars <= outro_bars` has to hold on every
+/// path, including the one that used to break it: `pick_outro_bars`'s final
+/// fallback is low-confidence with a `FALLBACK_BARS` (64) boundary, and when
+/// the intro is confident and short `reconcile_intro_outro` replaces that
+/// with a bound derived from the *intro* side. Before the trigger became one
+/// rule, `outro_bars` was whatever came out of reconcile and could sit below
+/// the outro's own structural estimate, so `analyze` needed a clamp. Now the
+/// trigger is derived from the reconciled boundary by `outro_trigger_bars`,
+/// which never returns less than what it is given -- the invariant holds by
+/// construction, and this pins that.
 #[test]
-fn outro_structure_bars_never_exceeds_reconciled_outro_bars() {
+fn outro_structure_bars_never_exceeds_the_derived_trigger() {
     let intro = SectionEstimate {
         bars: 16,
         low_confidence: false,
@@ -559,9 +561,6 @@ fn outro_structure_bars_never_exceeds_reconciled_outro_bars() {
         sharpness: 3.0,
         structure_bars: 16,
     };
-    // Mirrors `pick_outro_bars`'s final fallback: low-confidence, with
-    // `structure_bars` left at the FALLBACK_BARS placeholder. `bars` itself
-    // is irrelevant to the reconcile branch this triggers.
     let outro = SectionEstimate {
         bars: FALLBACK_BARS,
         low_confidence: true,
@@ -570,20 +569,44 @@ fn outro_structure_bars_never_exceeds_reconciled_outro_bars() {
         structure_bars: FALLBACK_BARS,
     };
 
-    let (_, outro_bars, _, outro_low_conf) = reconcile_intro_outro(intro, outro);
-    assert_eq!(outro_bars, 16, "outro low / intro credible: min(FALLBACK_BARS, intro.bars)");
+    let (intro_bars, structure_bars, _, outro_low_conf) = reconcile_intro_outro(intro, outro);
+    assert_eq!(
+        structure_bars, 16,
+        "outro low / intro credible: min(FALLBACK_BARS, intro.bars)"
+    );
     assert!(outro_low_conf);
-    assert!(
-        outro.structure_bars > outro_bars,
-        "test setup must actually produce the violating pre-clamp state (64 > 16)"
-    );
 
-    let clamped = clamp_outro_structure_bars(outro.structure_bars, outro_bars);
+    let trigger = outro_trigger_bars(structure_bars, intro_bars, 400);
+    assert_eq!(trigger, 32, "trigger is the boundary plus the fixed lead-in");
     assert!(
-        clamped <= outro_bars,
-        "outro_structure_bars ({clamped}) must never exceed outro_bars ({outro_bars})"
+        structure_bars <= trigger,
+        "outro_structure_bars ({structure_bars}) must never exceed outro_bars ({trigger})"
     );
-    assert_eq!(clamped, outro_bars, "clamp pins to outro_bars in this branch");
+}
+
+/// The lead-in is unconditional now. It used to be dropped when the boundary
+/// reached `FALLBACK_BARS`, which put the trigger *on* the boundary and ran
+/// the whole transition inside the outro -- the one place it must not go.
+#[test]
+fn trigger_keeps_the_lead_in_at_the_deepest_boundary() {
+    assert_eq!(outro_trigger_bars(64, 64, 400), 80);
+    assert_eq!(outro_trigger_bars(32, 64, 400), 48);
+    assert_eq!(outro_trigger_bars(16, 96, 400), 32);
+    assert_eq!(outro_trigger_bars(8, 8, 400), 24);
+}
+
+/// The only thing that may shorten the lead-in is the track running out:
+/// the trigger cannot reach back past the intro, and never lands before the
+/// boundary it came from.
+#[test]
+fn trigger_gives_way_to_a_track_too_short_to_hold_it() {
+    assert_eq!(outro_trigger_bars(8, 8, 24), 16, "24-bar track, 8-bar intro");
+    assert_eq!(
+        outro_trigger_bars(64, 32, 64),
+        64,
+        "no room for any lead-in: trigger falls back onto the boundary"
+    );
+    assert!(outro_trigger_bars(64, 200, 210) >= 64, "never before the boundary");
 }
 
 #[test]
@@ -741,6 +764,7 @@ fn purge_auto_deletes_and_clears_manual() {
         first_downbeat: 0,
         outro_start: 500,
         intro_bars: 16,
+        track_bars: 64,
         outro_bars: 16,
         outro_structure_bars: 16,
         bars_estimated_low_confidence: false,
@@ -748,6 +772,7 @@ fn purge_auto_deletes_and_clears_manual() {
         outro_bars_low_confidence: false,
         intro_bars_manual: false,
         outro_bars_manual: false,
+        outro_structure_bars_manual: false,
         needs_reanalysis: false,
         rms_dbfs: -14.0,
         gain_db: 0.0,
