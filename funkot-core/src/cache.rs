@@ -203,6 +203,23 @@ fn recompute_outro_start(a: &mut TrackAnalysis) {
         .saturating_sub(u64::from(a.outro_bars) * bar_len);
 }
 
+/// Keep `outro_structure_bars <= outro_bars` after a hand-edited trigger.
+///
+/// `analysis::analyze` holds that invariant by construction — the trigger is
+/// the boundary plus a lead-in, so it can never sit closer to the file end.
+/// A manual `outro_bars` skips that rule entirely, and shortening the outro
+/// past the detected boundary would leave the boundary claiming the outro
+/// starts *earlier* than the mix trigger the same entry advertises. That is
+/// the field `labels`/`eval_sections` compare against hand-labeled ground
+/// truth, so the tracks a user cared enough about to correct by hand would be
+/// exactly the ones scored against a broken value.
+///
+/// Only ever lowers: a manual trigger placed further back adds room, and the
+/// detected boundary is still the best estimate of where the outro begins.
+fn clamp_structure_to_outro(a: &mut TrackAnalysis) {
+    a.outro_structure_bars = a.outro_structure_bars.min(a.outro_bars);
+}
+
 /// Re-apply hand-edited intro/outro bars onto a fresh analysis.
 pub fn apply_manual_overrides(manual: &TrackAnalysis, mut fresh: TrackAnalysis) -> TrackAnalysis {
     if manual.intro_bars_manual {
@@ -215,6 +232,7 @@ pub fn apply_manual_overrides(manual: &TrackAnalysis, mut fresh: TrackAnalysis) 
         fresh.outro_bars_manual = true;
         fresh.outro_bars_low_confidence = false;
         recompute_outro_start(&mut fresh);
+        clamp_structure_to_outro(&mut fresh);
     }
     fresh.bars_estimated_low_confidence =
         fresh.intro_bars_low_confidence || fresh.outro_bars_low_confidence;
@@ -246,6 +264,7 @@ pub fn set_manual_bars(
         analysis.outro_bars_manual = true;
         analysis.outro_bars_low_confidence = false;
         recompute_outro_start(&mut analysis);
+        clamp_structure_to_outro(&mut analysis);
     }
     analysis.bars_estimated_low_confidence =
         analysis.intro_bars_low_confidence || analysis.outro_bars_low_confidence;
@@ -482,6 +501,62 @@ mod tests {
         assert_eq!(result.outro_bars, 20);
         assert!(result.outro_bars_manual, "the earlier outro edit must survive");
         assert!(result.intro_bars_manual);
+    }
+
+    /// A hand-edited trigger is the one path that can put the structural
+    /// boundary behind `outro_bars`, breaking the invariant `analyze` holds by
+    /// construction — and it breaks it on exactly the hand-corrected tracks
+    /// `eval_sections` cares most about.
+    #[test]
+    fn set_manual_bars_outro_clamps_the_structural_boundary() {
+        let dir = TempDir::new("outro-clamp");
+        let hash = "hash-outro-clamp";
+        let mut analysis = sample_analysis();
+        analysis.outro_bars = 48;
+        analysis.outro_structure_bars = 32;
+        store(dir.path(), hash, &analysis).unwrap();
+
+        let result = set_manual_bars(dir.path(), hash, None, Some(24)).unwrap();
+
+        assert_eq!(result.outro_bars, 24);
+        assert_eq!(result.outro_structure_bars, 24);
+        assert_eq!(load(dir.path(), hash).unwrap().outro_structure_bars, 24);
+    }
+
+    #[test]
+    fn set_manual_bars_outro_does_not_raise_the_structural_boundary() {
+        let dir = TempDir::new("outro-noraise");
+        let hash = "hash-outro-noraise";
+        let mut analysis = sample_analysis();
+        analysis.outro_bars = 48;
+        analysis.outro_structure_bars = 32;
+        store(dir.path(), hash, &analysis).unwrap();
+
+        let result = set_manual_bars(dir.path(), hash, None, Some(80)).unwrap();
+
+        assert_eq!(result.outro_bars, 80);
+        assert_eq!(
+            result.outro_structure_bars, 32,
+            "more room in front of the outro doesn't move where the outro starts"
+        );
+    }
+
+    /// Reanalysis re-applies the stored manual trigger onto a *fresh* boundary,
+    /// so the same clamp has to run there too.
+    #[test]
+    fn apply_manual_overrides_clamps_the_structural_boundary() {
+        let mut manual = sample_analysis();
+        manual.outro_bars = 24;
+        manual.outro_bars_manual = true;
+
+        let mut fresh = sample_analysis();
+        fresh.outro_bars = 48;
+        fresh.outro_structure_bars = 32;
+
+        let result = apply_manual_overrides(&manual, fresh);
+
+        assert_eq!(result.outro_bars, 24);
+        assert_eq!(result.outro_structure_bars, 24);
     }
 
     #[test]
