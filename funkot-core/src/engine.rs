@@ -652,6 +652,18 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(options: EngineOptions, playlist: Vec<PathBuf>) -> Result<Self> {
+        let source: Box<dyn TrackSource> = Box::new(PlaylistSource::new(
+            playlist,
+            options.random,
+            options.loop_playlist,
+        ));
+        Self::new_with_source(options, source)
+    }
+
+    /// Same as [`Self::new`], but the loader asks `source` for each track to
+    /// prepare instead of owning a fixed `Vec<PathBuf>`. Lets a host manage an
+    /// editable queue (append/reorder/remove) without restarting the engine.
+    pub fn new_with_source(options: EngineOptions, source: Box<dyn TrackSource>) -> Result<Self> {
         if options.output_sample_rate == 0 {
             return Err(Error::Engine("output_sample_rate must be > 0".into()));
         }
@@ -676,7 +688,7 @@ impl Engine {
         let join = thread::Builder::new()
             .name("funkot-loader".into())
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || loader_main(opts, playlist, msg_tx, permit_rx, shutdown_flag))
+            .spawn(move || loader_main(opts, source, msg_tx, permit_rx, shutdown_flag))
             .map_err(|e| Error::Engine(format!("spawn loader: {e}")))?;
 
         Ok(Self {
@@ -1838,72 +1850,125 @@ fn prepared_loader_main(
     let _ = send_msg(&tx, LoaderMsg::Exhausted, &shutdown);
 }
 
+/// What to prepare next. `next` is polled once per loader iteration, so a
+/// host-owned queue (append/reorder/remove) can change between calls without
+/// restarting the engine. Returning `None` signals the playlist is exhausted
+/// (same effect as running out of tracks used to have: [`LoaderMsg::Exhausted`]).
+pub trait TrackSource: Send {
+    /// Next track to prepare, as `(playlist_index, path)`. `playlist_index` is
+    /// surfaced verbatim in [`EngineEvent::TrackStarted`] / [`PreparedTrack`].
+    /// `None` ends the playlist.
+    fn next(&mut self) -> Option<(usize, PathBuf)>;
+}
+
+/// Default [`TrackSource`] backing [`Engine::new`]: a fixed `Vec<PathBuf>`,
+/// optionally Fisher-Yates shuffled per lap (`random`) and repeated forever
+/// (`loop_playlist`). Mirrors the old inline `loader_main` playlist loop.
+struct PlaylistSource {
+    playlist: Vec<PathBuf>,
+    random: bool,
+    loop_playlist: bool,
+    rng: Rng,
+    order: Vec<usize>,
+    pos: usize,
+    /// Whether a lap has already completed (gates whether a fresh lap is
+    /// allowed when `!loop_playlist`).
+    started: bool,
+}
+
+impl PlaylistSource {
+    fn new(playlist: Vec<PathBuf>, random: bool, loop_playlist: bool) -> Self {
+        Self {
+            playlist,
+            random,
+            loop_playlist,
+            rng: Rng::from_time(),
+            order: Vec::new(),
+            pos: 0,
+            started: false,
+        }
+    }
+}
+
+impl TrackSource for PlaylistSource {
+    fn next(&mut self) -> Option<(usize, PathBuf)> {
+        if self.playlist.is_empty() {
+            return None;
+        }
+        if self.pos >= self.order.len() {
+            if self.started && !self.loop_playlist {
+                return None;
+            }
+            self.started = true;
+            self.order = (0..self.playlist.len()).collect();
+            if self.random {
+                fisher_yates(&mut self.order, &mut self.rng);
+            }
+            self.pos = 0;
+        }
+        let idx = self.order[self.pos];
+        self.pos += 1;
+        Some((idx, self.playlist[idx].clone()))
+    }
+}
+
 fn loader_main(
     options: EngineOptions,
-    playlist: Vec<PathBuf>,
+    mut source: Box<dyn TrackSource>,
     tx: SyncSender<LoaderMsg>,
     permit_rx: Receiver<()>,
     shutdown: Arc<AtomicBool>,
 ) {
-    if playlist.is_empty() {
-        let _ = send_msg(&tx, LoaderMsg::Exhausted, &shutdown);
-        return;
-    }
-
-    let mut rng = Rng::from_time();
     // First live track: head stretch → play, then full stretch upgrades in place.
     let mut first_live = true;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            break;
+            return;
         }
 
-        let mut order: Vec<usize> = (0..playlist.len()).collect();
-        if options.random {
-            fisher_yates(&mut order, &mut rng);
+        // Wait for a free slot (current + next bound) before decoding.
+        //
+        // Ask the source *after* the permit, not before: `wait_permit` blocks, so
+        // either order polls `next` exactly once, but polling late means a
+        // host-owned queue is read as close as possible to the moment the track is
+        // actually needed. Asking first would claim a track a whole slot early and
+        // make a reorder take one extra track (minutes) to take effect.
+        if !wait_permit(&permit_rx, &shutdown) {
+            return;
         }
 
-        for &idx in &order {
-            if shutdown.load(Ordering::SeqCst) {
+        let (idx, path) = match source.next() {
+            Some(v) => v,
+            None => {
+                let _ = send_msg(&tx, LoaderMsg::Exhausted, &shutdown);
                 return;
             }
+        };
 
-            // Wait for a free slot (current + next bound) before decoding.
-            if !wait_permit(&permit_rx, &shutdown) {
+        let is_first = first_live;
+        first_live = false;
+        if is_first {
+            if !prepare_first_live(&options, &path, idx, &tx, &shutdown) {
                 return;
             }
-
-            let path = playlist[idx].clone();
-            let is_first = first_live;
-            first_live = false;
-            if is_first {
-                if !prepare_first_live(&options, &path, idx, &tx, &shutdown) {
-                    return;
-                }
-            } else {
-                match prepare_one(&options, &path, idx) {
-                    Ok(track) => {
-                        if !send_msg(&tx, LoaderMsg::Ready(track), &shutdown) {
-                            return;
-                        }
+        } else {
+            match prepare_one(&options, &path, idx) {
+                Ok(track) => {
+                    if !send_msg(&tx, LoaderMsg::Ready(track), &shutdown) {
+                        return;
                     }
-                    Err(e) => {
-                        let msg = LoaderMsg::Failed {
-                            path: path.clone(),
-                            message: e.to_string(),
-                        };
-                        if !send_msg(&tx, msg, &shutdown) {
-                            return;
-                        }
+                }
+                Err(e) => {
+                    let msg = LoaderMsg::Failed {
+                        path: path.clone(),
+                        message: e.to_string(),
+                    };
+                    if !send_msg(&tx, msg, &shutdown) {
+                        return;
                     }
                 }
             }
-        }
-
-        if !options.loop_playlist {
-            let _ = send_msg(&tx, LoaderMsg::Exhausted, &shutdown);
-            break;
         }
     }
 }

@@ -1,0 +1,64 @@
+# Cross-build container: Linux host → Android arm64 (NDK).
+#
+# Build the image:
+#   docker build -f Dockerfile.android -t funkot-autodj-android .
+# Prefer:
+#   ./cross-build.sh android
+#
+# Only funkot-core is built here; funkot-cli needs cpal + a terminal and has no
+# Android host. The GUI app links funkot-core as a Cargo dependency, so this
+# target exists as a regression guard (a new dep that breaks the NDK build should
+# fail here, not downstream) and to ship a C-ABI SDK bundle like the other targets.
+FROM rust:1.93-slim-trixie
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Host C++ + libclang for bindgen (signalsmith-stretch)
+    g++ \
+    libclang-dev \
+    curl unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG NDK_VERSION=r27c
+RUN curl -fsSL -o /tmp/ndk.zip \
+      "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" \
+ && unzip -q /tmp/ndk.zip -d /opt \
+ && mv "/opt/android-ndk-${NDK_VERSION}" /opt/android-ndk \
+ && rm /tmp/ndk.zip
+
+RUN rustup target add aarch64-linux-android
+
+ENV ANDROID_NDK_HOME=/opt/android-ndk
+ENV NDK_BIN=/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin
+ENV NDK_SYSROOT=/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+
+# API 26 is the floor, not a preference: libaaudio.so first appears in the NDK
+# sysroot at 26, and cpal's Android backend links it. Building against 24 fails
+# with `ld.lld: error: unable to find library -laaudio`.
+ENV ANDROID_API=26
+
+ENV CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android26-clang \
+    CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android26-clang \
+    CXX_aarch64_linux_android=$NDK_BIN/aarch64-linux-android26-clang++ \
+    AR_aarch64_linux_android=$NDK_BIN/llvm-ar
+
+# Android 15+ requires 16 KB page alignment; without this the device shows an
+# "app is not 16 KB aligned" compatibility dialog on launch. Target-scoped rather
+# than RUSTFLAGS so host build scripts are unaffected.
+#
+# A host embedding this crate must set the same flag for its own final link, and
+# must *append* it if the framework already sets this variable (Tauri, for one,
+# fills it with -landroid/-llog/-lOpenSLES).
+ENV CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+
+# bindgen needs a libclang. The NDK does NOT ship one (only the clang driver and
+# the sanitizer runtimes), so use the host libclang and hand it the NDK sysroot;
+# stddef.h/stdbool.h come from the host clang's own resource dir, which is fine
+# because src/wrapper.h includes nothing else.
+ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$NDK_SYSROOT"
+
+# Pin the host libclang by symlink so the LLVM version bundled with the base
+# image can change without editing this file.
+RUN ln -s "$(dirname "$(ls /usr/lib/llvm-*/lib/libclang.so | head -1)")" /opt/libclang
+ENV LIBCLANG_PATH=/opt/libclang
+
+WORKDIR /work

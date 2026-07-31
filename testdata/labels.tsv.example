@@ -1,0 +1,22 @@
+# Example testdata/labels.tsv for funkot_core::labels (Stage 0 evaluation labels).
+#
+# Real labels are NOT committed (testdata/ is gitignore'd; see AGENTS.md).
+# Copy this file to testdata/labels.tsv and replace the rows with real
+# content hashes + hand-verified bar counts for your own testdata/*.flac.
+#
+# Columns (tab-separated): content_hash, file_name, intro_best, intro_ok,
+# outro_best, outro_ok, note.
+#   - content_hash: funkot_core::cache::content_hash(path), hex. Identifies
+#     the track by content, not path, so labels survive renames/moves.
+#   - intro_best / outro_best: single best bar count (integer).
+#   - intro_ok / outro_ok: pipe-separated set of additionally acceptable bar
+#     counts (e.g. "32|48"); empty means only *_best is acceptable.
+#   - outro_best/outro_ok are the musical main->outro STRUCTURAL BOUNDARY in
+#     bars from the end, NOT TrackAnalysis::outro_bars (which additionally
+#     includes ~16 bars of DJ mix lead-in). eval_sections.rs converts
+#     outro_bars -> outro_bars - OUTRO_LEAD_BARS before comparing.
+#   - note: free text, may be empty.
+# Blank lines and lines starting with '#' are ignored anywhere in the file.
+content_hash	file_name	intro_best	intro_ok	outro_best	outro_ok	note
+1f3c9a7e2b5d4468091a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e5f60718	Example Artist - Example Track A.flac	32	48	32		clean drop, easy call
+9b0e1d2c3a4958677869504132241f0edcba0987654321fedcba9876543210a	Example Artist - Example Track B.flac	16		48	32|64	bright end-tag outro, ambiguous within 32-64

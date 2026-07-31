@@ -7,6 +7,16 @@ All notable changes to this project are documented in this file.
 ### Fixed
 
 - Outro floor sampling falls back to the lower quartile when a bright final fill spikes the near-end window (max ≫ median), so true 32-bar outros are no longer reported as 48 (Starmine). Purge auto-cache to refresh older analyses.
+- `--label-sections` guide clicks land on the music's beat. Outro candidates are counted back from `total_frames`, whose phase is whatever the master's last sample happened to be — measured over the real test set it is spread across the full ±0.5 beat, and on IVY it is +0.494 beat, i.e. every outro click was on the off-beat. Both sides' click grids are now phase-locked to the listening window itself (`analysis::lock_beat_phase`). Worst measured click-vs-music error over the sample tracks drops from 0.45 beat to 0.10 beat. Bar identity is unchanged: the lock never moves a boundary by half a beat or more.
+
+### Added
+
+- `analysis::lock_beat_phase`: full-beat-period phase lock from a broadband spectral-flux onset comb, for markers whose phase is unknown a priori. Complements `refine_groove_phase`, which micro-aligns (±0.45 beat, low-band) markers that are already approximately right.
+- `funkot-cli` example `click_phase_diag`: prints, per track and candidate, the nominal vs. locked `--label-sections` boundary and the shift in beats. Headless (no audio device).
+
+- Engine `TrackSource` trait and `Engine::new_with_source`: the loader asks the host for each track instead of owning a fixed `Vec<PathBuf>`, so a host-owned queue can be appended to, reordered or trimmed without restarting playback. `Engine::new` is unchanged and now wraps the same default shuffle/loop behaviour.
+- `./cross-build.sh android` cross-builds `funkot-core` for `aarch64-linux-android` and packages a C-ABI SDK (`libfunkot_core.{so,a}`, `libc++_shared.so`, `include/funkot.h`) into `dist/android-arm64/`. Guards against dependency changes that break the NDK build.
+- `cache::set_manual_bars` hand-edits `intro_bars` / `outro_bars` on a cached entry and persists it, recomputing `outro_start` so callers no longer have to. The side passed as `None` is untouched, including its `*_manual` flag, and `needs_reanalysis` is preserved.
 
 ## [0.3.1] - 2026-07-25
 

@@ -2,7 +2,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,11 +14,15 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, StreamConfig, SupportedBufferSize};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use funkot_cli::label_session::{self, LabelKey, LabelOutcome, Side, TrackSession};
 use funkot_cli::nav_keys::{MultiPressAggregator, NavDir, MULTI_PRESS_WINDOW};
 use funkot_cli::playlist::{load_playlist_file, validate_paths_exist};
+use funkot_cli::stream_error::{self, StreamErrorThrottle};
 use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
+use funkot_core::decode::decode_file;
 use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent, NavAction};
-use funkot_core::{EngineOptions, PitchMode};
+use funkot_core::labels::{upsert_label, SectionLabel};
+use funkot_core::{cache, EngineOptions, PitchMode};
 use log::warn;
 
 #[derive(Debug, Parser)]
@@ -130,6 +134,37 @@ struct Args {
     /// `needs_reanalysis`, then exit (skips complete cache hits).
     #[arg(long)]
     fill_missing_cache: bool,
+
+    /// Interactively label intro/outro section lengths against `--labels`,
+    /// then exit. Tracks come from `-l/--list` or the positional FILES, same
+    /// as normal playback. See `funkot_cli::label_session` for the key
+    /// bindings and `funkot_core::labels` for the on-disk format.
+    #[arg(long = "label-sections", requires = "labels")]
+    label_sections: bool,
+
+    /// `labels.tsv` path for `--label-sections` (required with that flag).
+    #[arg(long, value_name = "FILE")]
+    labels: Option<PathBuf>,
+
+    /// With `--label-sections`, write each candidate's click clip as WAV
+    /// into DIR instead of playing it live, then exit. For environments
+    /// without an audio output device (e.g. inside the dev container).
+    #[arg(long, value_name = "DIR", requires = "label_sections")]
+    render_clips: Option<PathBuf>,
+
+    /// `--label-sections` click peak level, in dB above the clip's own RMS
+    /// loudness (not a fixed absolute amplitude — real Funkot masters run
+    /// hot enough that a fixed number either got lost or clipped). Raise
+    /// this if clicks are still hard to hear on a given track.
+    #[arg(long, default_value_t = label_session::ClickOptions::default().click_db_above_rms, requires = "label_sections")]
+    click_db: f32,
+
+    /// `--label-sections`: how many dB to duck the music under each bar-head
+    /// click (sidechain-style, so the click cuts through dense/loud
+    /// material). The boundary click ducks deeper and longer automatically
+    /// on top of this, so it stays distinguishable from a normal bar head.
+    #[arg(long, default_value_t = label_session::ClickOptions::default().duck_db, requires = "label_sections")]
+    click_duck_db: f32,
 }
 
 fn main() {
@@ -154,6 +189,23 @@ fn run() -> Result<()> {
 
     if let Some(dir) = &args.gen_test_fixtures {
         return gen_test_fixtures(dir);
+    }
+
+    if args.label_sections {
+        // clap's `requires` guarantees this is Some.
+        let labels_path = args.labels.clone().expect("--labels required by clap");
+        let playlist = resolve_playlist(&args)?;
+        let click_opts = label_session::ClickOptions {
+            click_db_above_rms: args.click_db,
+            duck_db: args.click_duck_db,
+        };
+        return run_label_sections(
+            &playlist,
+            &labels_path,
+            &args.cache_dir,
+            args.render_clips.as_deref(),
+            &click_opts,
+        );
     }
 
     let playlist = resolve_playlist(&args)?;
@@ -1123,8 +1175,18 @@ fn run_live(
                     let _ = event_tx.send(event);
                 }
             },
-            |err| {
-                eprintln!("audio stream error: {err}");
+            // Same throttle as `--label-sections`: cpal's ALSA worker retries a
+            // generic device error with no backoff, so one line per callback
+            // means tens of thousands of lines a second (see
+            // `funkot_cli::stream_error`). Raw mode is on once the key thread
+            // starts, hence the `\r` framing.
+            {
+                let mut throttle = StreamErrorThrottle::new(stream_error::DEFAULT_SUMMARY_INTERVAL);
+                move |err| {
+                    if let Some(report) = throttle.record_with(Instant::now(), || err.to_string()) {
+                        eprintln!("\r{}\r", report.to_line());
+                    }
+                }
             },
             None,
         )
@@ -1398,6 +1460,650 @@ fn fill_missing_cache(playlist: &[PathBuf], cache_dir: &Path) -> Result<()> {
         }
     }
     eprintln!("fill-missing-cache: analyzed {analyzed} skipped {skipped} (complete cache hits)");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `--label-sections`: interactive (or `--render-clips` offline) intro/outro
+// ground-truth annotation. Candidate navigation / accept / skip / ambiguous
+// -set state lives in `funkot_cli::label_session` (pure, unit-tested); this
+// section only wires it to a playlist, `labels.tsv`, the cache, cpal, and
+// crossterm.
+// ---------------------------------------------------------------------
+
+fn run_label_sections(
+    playlist: &[PathBuf],
+    labels_path: &Path,
+    cache_dir: &Path,
+    render_clips_dir: Option<&Path>,
+    click_opts: &label_session::ClickOptions,
+) -> Result<()> {
+    let existing = if labels_path.exists() {
+        funkot_core::labels::load_labels(labels_path).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        Vec::new()
+    };
+    let labeled: std::collections::HashSet<String> =
+        existing.into_iter().map(|l| l.hash).collect();
+
+    let mut hashes = Vec::with_capacity(playlist.len());
+    let mut skipped = 0usize;
+    for path in playlist {
+        let hash = cache::content_hash(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if labeled.contains(&hash) {
+            skipped += 1;
+        }
+        hashes.push(hash);
+    }
+    eprintln!(
+        "label-sections: {skipped} of {} already labeled (skipped), {} to do",
+        playlist.len(),
+        playlist.len() - skipped
+    );
+
+    if let Some(dir) = render_clips_dir {
+        let todo: Vec<&PathBuf> = playlist
+            .iter()
+            .zip(&hashes)
+            .filter(|(_, h)| !labeled.contains(*h))
+            .map(|(p, _)| p)
+            .collect();
+        return render_label_clips(&todo, cache_dir, dir, click_opts);
+    }
+
+    run_label_sections_interactive(playlist, &hashes, &labeled, labels_path, cache_dir, click_opts)
+}
+
+/// `--render-clips DIR`: for every candidate on both sides of every track in
+/// `playlist`, write the same click-track clip an interactive session would
+/// have played, as WAV. No labels are written — this path exists so the
+/// clip synthesis can be verified without an audio output device (e.g.
+/// inside the dev container).
+fn render_label_clips(
+    playlist: &[&PathBuf],
+    cache_dir: &Path,
+    out_dir: &Path,
+    click_opts: &label_session::ClickOptions,
+) -> Result<()> {
+    std::fs::create_dir_all(out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
+    for path in playlist {
+        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let analysis =
+            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("track");
+
+        let mut n = 0usize;
+        for side in [Side::Intro, Side::Outro] {
+            for &bars in side.candidates() {
+                let clip = label_session::build_candidate_clip(
+                    &buf,
+                    &analysis,
+                    side,
+                    bars,
+                    label_session::NORMAL_HALF_WIDTH_BARS,
+                    click_opts,
+                );
+                let clip_path =
+                    out_dir.join(format!("{stem}_{}_{bars:03}bars.wav", side.label()));
+                let mut w = WavStreamWriter::create(&clip_path, buf.sample_rate, WavFormat::F32)?;
+                w.write_interleaved(&clip)?;
+                w.finalize()?;
+                n += 1;
+            }
+        }
+        println!("wrote {n} candidate clips for {}", path.display());
+    }
+    Ok(())
+}
+
+/// Resample a `--label-sections` click clip from the source file's own
+/// sample rate to the output device's rate. [`ClipPlayer`] streams whatever
+/// buffer it's handed straight into the device callback with no rate
+/// conversion of its own, so without this, a device default that differs
+/// from the file's rate (e.g. a 48 kHz device against 44.1 kHz Funkot
+/// masters) played every clip audibly fast/sharp or slow/flat. `speed` is
+/// pinned to `1.0` and [`PitchMode::Shift`] used deliberately: this needs an
+/// exact sample-rate match for correct playback speed, not a tempo change,
+/// so the plain-resample path (reused from the loader's existing
+/// [`funkot_core::stretch`]) is the right one, not the pitch-preserving
+/// stretch.
+fn resample_clip_for_device(clip: Vec<f32>, source_rate: u32, device_rate: u32) -> Vec<f32> {
+    if source_rate == device_rate {
+        return clip;
+    }
+    match funkot_core::stretch::render_track(&clip, source_rate, device_rate, 1.0, PitchMode::Shift)
+    {
+        Ok(resampled) => resampled,
+        Err(e) => {
+            eprintln!(
+                "warn: could not resample label-sections clip {source_rate} Hz -> \
+                 {device_rate} Hz ({e}); playing at source rate (pitch/tempo will be off)"
+            );
+            clip
+        }
+    }
+}
+
+#[cfg(test)]
+mod resample_clip_for_device_tests {
+    use super::*;
+
+    fn stereo_sine(frames: usize, freq: f32, sr: u32) -> Vec<f32> {
+        let mut out = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let t = i as f32 / sr as f32;
+            let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.5;
+            out[i * 2] = s;
+            out[i * 2 + 1] = s;
+        }
+        out
+    }
+
+    #[test]
+    fn matching_rates_pass_through_unchanged() {
+        let clip = stereo_sine(2_000, 440.0, 44_100);
+        let out = resample_clip_for_device(clip.clone(), 44_100, 44_100);
+        assert_eq!(out, clip, "same source/device rate must be a no-op");
+    }
+
+    #[test]
+    fn mismatched_rates_resample_to_the_device_length() {
+        // The mismatch this fixes: a 44.1 kHz file on a 48 kHz device
+        // (common WASAPI/CoreAudio default) previously played ~8.8% fast
+        // with no rate conversion at all.
+        let source_rate = 44_100;
+        let device_rate = 48_000;
+        let clip = stereo_sine(4_410, 440.0, source_rate); // 100 ms
+        let out = resample_clip_for_device(clip, source_rate, device_rate);
+
+        let expected_frames = 4_410 * device_rate as usize / source_rate as usize;
+        let out_frames = out.len() / 2;
+        assert!(
+            out_frames.abs_diff(expected_frames) <= expected_frames / 50 + 8,
+            "out_frames={out_frames} expected≈{expected_frames}"
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+}
+
+/// Sentinel `pos` value meaning "not currently playing".
+const CLIP_PLAYER_IDLE: usize = usize::MAX;
+
+/// Wait this long before trying to reopen a torn-down output stream. A
+/// wedged WSLg PulseAudio makes `snd_pcm_open` block for ~30 s (measured), and
+/// it is the UI thread that would block, so failed reopens must not be retried
+/// on every keystroke.
+const CLIP_STREAM_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// Printed once when a wedged stream is torn down.
+const CLIP_STREAM_WEDGED_NOTE: &str =
+    "audio output stopped (device kept failing); press r to retry playback";
+
+/// Error bookkeeping shared between the cpal error callback (audio thread) and
+/// the labeling UI thread.
+///
+/// The callback only *records*; the UI thread prints. That ordering matters:
+/// `--label-sections` runs in crossterm raw mode, where a bare `\n` from
+/// another thread leaves the cursor mid-column and staircases the status line.
+/// Queuing the text keeps every line on the UI thread, which frames it
+/// correctly.
+struct ClipStreamErrors {
+    throttle: StreamErrorThrottle,
+    /// Lines the UI thread has not printed yet. Bounded by the throttle: at
+    /// most one entry per [`stream_error::DEFAULT_SUMMARY_INTERVAL`].
+    pending: Vec<String>,
+}
+
+impl ClipStreamErrors {
+    fn new() -> Self {
+        Self {
+            throttle: StreamErrorThrottle::new(stream_error::DEFAULT_SUMMARY_INTERVAL),
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// Minimal single-buffer cpal player for `--label-sections` candidate
+/// clips. Bypasses the mixing engine entirely (per plan constraints): the
+/// audio callback just streams whichever interleaved-stereo f32 buffer
+/// [`ClipPlayer::play`] last handed it, so a new candidate can interrupt
+/// mid-playback the same way the live engine's nav keys do.
+///
+/// The stream is held open across the whole session rather than opened per
+/// clip. Opening lazily was considered and rejected: WSLg's PulseAudio wedges
+/// independently of whether anything is playing (its RDP sink loses the
+/// Windows-side endpoint), and in that state `snd_pcm_open` blocks for ~30 s,
+/// so a per-clip open would freeze the labeling UI for half a minute on every
+/// replay while fixing nothing. Instead the failure is *survived*: see
+/// [`ClipPlayer::poll`].
+struct ClipPlayer {
+    device: cpal::Device,
+    config: StreamConfig,
+    channels: u16,
+    /// `None` while no stream is open, i.e. after a wedged one was torn down.
+    /// Reopened on the next user-initiated playback.
+    stream: Option<cpal::Stream>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    pos: Arc<AtomicUsize>,
+    errors: Arc<Mutex<ClipStreamErrors>>,
+    /// Error total already accounted for, so [`ClipPlayer::poll`] can measure
+    /// a rate rather than a running count.
+    seen_errors: u64,
+    last_poll: Instant,
+    /// Earliest time a reopen may be attempted, after one failed.
+    retry_after: Option<Instant>,
+}
+
+impl ClipPlayer {
+    fn new(device: cpal::Device, config: StreamConfig, channels: u16) -> Result<Self> {
+        let mut player = Self {
+            device,
+            config,
+            channels,
+            stream: None,
+            buffer: Arc::new(Mutex::new(Vec::<f32>::new())),
+            pos: Arc::new(AtomicUsize::new(CLIP_PLAYER_IDLE)),
+            errors: Arc::new(Mutex::new(ClipStreamErrors::new())),
+            seen_errors: 0,
+            last_poll: Instant::now(),
+            retry_after: None,
+        };
+        // Fail fast at startup: a device that cannot be opened at all is a
+        // setup problem the user needs to see before any track is decoded.
+        player.open_stream()?;
+        Ok(player)
+    }
+
+    fn open_stream(&mut self) -> Result<()> {
+        let buffer_cb = Arc::clone(&self.buffer);
+        let pos_cb = Arc::clone(&self.pos);
+        let errors_cb = Arc::clone(&self.errors);
+        let channels = self.channels;
+        let stream = self
+            .device
+            .build_output_stream(
+                self.config,
+                move |data: &mut [f32], _| {
+                    data.fill(0.0);
+                    let p = pos_cb.load(Ordering::SeqCst);
+                    if p == CLIP_PLAYER_IDLE {
+                        return;
+                    }
+                    // try_lock: never block the audio thread on the UI
+                    // thread's play()/stop() swap.
+                    let Ok(buf) = buffer_cb.try_lock() else {
+                        return;
+                    };
+                    let frames_total = buf.len() / 2;
+                    let frames = data.len() / channels as usize;
+                    let mut idx = p;
+                    for i in 0..frames {
+                        if idx >= frames_total {
+                            break;
+                        }
+                        write_frame(data, i, channels, buf[idx * 2], buf[idx * 2 + 1]);
+                        idx += 1;
+                    }
+                    pos_cb.store(
+                        if idx >= frames_total {
+                            CLIP_PLAYER_IDLE
+                        } else {
+                            idx
+                        },
+                        Ordering::SeqCst,
+                    );
+                },
+                move |err| {
+                    let now = Instant::now();
+                    let mut errors = errors_cb.lock().unwrap_or_else(|e| e.into_inner());
+                    // record_with: cpal can land here ~90k times a second, and
+                    // formatting the error is the expensive part.
+                    if let Some(report) = errors.throttle.record_with(now, || err.to_string()) {
+                        errors.pending.push(report.to_line());
+                    }
+                },
+                None,
+            )
+            .context("failed to build label-sections audio output stream")?;
+        stream
+            .play()
+            .context("failed to start label-sections audio stream")?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    /// Drain queued error lines, and tear the stream down if the device is
+    /// producing errors far faster than any real glitch could.
+    ///
+    /// Tearing down is what actually stops the damage: cpal's ALSA worker
+    /// retries a generic error with no backoff, so a wedged device pins a CPU
+    /// core and calls the error callback forever. Dropping the stream sets
+    /// cpal's `dropping` flag and joins that worker.
+    fn poll(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        let total = {
+            let errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+            errors.throttle.total()
+        };
+        let since = total.saturating_sub(self.seen_errors);
+        let elapsed = now.duration_since(self.last_poll);
+        self.seen_errors = total;
+        self.last_poll = now;
+        if self.stream.is_some() && stream_error::looks_wedged(since, elapsed) {
+            self.shutdown_wedged_stream(now);
+        }
+        let mut errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut errors.pending)
+    }
+
+    fn shutdown_wedged_stream(&mut self, now: Instant) {
+        // Drop *before* touching `errors`: the drop joins cpal's worker
+        // thread, which takes that same lock in the error callback.
+        drop(self.stream.take());
+        self.pos.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
+        {
+            let mut errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(report) = errors.throttle.flush(now) {
+                errors.pending.push(report.to_line());
+            }
+            errors.pending.push(CLIP_STREAM_WEDGED_NOTE.to_string());
+            errors.throttle.reset();
+        }
+        self.seen_errors = 0;
+        self.retry_after = Some(now + CLIP_STREAM_RETRY_COOLDOWN);
+    }
+
+    /// Reopen after a teardown, if the cooldown has passed. Queues a note
+    /// either way so the user learns why `r` did nothing.
+    fn ensure_stream(&mut self) {
+        if self.stream.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(at) = self.retry_after {
+            if now < at {
+                self.note(format!(
+                    "audio output unavailable; retrying in {:.0}s",
+                    at.duration_since(now).as_secs_f64().ceil()
+                ));
+                return;
+            }
+        }
+        match self.open_stream() {
+            Ok(()) => {
+                self.retry_after = None;
+                self.last_poll = Instant::now();
+                self.note("audio output restarted".to_string());
+            }
+            Err(e) => {
+                self.retry_after = Some(Instant::now() + CLIP_STREAM_RETRY_COOLDOWN);
+                self.note(format!("audio output unavailable: {e:#}"));
+            }
+        }
+    }
+
+    fn note(&self, line: String) {
+        let mut errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+        errors.pending.push(line);
+    }
+
+    /// Stop whatever is playing and start `clip` from the top.
+    fn play(&mut self, clip: Vec<f32>) {
+        self.ensure_stream();
+        self.pos.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
+        {
+            let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            *buf = clip;
+        }
+        if self.stream.is_some() {
+            self.pos.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn stop(&self) {
+        self.pos.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
+    }
+}
+
+const LABEL_SECTIONS_KEY_HELP: &str =
+    "keys: y/Enter=accept  \u{2190}/\u{2192}=candidate  +=widen/narrow window  \
+     r=replay  a=ambiguous(toggle set)  n=note  s=skip track  q=save & quit";
+
+fn print_label_key_help() {
+    println!("\r{LABEL_SECTIONS_KEY_HELP}\r");
+}
+
+/// Print audio-subsystem notices from the UI thread. Raw mode is on, so every
+/// line needs the same `\r` framing the rest of this UI uses -- a bare
+/// `eprintln!` from the cpal thread would staircase the display.
+fn print_label_audio(lines: &[String]) {
+    for line in lines {
+        eprintln!("\r{line}\r");
+    }
+}
+
+fn print_label_track_header(progress: &str, path: &Path) {
+    println!("\r{progress} {}\r", file_name(path));
+}
+
+fn print_label_status(session: &TrackSession) {
+    let mut line = format!(
+        "\r  [{}] candidate={} bars  window=\u{b1}{} bars",
+        session.current_side().label(),
+        session.current_bars(),
+        session.context_half_width_bars(),
+    );
+    if let Some(selected) = session.ambiguous_selected() {
+        let set = selected
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("|");
+        line.push_str(&format!("  ambiguous-set={set}"));
+    }
+    if !session.note().is_empty() {
+        line.push_str(&format!("  note=\"{}\"", session.note()));
+    }
+    line.push_str(&format!("  | {LABEL_SECTIONS_KEY_HELP}\r"));
+    println!("{line}");
+}
+
+/// Read one line from stdin for `n` (note entry). Raw mode is disabled for
+/// the duration so the terminal echoes normally, then restored.
+fn read_note_line() -> Result<String> {
+    disable_raw_mode().ok();
+    print!("\rnote: ");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    enable_raw_mode().context("failed to re-enable raw mode after note entry")?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// Decode one crossterm key press into a [`LabelKey`], or `None` for a key
+/// with no meaning here. `n` needs a blocking line read (outside raw mode)
+/// to collect the note text, so it's resolved here rather than deferred.
+fn map_label_key(key: KeyEvent) -> Result<Option<LabelKey>> {
+    if key.kind == KeyEventKind::Release {
+        return Ok(None);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        return Ok(Some(LabelKey::Quit));
+    }
+    Ok(match key.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Some(LabelKey::Accept),
+        KeyCode::Left => Some(LabelKey::Left),
+        KeyCode::Right => Some(LabelKey::Right),
+        KeyCode::Char('+') => Some(LabelKey::ToggleWidth),
+        KeyCode::Char('r') | KeyCode::Char('R') => Some(LabelKey::Replay),
+        KeyCode::Char('a') | KeyCode::Char('A') => Some(LabelKey::Ambiguous),
+        KeyCode::Char('n') | KeyCode::Char('N') => Some(LabelKey::Note(read_note_line()?)),
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(LabelKey::Skip),
+        KeyCode::Char('q') | KeyCode::Char('Q') => Some(LabelKey::Quit),
+        _ => None,
+    })
+}
+
+/// Persist one finished track: append/replace its row in `labels.tsv`, then
+/// reflect the intro side onto the analysis cache.
+fn save_label_and_cache(
+    labels_path: &Path,
+    cache_dir: &Path,
+    hash: &str,
+    path: &Path,
+    intro: &label_session::LabelChoice,
+    outro: &label_session::LabelChoice,
+    note: &str,
+) -> Result<()> {
+    let label = SectionLabel {
+        hash: hash.to_string(),
+        file_name: file_name(path),
+        intro_best: intro.best,
+        intro_ok: intro.ok.clone(),
+        outro_best: outro.best,
+        outro_ok: outro.ok.clone(),
+        note: note.to_string(),
+    };
+    upsert_label(labels_path, label).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Reflect the intro side onto the cache immediately (so live/render
+    // playback picks it up, and `--purge-auto-cache` keeps it). The outro
+    // side is deliberately *not* written here: `cache::set_manual_bars`'s
+    // `outro` argument sets `TrackAnalysis::outro_bars`, the DJ mix-trigger,
+    // which is *not* a fixed offset from the structural boundary this tool
+    // collects (see `funkot_core::labels` module docs and the
+    // `outro_structure_bars` doc comment in `funkot-core/src/lib.rs`).
+    // Synthesizing a lead-in here to convert one into the other would plant
+    // a guessed value in the cache that the analyzer itself doesn't stand
+    // behind -- the exact outro_bars/outro_structure_bars conflation Stage 0
+    // introduced `outro_structure_bars` to avoid. The cached outro stays
+    // whatever `analysis::analyze` computed; only the label file records the
+    // structural ground truth, for Stage 2+ to use.
+    cache::set_manual_bars(cache_dir, hash, Some(intro.best), None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+fn run_label_sections_interactive(
+    playlist: &[PathBuf],
+    hashes: &[String],
+    labeled: &std::collections::HashSet<String>,
+    labels_path: &Path,
+    cache_dir: &Path,
+    click_opts: &label_session::ClickOptions,
+) -> Result<()> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .context("no default audio output device available (use --render-clips instead)")?;
+    let (config, channels) = pick_output_config(&device, None)?;
+    let device_rate = config.sample_rate;
+    let mut player = ClipPlayer::new(device, config, channels)?;
+
+    enable_raw_mode().context("failed to enable raw mode (needed for --label-sections)")?;
+    let _raw_guard = RawModeGuard;
+
+    print_label_key_help();
+
+    let total = playlist.len();
+    'tracks: for (i, path) in playlist.iter().enumerate() {
+        let hash = &hashes[i];
+        if labeled.contains(hash) {
+            continue;
+        }
+        let progress = format!("[{}/{total}]", i + 1);
+
+        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let analysis =
+            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Decode + analyze can run for a minute with no key polling; check the
+        // stream now so a device that died meanwhile is torn down here rather
+        // than spinning until the next keystroke.
+        print_label_audio(&player.poll());
+        if buf.sample_rate != device_rate {
+            eprintln!(
+                "note: {} is {} Hz, output device is {device_rate} Hz; resampling clips for playback",
+                file_name(path),
+                buf.sample_rate
+            );
+        }
+
+        let mut session = TrackSession::new(analysis.intro_bars, analysis.outro_structure_bars);
+        let build_clip = |session: &TrackSession| -> Vec<f32> {
+            let clip = label_session::build_candidate_clip(
+                &buf,
+                &analysis,
+                session.current_side(),
+                session.current_bars(),
+                session.context_half_width_bars(),
+                click_opts,
+            );
+            resample_clip_for_device(clip, buf.sample_rate, device_rate)
+        };
+
+        print_label_track_header(&progress, path);
+        player.play(build_clip(&session));
+        print_label_status(&session);
+
+        loop {
+            let waiting = !event::poll(Duration::from_millis(100)).unwrap_or(false);
+            // Runs on every tick, including the idle ones: this is what keeps a
+            // failing device from flooding the terminal while the user thinks.
+            print_label_audio(&player.poll());
+            if waiting {
+                continue;
+            }
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(_) => break 'tracks,
+            };
+            let Event::Key(key) = ev else { continue };
+            let Some(label_key) = map_label_key(key)? else {
+                continue;
+            };
+            match session.apply_key(label_key) {
+                LabelOutcome::Continue => print_label_status(&session),
+                LabelOutcome::Replay => {
+                    player.play(build_clip(&session));
+                    print_label_status(&session);
+                }
+                LabelOutcome::Skip => {
+                    player.stop();
+                    println!("\r  skipped {}\r", file_name(path));
+                    continue 'tracks;
+                }
+                LabelOutcome::Quit => {
+                    player.stop();
+                    println!("\rsaved & quit\r");
+                    break 'tracks;
+                }
+                LabelOutcome::Done { intro, outro } => {
+                    player.stop();
+                    save_label_and_cache(
+                        labels_path,
+                        cache_dir,
+                        hash,
+                        path,
+                        &intro,
+                        &outro,
+                        session.note(),
+                    )?;
+                    println!(
+                        "\r  saved {} (intro={} outro={})\r",
+                        file_name(path),
+                        intro.best,
+                        outro.best
+                    );
+                    continue 'tracks;
+                }
+            }
+        }
+    }
     Ok(())
 }
 

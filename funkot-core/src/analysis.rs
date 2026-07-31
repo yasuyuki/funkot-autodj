@@ -31,6 +31,9 @@
 //!    high-confidence sides are kept even when `intro < outro`.
 //! 8. Measure full-track mono RMS and derive a clamped gain.
 
+use rustfft::num_complex::Complex32;
+use rustfft::FftPlanner;
+
 use crate::cache::CACHE_VERSION;
 use crate::decode::AudioBuffer;
 use crate::{
@@ -43,7 +46,7 @@ const SEGMENT_SECS: f64 = 110.0;
 const MIN_DURATION_SECS: f64 = 30.0;
 const BPM_MIN: f64 = 172.0;
 const BPM_MAX: f64 = 188.0;
-const HOP: usize = 256;
+pub(crate) const HOP: usize = 256;
 const LOWPASS_HZ: f64 = 150.0;
 const HIGHPASS_HZ: f64 = 1500.0;
 /// Onset must exceed this fraction of the segment peak to count as a beat.
@@ -115,6 +118,14 @@ pub struct SectionEstimate {
     pub score: f64,
     /// Local edge sharpness at the candidate boundary.
     pub sharpness: f64,
+    /// Musical structural boundary in bars, *before* any mix-lead-in is
+    /// added on top. Equal to `bars` everywhere except the two outro paths
+    /// that walk back an extra [`OUTRO_LEAD_BARS`] from a detected drop
+    /// (`pick_outro_bars`'s full-drop branch and
+    /// `pick_by_candidate_scores_outro`'s accepted-candidate branch): there,
+    /// `bars` is the lead-adjusted mix trigger and `structure_bars` is the
+    /// drop/candidate point itself. See [`TrackAnalysis::outro_structure_bars`].
+    pub structure_bars: u32,
 }
 
 /// Local tempo around a playhead in already-stretched (output-domain) audio.
@@ -254,8 +265,24 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         SectionDir::Backward,
     )?;
 
+    // `outro_est` is `Copy`, so this is still valid after the move-by-value
+    // call below; grab the pre-lead structural boundary before reconcile
+    // potentially rewrites `outro_bars`.
+    let outro_structure_bars_pre_reconcile = outro_est.structure_bars;
+
     let (intro_bars, outro_bars, intro_low_conf, outro_low_conf) =
         reconcile_intro_outro(intro_est, outro_est);
+
+    // Reconcile can shrink `outro_bars` below the pre-reconcile structural
+    // estimate (the "outro low-confidence, intro credible" branch above:
+    // `outro_bars = FALLBACK_BARS.min(intro.bars)`, unrelated to
+    // `structure_bars`). Without this clamp the exported invariant
+    // `outro_structure_bars <= outro_bars` (see
+    // [`TrackAnalysis::outro_structure_bars`]) could be violated. Both sides
+    // already carry `outro_bars_low_confidence: true` in that branch, so
+    // clamping loses no information a caller could otherwise trust.
+    let outro_structure_bars =
+        clamp_outro_structure_bars(outro_structure_bars_pre_reconcile, outro_bars);
 
     let bars_estimated_low_confidence = intro_low_conf || outro_low_conf;
     let outro_start = last_bar_end.saturating_sub(u64::from(outro_bars) * outro_bar_len);
@@ -279,6 +306,7 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         outro_start,
         intro_bars,
         outro_bars,
+        outro_structure_bars,
         bars_estimated_low_confidence,
         intro_bars_low_confidence: intro_low_conf,
         outro_bars_low_confidence: outro_low_conf,
@@ -288,6 +316,19 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         rms_dbfs,
         gain_db,
     })
+}
+
+/// Clamp a pre-reconcile outro structural-boundary estimate to the
+/// post-reconcile `outro_bars`, preserving the invariant documented on
+/// [`crate::TrackAnalysis::outro_structure_bars`]: the structural boundary
+/// can never be reported as farther from the file end than the mix trigger
+/// derived from it. `reconcile_intro_outro`'s low-confidence-outro branch is
+/// the only path that can push `outro_bars` below `structure_bars` (it
+/// derives `outro_bars` from the *intro* side, independent of the outro's
+/// own structural estimate); every other path leaves `outro_bars` at or
+/// above the original per-side outro estimate, so this is a no-op there.
+pub(crate) fn clamp_outro_structure_bars(structure_bars: u32, outro_bars: u32) -> u32 {
+    structure_bars.min(outro_bars)
 }
 
 /// Reconcile independently estimated intro/outro lengths.
@@ -496,6 +537,181 @@ pub fn refine_groove_phase(
         return coarse.min(frames as u64 - 1);
     }
     best_frame.min(frames as u64 - 1)
+}
+
+/// STFT window and hop for [`broadband_onset_flux`]. Short window on purpose:
+/// what matters is localizing transients in time, not frequency detail.
+const FLUX_WIN: usize = 512;
+const FLUX_HOP: usize = 128;
+/// How much better than "don't move" a candidate phase must score before
+/// [`lock_beat_phase`] adopts it.
+const LOCK_CLEAR_WIN_RATIO: f64 = 1.05;
+
+/// Broadband spectral-flux onset envelope: half-wave-rectified magnitude
+/// difference summed over the whole spectrum, one value per [`FLUX_HOP`]
+/// frames (value `i` is centred on frame `i * FLUX_HOP + FLUX_WIN / 2`), with
+/// its median subtracted so a steady bed does not count as onsets.
+///
+/// Distinct from [`onset_envelope`], which low-passes to ~150 Hz first
+/// because it is looking for *kicks* specifically (BPM comb, first-downbeat
+/// anchor). That is the wrong signal for deciding beat phase in dense
+/// mid-track Funkot: measured on the real masters in `testdata/`, a
+/// full-period comb over the low band reports mutually inconsistent phases
+/// for different windows of the same track, while the same comb over
+/// broadband flux — which sees the hats and percussion that actually mark the
+/// grid there — agrees with the analyzer's own intro downbeat to within a
+/// few hundredths of a beat.
+fn broadband_onset_flux(mono: &[f32]) -> Vec<f64> {
+    if mono.len() < FLUX_WIN + FLUX_HOP {
+        return Vec::new();
+    }
+    let n = (mono.len() - FLUX_WIN) / FLUX_HOP + 1;
+    let window: Vec<f32> = (0..FLUX_WIN)
+        .map(|i| {
+            let x = 2.0 * std::f32::consts::PI * i as f32 / FLUX_WIN as f32;
+            0.5 - 0.5 * x.cos()
+        })
+        .collect();
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(FLUX_WIN);
+    let mut buf = vec![Complex32::new(0.0, 0.0); FLUX_WIN];
+    let mut prev = vec![0.0f32; FLUX_WIN / 2 + 1];
+    let mut out = Vec::with_capacity(n);
+    for f in 0..n {
+        let base = f * FLUX_HOP;
+        for i in 0..FLUX_WIN {
+            buf[i] = Complex32::new(mono[base + i] * window[i], 0.0);
+        }
+        fft.process(&mut buf);
+        let mut sum = 0.0f64;
+        for k in 0..=FLUX_WIN / 2 {
+            let m = buf[k].norm();
+            if f > 0 && m > prev[k] {
+                sum += f64::from(m - prev[k]);
+            }
+            prev[k] = m;
+        }
+        out.push(sum);
+    }
+    let mut sorted = out.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    for v in out.iter_mut() {
+        *v = (*v - median).max(0.0);
+    }
+    out
+}
+
+/// Lock a marker onto the music's beat phase, searching a **full** beat period.
+///
+/// [`refine_groove_phase`] and [`refine_periodic_phase`] both search only
+/// ±0.45 beat around their input. That is deliberate — they are *micro*
+/// alignments for markers that are already approximately right — and it makes
+/// them the wrong tool for a marker whose phase is unknown a priori. A section
+/// boundary counted back from `total_frames` is exactly that: "production ends
+/// on a bar boundary" holds to within a bar, not within a sample, and across
+/// the real masters in `testdata/` the file end lands anywhere in the beat,
+/// including within a hundredth of a beat of the exact half-beat ambiguity
+/// point that no ±0.45-beat search can resolve either way.
+///
+/// So this combs [`broadband_onset_flux`] over `n_bars` bars at every phase in
+/// the beat and takes the best (`±1` flux hop of slack absorbs quantization),
+/// then snaps to the nearest kick body with [`refine_kick_marker`] so the
+/// result follows the same "downbeat = low-band peak" convention as
+/// `first_downbeat`.
+///
+/// The result stays within half a beat of `approx_frame`, so **bar identity is
+/// unchanged** — this is a beat-phase lock, not the ±1/±2-beat coarse
+/// alignment HANDOFF §3/§8 rules out (which is about *which* beat starts the
+/// bar). Falls back to `approx_frame` when the window is too short or carries
+/// no onsets at all.
+pub fn lock_beat_phase(
+    interleaved_stereo: &[f32],
+    sample_rate: u32,
+    approx_frame: u64,
+    beat_frames: f64,
+    n_bars: u32,
+) -> u64 {
+    let frames = interleaved_stereo.len() / 2;
+    if frames == 0 || sample_rate == 0 || !(beat_frames.is_finite() && beat_frames > 1.0) {
+        return approx_frame.min(frames.saturating_sub(1) as u64);
+    }
+    let approx = approx_frame.min(frames as u64 - 1);
+    let n_beats = n_bars.saturating_mul(BEATS_PER_BAR).clamp(4, 128);
+    let radius = (beat_frames / 2.0).round().max(1.0) as i64;
+    let span = (f64::from(n_beats) * beat_frames).ceil() as i64 + radius;
+    let lo = (approx as i64 - radius).max(0) as usize;
+    let hi = ((approx as i64 + span) as usize).min(frames);
+    if hi <= lo + FLUX_WIN + FLUX_HOP {
+        return approx;
+    }
+
+    let mut mono = Vec::with_capacity(hi - lo);
+    for i in lo..hi {
+        mono.push(0.5 * (interleaved_stereo[i * 2] + interleaved_stereo[i * 2 + 1]));
+    }
+    let flux = broadband_onset_flux(&mono);
+    if flux.is_empty() {
+        return approx;
+    }
+
+    let centre = FLUX_WIN as f64 / 2.0;
+    let at = |pos: f64| -> f64 {
+        let h = ((pos - centre) / FLUX_HOP as f64).round() as i64;
+        let mut best = 0.0f64;
+        for d in -1..=1 {
+            let i = h + d;
+            if i >= 0 && (i as usize) < flux.len() {
+                best = best.max(flux[i as usize]);
+            }
+        }
+        best
+    };
+
+    let approx_local = (approx as i64 - lo as i64) as f64;
+    let step = FLUX_HOP as i64;
+    let steps = radius / step;
+    let score_at = |delta: i64| -> f64 {
+        let base = approx_local + delta as f64;
+        (0..n_beats)
+            .map(|k| at(base + f64::from(k) * beat_frames))
+            .sum()
+    };
+    // `delta == 0` is scored explicitly (and is one of the `k` steps below),
+    // so the "don't move" option is always in the comparison set exactly.
+    let zero_score = score_at(0);
+    let mut best_delta = 0i64;
+    let mut best_score = zero_score;
+    for k in -steps..=steps {
+        let delta = k * step;
+        let score = score_at(delta);
+        if score > best_score {
+            best_score = score;
+            best_delta = delta;
+        }
+    }
+    if !best_score.is_finite() || best_score <= 0.0 {
+        return approx;
+    }
+    // Only move on a clear win. A comb over a window whose rhythm is
+    // ambiguous (half-time breakdown, sparse pad) can prefer a wrong phase by
+    // a hair; keeping the analysis marker in that case is the same
+    // clear-margin-only rule `align_next_entry_scored` uses for bar identity,
+    // and it is what stops this from *introducing* phase errors on windows
+    // the markers already had right.
+    if zero_score.is_finite()
+        && zero_score > 0.0
+        && best_score < zero_score * LOCK_CLEAR_WIN_RATIO
+    {
+        best_delta = 0;
+    }
+    let coarse = ((approx as i64 + best_delta).max(0) as u64).min(frames as u64 - 1);
+    refine_kick_marker(
+        interleaved_stereo,
+        sample_rate,
+        coarse,
+        KICK_REFINE_RADIUS_MS,
+    )
 }
 
 /// Refine a downbeat by scoring low-band onset energy across several following beats.
@@ -790,7 +1006,10 @@ fn finite_or_err(v: f64, name: &str) -> Result<f64> {
 }
 
 /// Onset-strength envelope: 2nd-order LPF (~150 Hz) → hop energy → half-wave Δ.
-fn onset_envelope(mono: &[f32], sample_rate: u32, hop: usize) -> Result<OnsetData> {
+///
+/// `pub(crate)` so [`crate::features`] can reuse the exact same kick-oriented
+/// novelty for per-bar onset-density aggregation instead of reimplementing it.
+pub(crate) fn onset_envelope(mono: &[f32], sample_rate: u32, hop: usize) -> Result<OnsetData> {
     if mono.len() < hop * 4 {
         return Err(Error::Analysis(
             "segment too short for onset envelope".into(),
@@ -831,9 +1050,9 @@ fn onset_envelope(mono: &[f32], sample_rate: u32, hop: usize) -> Result<OnsetDat
     Ok(OnsetData { novelty, energy })
 }
 
-struct OnsetData {
-    novelty: Vec<f64>,
-    energy: Vec<f64>,
+pub(crate) struct OnsetData {
+    pub(crate) novelty: Vec<f64>,
+    pub(crate) energy: Vec<f64>,
 }
 
 /// RBJ biquad low-pass, Q = 1/√2 (Butterworth).
@@ -1050,18 +1269,21 @@ fn find_first_downbeat_hop(
 }
 
 #[derive(Clone, Copy)]
-enum SectionDir {
+pub(crate) enum SectionDir {
     Forward,
     Backward,
 }
 
-fn detect_section_bars(
+/// Bar-start frame offsets for a head/tail scan window, shared by
+/// [`detect_section_bars`] and [`bar_diag_rows`] (and reused by
+/// [`crate::features`] callers via [`SectionDiag`]) so the feature-frontend
+/// bar grid is always identical to the grid the existing detector scores.
+fn section_bar_starts(
     buffer: &AudioBuffer,
     anchor: u64,
-    bar_len: f64,
+    bar_len_frames: u64,
     dir: SectionDir,
-) -> Result<SectionEstimate> {
-    let bar_len_frames = bar_len.round().max(1.0) as u64;
+) -> Vec<u64> {
     let max_scan = match dir {
         SectionDir::Forward => MAX_SCAN_BARS_INTRO,
         SectionDir::Backward => MAX_SCAN_BARS_OUTRO,
@@ -1072,22 +1294,32 @@ fn detect_section_bars(
         }
         SectionDir::Backward => max_scan.min((anchor / bar_len_frames) as usize),
     };
+    (0..n_bars)
+        .map(|i| match dir {
+            SectionDir::Forward => anchor + i as u64 * bar_len_frames,
+            SectionDir::Backward => anchor.saturating_sub((i as u64 + 1) * bar_len_frames),
+        })
+        .collect()
+}
+
+fn detect_section_bars(
+    buffer: &AudioBuffer,
+    anchor: u64,
+    bar_len: f64,
+    dir: SectionDir,
+) -> Result<SectionEstimate> {
+    let bar_len_frames = bar_len.round().max(1.0) as u64;
+    let starts = section_bar_starts(buffer, anchor, bar_len_frames, dir);
     // Need at least one snap candidate + a short after-window.
-    if n_bars < SNAP_CANDIDATES[0] as usize + 4 {
+    if starts.len() < SNAP_CANDIDATES[0] as usize + 4 {
         return Ok(SectionEstimate {
             bars: FALLBACK_BARS,
             low_confidence: true,
             score: 0.0,
             sharpness: 0.0,
+            structure_bars: FALLBACK_BARS,
         });
     }
-
-    let starts: Vec<u64> = (0..n_bars)
-        .map(|i| match dir {
-            SectionDir::Forward => anchor + i as u64 * bar_len_frames,
-            SectionDir::Backward => anchor.saturating_sub((i as u64 + 1) * bar_len_frames),
-        })
-        .collect();
 
     let feats = bar_features(buffer, &starts, bar_len_frames);
     Ok(match dir {
@@ -1116,6 +1348,10 @@ fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
             low_confidence: false,
             score: drop.score,
             sharpness: drop.sharpness,
+            // `drop.structure_bars` is the un-lead-adjusted drop point
+            // (`pick_outro_full_drop` never adds the lead itself); `bars`
+            // above may additionally include OUTRO_LEAD_BARS.
+            structure_bars: drop.structure_bars,
         };
     }
     if let Some(hit) = pick_by_candidate_scores_outro(feats) {
@@ -1126,6 +1362,7 @@ fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
         low_confidence: true,
         score: 0.0,
         sharpness: 0.0,
+        structure_bars: FALLBACK_BARS,
     }
 }
 
@@ -1237,6 +1474,9 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
             low_confidence: false,
             score: peak / floor.max(1e-6),
             sharpness: edge_sharpness(before, after),
+            // This function never adds the mix lead-in itself; `bars` here
+            // already *is* the structural drop point.
+            structure_bars: bars,
         });
     }
     None
@@ -1267,6 +1507,7 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
             low_confidence: false,
             score,
             sharpness,
+            structure_bars: cand,
         });
     }
     if scored.is_empty() {
@@ -1314,6 +1555,10 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
             low_confidence: false,
             score: best.score,
             sharpness: best.sharpness,
+            // `best.bars` (== `best.structure_bars`, this function never
+            // adds the lead before this point) is the candidate boundary
+            // itself; `bars` above may additionally include OUTRO_LEAD_BARS.
+            structure_bars: best.bars,
         })
     } else {
         None
@@ -1352,6 +1597,7 @@ fn pick_section_bars(feats: &[BarFeat]) -> SectionEstimate {
         low_confidence: true,
         score: 0.0,
         sharpness: 0.0,
+        structure_bars: FALLBACK_BARS,
     }
 }
 
@@ -1416,6 +1662,7 @@ fn long_intro_tension_drop(feats: &[BarFeat], cand: u32) -> Option<SectionEstima
         low_confidence: false,
         score,
         sharpness: score,
+        structure_bars: cand,
     })
 }
 
@@ -1476,6 +1723,7 @@ fn pick_medium_intro_48(feats: &[BarFeat]) -> Option<SectionEstimate> {
             .max(local_ratio)
             .max(shout * 10.0),
         sharpness: sharpness.max(local_rise).max(local_ratio),
+        structure_bars: CAND,
     })
 }
 
@@ -1537,6 +1785,7 @@ fn long_intro_candidate(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate>
             .max(local_ratio)
             .max(shout * 10.0),
         sharpness: sharpness.max(local_rise).max(local_ratio),
+        structure_bars: cand,
     })
 }
 
@@ -1685,6 +1934,7 @@ fn pick_by_mainness_onset(feats: &[BarFeat]) -> Option<SectionEstimate> {
             low_confidence: false,
             score: contrast,
             sharpness: sharp,
+            structure_bars: bars,
         });
     }
     None
@@ -1722,6 +1972,7 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
             low_confidence: false,
             score,
             sharpness,
+            structure_bars: cand,
         });
     }
     if scored.is_empty() {
@@ -2025,6 +2276,10 @@ pub struct BarDiag {
     pub rms_db: f64,
     pub hf_db: f64,
     pub centroid_hz: f64,
+    /// Stage 2 spectral-frontend features for this bar ([`crate::features::BarFeatures`]).
+    /// `None` unless requested via [`diagnose_section_bars_ext`]. `analyze()`
+    /// never reads this; it exists purely for `examples/section_diag.rs`.
+    pub new_features: Option<crate::features::BarFeatures>,
 }
 
 /// Aggregated head/tail bar features for offline inspection.
@@ -2032,10 +2287,32 @@ pub struct BarDiag {
 pub struct SectionDiag {
     pub intro: Vec<BarDiag>,
     pub outro: Vec<BarDiag>,
+    /// Stage 2 structure signals over the intro bar sequence ([`crate::structure::compute`]).
+    /// `None` unless requested via [`diagnose_section_bars_ext`].
+    pub intro_structure: Option<crate::structure::StructureSignals>,
+    /// Structure signals over the outro bar sequence. The outro's bar grid
+    /// is already ordered nearest-file-end-first (see [`section_bar_starts`]
+    /// / [`crate::structure`]'s module docs), so this is the *same*
+    /// intro-prefix-model / novelty computation as `intro_structure`, not a
+    /// separately time-reversed variant.
+    pub outro_structure: Option<crate::structure::StructureSignals>,
 }
 
-/// Compute per-bar features for intro (forward) and outro (backward) scan windows.
+/// Compute per-bar features for intro (forward) and outro (backward) scan
+/// windows, using only the legacy `BarFeat` frontend — identical behavior to
+/// before Stage 2. Equivalent to `diagnose_section_bars_ext(buffer, false)`.
 pub fn diagnose_section_bars(buffer: &AudioBuffer) -> Result<SectionDiag> {
+    diagnose_section_bars_ext(buffer, false)
+}
+
+/// Like [`diagnose_section_bars`], optionally also computing the Stage 2
+/// spectral-frontend per-bar features and derived structure signals for both
+/// sides (`with_new_features: true`). Purely diagnostic: never affects
+/// [`analyze`], and the legacy columns are byte-for-byte the same either way.
+pub fn diagnose_section_bars_ext(
+    buffer: &AudioBuffer,
+    with_new_features: bool,
+) -> Result<SectionDiag> {
     let sr = buffer.sample_rate as f64;
     let segment_frames = (SEGMENT_SECS * sr).round() as u64;
     let head_len = segment_frames.min(buffer.frames);
@@ -2065,9 +2342,36 @@ pub fn diagnose_section_bars(buffer: &AudioBuffer) -> Result<SectionDiag> {
         .round()
         .max(1.0);
 
+    let head_window = with_new_features.then_some((head.as_slice(), 0u64));
+    let tail_window = with_new_features.then_some((tail.as_slice(), tail_start));
+
+    let (intro, intro_new_feats) = bar_diag_rows(
+        buffer,
+        first_downbeat,
+        intro_bar_len,
+        SectionDir::Forward,
+        head_window,
+    )?;
+    let (outro, outro_new_feats) = bar_diag_rows(
+        buffer,
+        buffer.frames,
+        outro_bar_len,
+        SectionDir::Backward,
+        tail_window,
+    )?;
+
+    let intro_structure = intro_new_feats
+        .as_deref()
+        .map(|f| crate::structure::compute(f, crate::structure::DEFAULT_PREFIX_BARS));
+    let outro_structure = outro_new_feats
+        .as_deref()
+        .map(|f| crate::structure::compute(f, crate::structure::DEFAULT_PREFIX_BARS));
+
     Ok(SectionDiag {
-        intro: bar_diag_rows(buffer, first_downbeat, intro_bar_len, SectionDir::Forward)?,
-        outro: bar_diag_rows(buffer, buffer.frames, outro_bar_len, SectionDir::Backward)?,
+        intro,
+        outro,
+        intro_structure,
+        outro_structure,
     })
 }
 
@@ -2076,26 +2380,15 @@ fn bar_diag_rows(
     anchor: u64,
     bar_len: f64,
     dir: SectionDir,
-) -> Result<Vec<BarDiag>> {
+    window: Option<(&[f32], u64)>,
+) -> Result<(Vec<BarDiag>, Option<Vec<crate::features::BarFeatures>>)> {
     let bar_len_frames = bar_len.round().max(1.0) as u64;
-    let max_scan = match dir {
-        SectionDir::Forward => MAX_SCAN_BARS_INTRO,
-        SectionDir::Backward => MAX_SCAN_BARS_OUTRO,
-    };
-    let n_bars = match dir {
-        SectionDir::Forward => {
-            max_scan.min(((buffer.frames.saturating_sub(anchor)) / bar_len_frames) as usize)
-        }
-        SectionDir::Backward => max_scan.min((anchor / bar_len_frames) as usize),
-    };
-    let starts: Vec<u64> = (0..n_bars)
-        .map(|i| match dir {
-            SectionDir::Forward => anchor + i as u64 * bar_len_frames,
-            SectionDir::Backward => anchor.saturating_sub((i as u64 + 1) * bar_len_frames),
-        })
-        .collect();
+    let starts = section_bar_starts(buffer, anchor, bar_len_frames, dir);
     let feats = bar_features(buffer, &starts, bar_len_frames);
-    Ok(feats
+    let new_feats = window.map(|(mono, offset)| {
+        crate::features::bar_features(mono, offset, buffer.sample_rate, &starts, bar_len_frames)
+    });
+    let rows = feats
         .into_iter()
         .enumerate()
         .map(|(i, f)| BarDiag {
@@ -2112,8 +2405,10 @@ fn bar_diag_rows(
                 -120.0
             },
             centroid_hz: f.centroid_hz,
+            new_features: new_feats.as_ref().and_then(|v| v.get(i).copied()),
         })
-        .collect())
+        .collect();
+    Ok((rows, new_feats))
 }
 
 #[derive(Clone, Copy)]

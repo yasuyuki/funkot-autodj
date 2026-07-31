@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use crate::analysis::{
-    analyze, analyze_local_tempo, reconcile_intro_outro, refine_kick_marker, SectionEstimate,
+    analyze, analyze_local_tempo, clamp_outro_structure_bars, reconcile_intro_outro,
+    refine_kick_marker, SectionEstimate,
 };
 use crate::cache::{self, get_cached_or_provisional, get_or_analyze};
 use crate::decode::AudioBuffer;
@@ -477,12 +478,14 @@ fn reconcile_rules_unit() {
         low_confidence: false,
         score,
         sharpness: sharp,
+        structure_bars: bars,
     };
     let lo = |bars| SectionEstimate {
         bars,
         low_confidence: true,
         score: 0.5,
         sharpness: 0.1,
+        structure_bars: bars,
     };
 
     // Both confident, intro >= outro (unequal OK): keep both.
@@ -528,6 +531,59 @@ fn reconcile_rules_unit() {
     let (i, o, il, ol) = reconcile_intro_outro(lo(16), lo(32));
     assert_eq!((i, o), (FALLBACK_BARS, FALLBACK_BARS));
     assert!(il && ol);
+}
+
+/// Regression for the invariant documented on
+/// [`crate::TrackAnalysis::outro_structure_bars`]: it must never exceed the
+/// reconciled `outro_bars`.
+///
+/// `pick_outro_bars`'s final fallback returns `low_confidence: true,
+/// structure_bars: FALLBACK_BARS` (64). When the intro is confident and
+/// short (e.g. 16 bars), `reconcile_intro_outro`'s "outro low / intro
+/// credible" branch derives `outro_bars = min(FALLBACK_BARS, intro.bars)`
+/// from the *intro* side, ignoring the outro's own (pre-reconcile)
+/// structural estimate entirely. Without clamping afterward,
+/// `outro_structure_bars` (64) would end up larger than the reconciled
+/// `outro_bars` (16) -- i.e. the structural boundary would be reported as
+/// farther from the file end than the mix trigger derived from it, which
+/// contradicts the field's own doc comment. This exercises
+/// `clamp_outro_structure_bars` directly (the same helper `analyze()`
+/// calls), not a re-implementation of its `.min()`, so a regression in the
+/// real code path is guaranteed to fail this test too.
+#[test]
+fn outro_structure_bars_never_exceeds_reconciled_outro_bars() {
+    let intro = SectionEstimate {
+        bars: 16,
+        low_confidence: false,
+        score: 5.0,
+        sharpness: 3.0,
+        structure_bars: 16,
+    };
+    // Mirrors `pick_outro_bars`'s final fallback: low-confidence, with
+    // `structure_bars` left at the FALLBACK_BARS placeholder. `bars` itself
+    // is irrelevant to the reconcile branch this triggers.
+    let outro = SectionEstimate {
+        bars: FALLBACK_BARS,
+        low_confidence: true,
+        score: 0.0,
+        sharpness: 0.0,
+        structure_bars: FALLBACK_BARS,
+    };
+
+    let (_, outro_bars, _, outro_low_conf) = reconcile_intro_outro(intro, outro);
+    assert_eq!(outro_bars, 16, "outro low / intro credible: min(FALLBACK_BARS, intro.bars)");
+    assert!(outro_low_conf);
+    assert!(
+        outro.structure_bars > outro_bars,
+        "test setup must actually produce the violating pre-clamp state (64 > 16)"
+    );
+
+    let clamped = clamp_outro_structure_bars(outro.structure_bars, outro_bars);
+    assert!(
+        clamped <= outro_bars,
+        "outro_structure_bars ({clamped}) must never exceed outro_bars ({outro_bars})"
+    );
+    assert_eq!(clamped, outro_bars, "clamp pins to outro_bars in this branch");
 }
 
 #[test]
@@ -686,6 +742,7 @@ fn purge_auto_deletes_and_clears_manual() {
         outro_start: 500,
         intro_bars: 16,
         outro_bars: 16,
+        outro_structure_bars: 16,
         bars_estimated_low_confidence: false,
         intro_bars_low_confidence: false,
         outro_bars_low_confidence: false,
