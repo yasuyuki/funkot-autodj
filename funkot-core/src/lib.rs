@@ -81,6 +81,16 @@ pub struct TrackAnalysis {
     pub outro_start: u64,
     /// Intro length in bars.
     pub intro_bars: u32,
+    /// Nominal length of the track in bars, first downbeat to end of music
+    /// (trailing silence and fade tails excluded, like the analyzer's own
+    /// measurement). Stored so a hand-edited structural boundary can be run
+    /// back through `analysis::outro_trigger_bars`, which needs to know
+    /// whether the track is long enough to hold the mix lead-in.
+    ///
+    /// `0` on entries written before this field existed and on stripped ones;
+    /// callers fall back to estimating it from `total_frames`.
+    #[serde(default)]
+    pub track_bars: u32,
     /// Outro mix-trigger length in bars (from file end): where the
     /// transition *starts*. [`Self::outro_structure_bars`] plus the mix
     /// lead-in, so that the transition — two fades and [`MAIN_GAP_BARS`],
@@ -129,6 +139,16 @@ pub struct TrackAnalysis {
     /// Hand-edited `outro_bars`; preserved across `--purge-auto-cache` / reanalysis.
     #[serde(default)]
     pub outro_bars_manual: bool,
+    /// Hand-edited [`Self::outro_structure_bars`]; preserved across
+    /// `--purge-auto-cache` / reanalysis, with `outro_bars` re-derived from it
+    /// by the same rule the analyzer uses (`cache::set_manual_structure_bars`).
+    ///
+    /// Mutually exclusive with [`Self::outro_bars_manual`]: both describe the
+    /// same edge, so whichever was set last wins and clears the other. Setting
+    /// this on a track also makes it useless as evaluation ground truth — the
+    /// analyzer would be scored against a boundary a human typed in.
+    #[serde(default)]
+    pub outro_structure_bars_manual: bool,
     /// Auto fields were stripped; next load reanalyzes and merges manual bars.
     #[serde(default)]
     pub needs_reanalysis: bool,

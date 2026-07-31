@@ -145,7 +145,10 @@ pub fn purge_auto(cache_dir: &Path) -> Result<PurgeStats> {
             stats.skipped += 1;
             continue;
         }
-        if !analysis.intro_bars_manual && !analysis.outro_bars_manual {
+        if !analysis.intro_bars_manual
+            && !analysis.outro_bars_manual
+            && !analysis.outro_structure_bars_manual
+        {
             fs::remove_file(&path).map_err(|e| {
                 Error::Cache(format!("cannot delete cache '{}': {e}", path.display()))
             })?;
@@ -168,6 +171,8 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
     let outro_bars = if a.outro_bars_manual { a.outro_bars } else { 0 };
     let intro_m = a.intro_bars_manual;
     let outro_m = a.outro_bars_manual;
+    let structure_m = a.outro_structure_bars_manual;
+    let outro_structure_bars = if structure_m { a.outro_structure_bars } else { 0 };
     *a = TrackAnalysis {
         version: CACHE_VERSION,
         file_name: a.file_name.clone(),
@@ -178,29 +183,62 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
         first_downbeat: 0,
         outro_start: 0,
         intro_bars,
+        // Auto: recomputed from the fresh boundary next load.
+        track_bars: 0,
         outro_bars,
-        // Stripped alongside the other auto fields; needs_reanalysis pulls
-        // in a fresh value (or a fresh FALLBACK_BARS-based one) next load.
-        outro_structure_bars: 0,
+        // Stripped alongside the other auto fields unless hand-set;
+        // needs_reanalysis pulls in a fresh value (or a fresh
+        // FALLBACK_BARS-based one) next load.
+        outro_structure_bars,
         bars_estimated_low_confidence: true,
         intro_bars_low_confidence: !intro_m,
-        outro_bars_low_confidence: !outro_m,
+        outro_bars_low_confidence: !(outro_m || structure_m),
         intro_bars_manual: intro_m,
         outro_bars_manual: outro_m,
+        outro_structure_bars_manual: structure_m,
         needs_reanalysis: true,
         rms_dbfs: TARGET_RMS_DBFS,
         gain_db: 0.0,
     };
 }
 
+/// Length of one bar in frames at the outro tempo.
+fn outro_bar_len(a: &TrackAnalysis) -> u64 {
+    (60.0 / a.outro_bpm * f64::from(a.sample_rate) * f64::from(BEATS_PER_BAR))
+        .round()
+        .max(1.0) as u64
+}
+
 /// Recompute `outro_start` from `outro_bars`, `outro_bpm`, `sample_rate` and `total_frames`.
 fn recompute_outro_start(a: &mut TrackAnalysis) {
-    let bar_len = (60.0 / a.outro_bpm * f64::from(a.sample_rate) * f64::from(BEATS_PER_BAR))
-        .round()
-        .max(1.0) as u64;
+    let bar_len = outro_bar_len(a);
     a.outro_start = a
         .total_frames
         .saturating_sub(u64::from(a.outro_bars) * bar_len);
+}
+
+/// `track_bars`, or a stand-in for entries written before it was stored.
+///
+/// The fallback measures to the end of the *file* rather than the end of the
+/// music, so it runs long on tracks with a silent tail. It only feeds the
+/// "is the track long enough to hold the lead-in" bound, where being generous
+/// just means the plain boundary-plus-lead-in rule applies.
+fn track_bars_or_estimate(a: &TrackAnalysis) -> u32 {
+    if a.track_bars > 0 {
+        return a.track_bars;
+    }
+    (a.total_frames.saturating_sub(a.first_downbeat) / outro_bar_len(a)) as u32
+}
+
+/// Re-derive the mix trigger (and `outro_start`) from the structural boundary,
+/// by the same rule `analysis::analyze` applies.
+fn derive_outro_from_structure(a: &mut TrackAnalysis) {
+    a.outro_bars = crate::analysis::outro_trigger_bars(
+        a.outro_structure_bars,
+        a.intro_bars,
+        track_bars_or_estimate(a),
+    );
+    recompute_outro_start(a);
 }
 
 /// Keep `outro_structure_bars <= outro_bars` after a hand-edited trigger.
@@ -221,13 +259,25 @@ fn clamp_structure_to_outro(a: &mut TrackAnalysis) {
 }
 
 /// Re-apply hand-edited intro/outro bars onto a fresh analysis.
+///
+/// A hand-set structural boundary wins over a hand-set trigger: the two say
+/// the same thing, the setters keep them exclusive, and the boundary is the
+/// one the trigger is derived from.
 pub fn apply_manual_overrides(manual: &TrackAnalysis, mut fresh: TrackAnalysis) -> TrackAnalysis {
     if manual.intro_bars_manual {
         fresh.intro_bars = manual.intro_bars;
         fresh.intro_bars_manual = true;
         fresh.intro_bars_low_confidence = false;
     }
-    if manual.outro_bars_manual {
+    if manual.outro_structure_bars_manual {
+        fresh.outro_structure_bars = manual.outro_structure_bars;
+        fresh.outro_structure_bars_manual = true;
+        fresh.outro_bars_manual = false;
+        fresh.outro_bars_low_confidence = false;
+        // Derived from the boundary the *user* set, but against this analysis'
+        // fresh intro and length — the same inputs `analyze` would have used.
+        derive_outro_from_structure(&mut fresh);
+    } else if manual.outro_bars_manual {
         fresh.outro_bars = manual.outro_bars;
         fresh.outro_bars_manual = true;
         fresh.outro_bars_low_confidence = false;
@@ -263,9 +313,42 @@ pub fn set_manual_bars(
         analysis.outro_bars = n;
         analysis.outro_bars_manual = true;
         analysis.outro_bars_low_confidence = false;
+        // Pinning the trigger by hand takes the outro edge out of the
+        // boundary's control, so an earlier boundary edit no longer applies.
+        analysis.outro_structure_bars_manual = false;
         recompute_outro_start(&mut analysis);
         clamp_structure_to_outro(&mut analysis);
     }
+    analysis.bars_estimated_low_confidence =
+        analysis.intro_bars_low_confidence || analysis.outro_bars_low_confidence;
+    store(cache_dir, hash, &analysis)?;
+    Ok(analysis)
+}
+
+/// Hand-edit the *structural* outro boundary on a cached entry and persist it,
+/// re-deriving `outro_bars` (the mix trigger) and `outro_start` from it.
+///
+/// This is the edit to expose to listeners: `outro_structure_bars` is where
+/// the track actually collapses, which is what someone hears and can judge,
+/// while the trigger is bookkeeping the analyzer derives from it — one fixed
+/// lead-in ahead, so the transition finishes exactly where the outro begins.
+/// Editing the trigger directly ([`set_manual_bars`]) severs that relation;
+/// this keeps it.
+///
+/// Clears `outro_bars_manual`: the trigger is derived again from here on.
+/// `needs_reanalysis` is preserved, as in [`set_manual_bars`].
+pub fn set_manual_structure_bars(
+    cache_dir: &Path,
+    hash: &str,
+    bars: u32,
+) -> Result<TrackAnalysis> {
+    let mut analysis = load(cache_dir, hash)
+        .ok_or_else(|| Error::Cache(format!("no cache entry for hash '{hash}'")))?;
+    analysis.outro_structure_bars = bars;
+    analysis.outro_structure_bars_manual = true;
+    analysis.outro_bars_manual = false;
+    analysis.outro_bars_low_confidence = false;
+    derive_outro_from_structure(&mut analysis);
     analysis.bars_estimated_low_confidence =
         analysis.intro_bars_low_confidence || analysis.outro_bars_low_confidence;
     store(cache_dir, hash, &analysis)?;
@@ -294,7 +377,10 @@ pub fn get_or_analyze(
         .unwrap_or("unknown");
     let mut analysis = crate::analysis::analyze(buffer, file_name)?;
     if let Some(cached) = prior.as_ref() {
-        if cached.intro_bars_manual || cached.outro_bars_manual {
+        if cached.intro_bars_manual
+            || cached.outro_bars_manual
+            || cached.outro_structure_bars_manual
+        {
             analysis = apply_manual_overrides(cached, analysis);
         }
     }
@@ -366,6 +452,7 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         first_downbeat: 0,
         outro_start,
         intro_bars: section_bars,
+        track_bars: total_bars,
         outro_bars: section_bars,
         // Naive placeholder, no structural detection ran; mirrors outro_bars
         // like every other field here (all low-confidence by construction).
@@ -375,6 +462,7 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         outro_bars_low_confidence: true,
         intro_bars_manual: false,
         outro_bars_manual: false,
+        outro_structure_bars_manual: false,
         needs_reanalysis: false,
         rms_dbfs: TARGET_RMS_DBFS,
         gain_db: 0.0,
@@ -397,6 +485,7 @@ mod tests {
             first_downbeat: 0,
             outro_start: 0,
             intro_bars: 8,
+            track_bars: 200,
             outro_bars: 16,
             outro_structure_bars: 16,
             bars_estimated_low_confidence: true,
@@ -404,6 +493,7 @@ mod tests {
             outro_bars_low_confidence: true,
             intro_bars_manual: false,
             outro_bars_manual: false,
+            outro_structure_bars_manual: false,
             needs_reanalysis: false,
             rms_dbfs: TARGET_RMS_DBFS,
             gain_db: 0.0,
@@ -557,6 +647,107 @@ mod tests {
 
         assert_eq!(result.outro_bars, 24);
         assert_eq!(result.outro_structure_bars, 24);
+    }
+
+    #[test]
+    fn set_manual_structure_bars_rederives_the_trigger() {
+        let dir = TempDir::new("structure");
+        let hash = "hash-structure";
+        store(dir.path(), hash, &sample_analysis()).unwrap();
+
+        let result = set_manual_structure_bars(dir.path(), hash, 32).unwrap();
+
+        assert_eq!(result.outro_structure_bars, 32);
+        assert!(result.outro_structure_bars_manual);
+        assert_eq!(
+            result.outro_bars, 48,
+            "the analyzer's rule: boundary plus the 16-bar lead-in"
+        );
+        assert!(!result.outro_bars_low_confidence);
+
+        let bar_len = (60.0 / result.outro_bpm
+            * f64::from(result.sample_rate)
+            * f64::from(BEATS_PER_BAR))
+        .round()
+        .max(1.0) as u64;
+        assert_eq!(result.outro_start, result.total_frames - 48 * bar_len);
+        assert_eq!(load(dir.path(), hash).unwrap(), result);
+    }
+
+    /// The two manual outro edits describe the same edge, so the later one has
+    /// to win outright — leaving both flags set would make the next reanalysis
+    /// pick between them.
+    #[test]
+    fn manual_outro_edits_replace_each_other() {
+        let dir = TempDir::new("structure-excl");
+        let hash = "hash-structure-excl";
+        store(dir.path(), hash, &sample_analysis()).unwrap();
+
+        set_manual_bars(dir.path(), hash, None, Some(24)).unwrap();
+        let result = set_manual_structure_bars(dir.path(), hash, 32).unwrap();
+        assert!(!result.outro_bars_manual, "the pinned trigger is gone");
+        assert_eq!(result.outro_bars, 48);
+
+        let result = set_manual_bars(dir.path(), hash, None, Some(24)).unwrap();
+        assert!(
+            !result.outro_structure_bars_manual,
+            "the hand-set boundary is gone"
+        );
+        assert_eq!(result.outro_bars, 24);
+        assert_eq!(result.outro_structure_bars, 24, "clamped to the trigger");
+    }
+
+    /// Reanalysis has to re-derive the trigger rather than restore the stored
+    /// one: the fresh analysis may have found a different intro or length.
+    #[test]
+    fn apply_manual_overrides_rederives_from_a_hand_set_boundary() {
+        let mut manual = sample_analysis();
+        manual.outro_structure_bars = 16;
+        manual.outro_structure_bars_manual = true;
+
+        let mut fresh = sample_analysis();
+        fresh.outro_structure_bars = 64;
+        fresh.outro_bars = 80;
+
+        let result = apply_manual_overrides(&manual, fresh);
+
+        assert_eq!(result.outro_structure_bars, 16);
+        assert!(result.outro_structure_bars_manual);
+        assert_eq!(result.outro_bars, 32);
+        assert!(!result.needs_reanalysis);
+    }
+
+    /// Entries written before `track_bars` existed still have to derive a
+    /// trigger; the file-length estimate stands in for the stored value.
+    #[test]
+    fn set_manual_structure_bars_without_stored_track_bars() {
+        let dir = TempDir::new("structure-old");
+        let hash = "hash-structure-old";
+        let mut analysis = sample_analysis();
+        analysis.track_bars = 0;
+        store(dir.path(), hash, &analysis).unwrap();
+
+        let result = set_manual_structure_bars(dir.path(), hash, 32).unwrap();
+        assert_eq!(result.outro_bars, 48);
+    }
+
+    /// `purge_auto` protects hand-edited bars. A hand-set boundary is one, and
+    /// deleting the entry would throw the edit away silently.
+    #[test]
+    fn purge_auto_keeps_a_hand_set_boundary() {
+        let dir = TempDir::new("structure-purge");
+        let hash = "hash-structure-purge";
+        store(dir.path(), hash, &sample_analysis()).unwrap();
+        set_manual_structure_bars(dir.path(), hash, 32).unwrap();
+
+        let stats = purge_auto(dir.path()).unwrap();
+
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.cleared, 1);
+        let kept = load(dir.path(), hash).expect("entry survives the purge");
+        assert_eq!(kept.outro_structure_bars, 32);
+        assert!(kept.outro_structure_bars_manual);
+        assert!(kept.needs_reanalysis);
     }
 
     #[test]
