@@ -421,9 +421,19 @@ const TAIL_WINDOW_SECONDS: f64 = 0.05;
 /// below the transients, and is unmoved by a tail short enough to matter.
 const TAIL_REFERENCE_PERCENTILE: f64 = 0.75;
 /// How far below that reference a window has to fall to count as no longer
-/// music. Measured on `testdata/`, beat gaps within the music sit 20-25 dB
-/// down and decaying tails run past -45 dB.
-const TAIL_SILENCE_DB: f64 = -20.0;
+/// music.
+///
+/// The binding case is a fade-out, not silence: `AntonFer - … - 09 Sakura
+/// Photograph` plays at full level until 6 bars before the file ends and then
+/// decays -16, -25, -32, -42, -49 dB per bar. At -20 dB the first bar of that
+/// decay still counted as music and the anchor landed a bar late, which the
+/// labeler heard as a 16-bar candidate clicking 15 bars before the end.
+///
+/// Swept over the 14 masters in `testdata/`: from -24 to -6 dB, thirteen of
+/// them give the same anchor at every setting — only the fade-out track moves,
+/// and it settles on its ear-verified answer from -18 dB down. This sits in
+/// the middle of that plateau.
+const TAIL_SILENCE_DB: f64 = -14.0;
 /// How much louder a window has to be than the one before it to count as
 /// something being struck rather than something still ringing. A tail only
 /// decays, so this is what separates the last hit from the reverb after it.
@@ -453,6 +463,17 @@ const TAIL_ONSET_RISE: f64 = 1.6;
 /// track, so it needs no absolute calibration;
 /// [`ANCHOR_ONSET_SLACK_BARS`] covers the detection latency.
 pub fn music_end_frame(buffer: &AudioBuffer, analysis: &TrackAnalysis) -> u64 {
+    music_end_frame_with(buffer, analysis, TAIL_SILENCE_DB, TAIL_ONSET_RISE)
+}
+
+/// [`music_end_frame`] with its two thresholds exposed, so
+/// `examples/music_end_sweep.rs` can measure how the answer moves with them.
+pub fn music_end_frame_with(
+    buffer: &AudioBuffer,
+    analysis: &TrackAnalysis,
+    silence_db: f64,
+    onset_rise: f64,
+) -> u64 {
     let sr = f64::from(buffer.sample_rate);
     let total = buffer.frames as usize;
     let win = (TAIL_WINDOW_SECONDS * sr).round() as usize;
@@ -484,7 +505,7 @@ pub fn music_end_frame(buffer: &AudioBuffer, analysis: &TrackAnalysis) -> u64 {
     if !(reference > 0.0) {
         return analysis.total_frames;
     }
-    let threshold = reference * 10f64.powf(TAIL_SILENCE_DB / 20.0);
+    let threshold = reference * 10f64.powf(silence_db / 20.0);
 
     // Prefer the last window where something was *struck*: a tail only
     // decays, so the last rise above the threshold is the final hit, whereas
@@ -495,7 +516,7 @@ pub fn music_end_frame(buffer: &AudioBuffer, analysis: &TrackAnalysis) -> u64 {
     let last_onset = levels
         .windows(2)
         .rev()
-        .find(|pair| pair[1].1 >= threshold && pair[1].1 > pair[0].1 * TAIL_ONSET_RISE)
+        .find(|pair| pair[1].1 >= threshold && pair[1].1 > pair[0].1 * onset_rise)
         .map(|pair| pair[1].0);
     let last_audible = levels
         .iter()
@@ -1951,5 +1972,58 @@ mod tests {
                  so the fixture is not exercising the tail"
             );
         }
+    }
+
+    /// Masters that fade out rather than stopping are the case that pins
+    /// `TAIL_SILENCE_DB`: the fade is still music by any absolute measure, but
+    /// the bar it starts on is where the labeler hears the track end, and
+    /// counting candidates back from inside the fade puts every one of them a
+    /// bar late (`AntonFer - … - 09 Sakura Photograph`).
+    fn with_fade_out(
+        buffer: AudioBuffer,
+        fade_bars: f64,
+        silence_bars: f64,
+        beat_true: f64,
+    ) -> (AudioBuffer, u64) {
+        let bar = beat_true * 4.0;
+        let fade = (bar * fade_bars).round() as usize;
+        let silence = (bar * silence_bars).round() as usize;
+        let mut samples = buffer.samples;
+        let full_level_end = buffer.frames.saturating_sub(fade as u64);
+        for s in samples.iter_mut().skip(full_level_end as usize * 2) {
+            *s *= 0.12; // -18 dB: unmistakably still playing, unmistakably not the body
+        }
+        samples.extend(std::iter::repeat(0.0).take(silence * 2));
+        let frames = buffer.frames + silence as u64;
+        (
+            AudioBuffer {
+                sample_rate: buffer.sample_rate,
+                frames,
+                samples,
+            },
+            full_level_end,
+        )
+    }
+
+    #[test]
+    fn music_end_stops_where_a_fade_out_starts_not_where_it_becomes_inaudible() {
+        let (music, analysis_music, beat_true) = drifting_tempo_fixture(0.0);
+        let (buffer, fade_start) = with_fade_out(music, 4.0, 1.0, beat_true);
+        let analysis = sample_analysis(
+            buffer.sample_rate,
+            analysis_music.intro_bpm,
+            analysis_music.outro_bpm,
+            analysis_music.first_downbeat,
+            buffer.frames,
+        );
+        let bar = beat_true * 4.0;
+
+        let music_end = music_end_frame(&buffer, &analysis);
+        let off = (music_end as f64 - fade_start as f64) / bar;
+        assert!(
+            off.abs() <= 0.25,
+            "music end came out {off:+.3} bar from where the fade starts; a positive \
+             value means the fade was counted as music, which lands every candidate late"
+        );
     }
 }
