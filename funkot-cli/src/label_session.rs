@@ -335,32 +335,36 @@ pub fn boundary_frame(analysis: &TrackAnalysis, side: Side, bars: u32) -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClickGrid {
     pub bar_frames: f64,
-    /// Last frame that still carries music. Not `total_frames`: see
-    /// [`music_end_frame`].
-    pub music_end: u64,
-    /// How far past a bar line `music_end` may sit and still be taken as
-    /// landing on it. [`music_end_frame`] returns the last thing *struck*, so
-    /// the music's final bar line is the first one at or after it and this is
-    /// small ([`ANCHOR_ONSET_SLACK_BARS`]). A `music_end` that is just the
-    /// file end carries no such meaning, so [`ClickGrid::nominal`] uses 0.5,
-    /// which makes the same arithmetic plain nearest-bar rounding.
-    pub anchor_slack_bars: f64,
+    /// Frame the outro side counts candidates back from: the bar line where
+    /// the music ends ([`music_end_bar`]), which is not the end of the file.
+    /// Unused on the intro side, which counts forward from `first_downbeat`.
+    pub outro_anchor: i64,
 }
 
 impl ClickGrid {
-    /// The grid implied by the analysis markers alone — the pre-audio
-    /// behaviour, kept for [`boundary_frame`] and its tests.
+    /// The grid implied by the analysis markers alone — no audio, so the
+    /// outro anchor can only be the file end rounded onto the bar grid. Kept
+    /// for [`boundary_frame`] and its tests.
     pub fn nominal(analysis: &TrackAnalysis, side: Side) -> Self {
+        let bar_frames = bar_frames_for(analysis, side);
+        let first_downbeat = analysis.first_downbeat as f64;
+        let total = analysis.total_frames as f64;
+        let outro_anchor = if bar_frames.is_finite() && bar_frames > 1.0 && total >= first_downbeat
+        {
+            let bars = ((total - first_downbeat) / bar_frames).round();
+            (first_downbeat + bars * bar_frames).round() as i64
+        } else {
+            analysis.total_frames as i64
+        };
         Self {
-            bar_frames: bar_frames_for(analysis, side),
-            music_end: analysis.total_frames,
-            anchor_slack_bars: 0.5,
+            bar_frames,
+            outro_anchor,
         }
     }
 }
 
 /// [`boundary_frame`] on a caller-supplied grid, so the refined outro period
-/// and music-end anchor can drive the same arithmetic.
+/// and the measured music-end anchor drive the same arithmetic.
 pub fn boundary_frame_on_grid(
     analysis: &TrackAnalysis,
     side: Side,
@@ -370,163 +374,115 @@ pub fn boundary_frame_on_grid(
     let span = (grid.bar_frames * f64::from(bars)).round() as i64;
     match side {
         Side::Intro => analysis.first_downbeat as i64 + span,
-        Side::Outro => outro_anchor_frame(analysis, grid) - span,
+        Side::Outro => grid.outro_anchor - span,
     }
 }
 
-/// The outro-side anchor `boundary_frame` counts candidates back from:
-/// `first_downbeat` plus the nearest whole number of bars to the end of the
-/// music. Falls back to that end verbatim if the markers needed to propagate
-/// the grid are unusable.
-fn outro_anchor_frame(analysis: &TrackAnalysis, grid: ClickGrid) -> i64 {
-    let music_end = grid.music_end as f64;
-    let first_downbeat = analysis.first_downbeat as f64;
-    if !grid.bar_frames.is_finite()
-        || grid.bar_frames <= 1.0
-        || !music_end.is_finite()
-        || !first_downbeat.is_finite()
-        || music_end < first_downbeat
-    {
-        return grid.music_end as i64;
-    }
-    let bars_to_end =
-        ((music_end - first_downbeat) / grid.bar_frames - grid.anchor_slack_bars).ceil();
-    if bars_to_end < 1.0 {
-        return grid.music_end as i64;
-    }
-    (first_downbeat + bars_to_end * grid.bar_frames).round() as i64
-}
+/// How far back from the file end to look for the end of the music, in bars.
+const END_SCAN_BARS: u32 = 64;
+/// How far below the track's own typical bar a beat's onset strength may fall
+/// and still count as the rhythm running.
+///
+/// The separation this has to make is between a bar that is still playing
+/// quietly and a bar that only holds the decay of the last hit. Measured
+/// across the four masters in `testdata/` whose ends are ear-verified, the
+/// weakest still-playing bar sits 10.2 dB down (`Yukitama & Zhenz - … - 05
+/// Kimi to Semi Blue`, whose outro fades before it stops) and the loudest
+/// decay-only bar 22.5 dB down (the same track, one bar later) — a 12 dB gap,
+/// and this sits in the middle of it.
+const END_BEAT_ONSET_DB: f64 = -16.0;
 
-/// How far past a bar line the last struck sound may sit and still be taken
-/// as landing *on* it.
+/// The bar line, counted from `first_downbeat`, where the music stops.
 ///
-/// [`music_end_frame`] returns the last thing struck, so the music's final
-/// bar line is the first one at or after it — `ceil`, not `round`: a track
-/// whose last hit falls on beat 2 still fills the bar it is in. But a hit
-/// exactly on the final bar line is detected a window or two late, and plain
-/// `ceil` would hand that one a whole extra bar. Measured across the 14
-/// masters in `testdata/`, the last hit sits either within 0.08 bar *after* a
-/// bar line (five of them, all ending on a downbeat hit) or at least 0.22 bar
-/// after one, with nothing in between; this sits in that gap.
-const ANCHOR_ONSET_SLACK_BARS: f64 = 0.15;
-
-/// How far back from the file end to look for the last music.
-const TAIL_SCAN_SECONDS: f64 = 90.0;
-/// Envelope resolution. 50 ms is short enough to sit inside the gap between
-/// two beats at 180 BPM (333 ms) and long enough not to fall between the
-/// samples of a bass note's own cycle.
-const TAIL_WINDOW_SECONDS: f64 = 0.05;
-/// Where in the scanned window's own level distribution "this is the music
-/// playing" sits. The 75th percentile is above the beat-to-beat gaps and
-/// below the transients, and is unmoved by a tail short enough to matter.
-const TAIL_REFERENCE_PERCENTILE: f64 = 0.75;
-/// How far below that reference a window has to fall to count as no longer
-/// music.
+/// Not where the *file* stops: masters ring out and then pad with silence,
+/// and every one of the 14 in `testdata/` does, from 0.64 bars to 3.86. Nor
+/// where the last transient is: a track can end on a crash sitting right on
+/// the final bar line (`… - 06 Love & Joy`) or stop after a bar the last
+/// transient never reached (`… - 03 Shuki Shuki Song`), so no rounding rule
+/// applied to "the last onset" gets both — measured, the fractional bar
+/// positions of the last onset on the ear-verified tracks want rounding *up*
+/// at 0.47 and *down* at 0.23 and 0.65.
 ///
-/// The binding case is a fade-out, not silence: `AntonFer - … - 09 Sakura
-/// Photograph` plays at full level until 6 bars before the file ends and then
-/// decays -16, -25, -32, -42, -49 dB per bar. At -20 dB the first bar of that
-/// decay still counted as music and the anchor landed a bar late, which the
-/// labeler heard as a 16-bar candidate clicking 15 bars before the end.
+/// What does separate them is whether the *rhythm* is still running: a bar of
+/// music has an onset on every beat, a bar of decay has one at most. So this
+/// takes the last bar whose four beats all carry an onset above
+/// [`END_BEAT_ONSET_DB`], and returns the line after it. A terminal one-shot
+/// on the next line is then exactly where the music ends, which is what the
+/// ear reports on all four verified tracks.
 ///
-/// Swept over the 14 masters in `testdata/`: from -24 to -6 dB, thirteen of
-/// them give the same anchor at every setting — only the fade-out track moves,
-/// and it settles on its ear-verified answer from -18 dB down. This sits in
-/// the middle of that plateau.
-const TAIL_SILENCE_DB: f64 = -14.0;
-/// How much louder a window has to be than the one before it to count as
-/// something being struck rather than something still ringing. A tail only
-/// decays, so this is what separates the last hit from the reverb after it.
-const TAIL_ONSET_RISE: f64 = 1.6;
-
-/// The last frame of the track that still carries music, which is not the
-/// same thing as the last frame of the file.
-///
-/// [`outro_anchor_frame`] counts every outro candidate back from the end, on
-/// the "production ends on a bar boundary" convention. Masters do end on a
-/// bar boundary — and then let the reverb ring out, and then pad with digital
-/// silence. Measured across the 14 masters in `testdata/`, every single one
-/// has such a tail, from 0.64 bars (`… - 07 Starmine`) to 3.86
-/// (`… - 09 Sakura Photograph`). Anchoring on `total_frames` therefore places
-/// every candidate that far *late*: on
-/// `Surya Groxyn - … - 03 Shuki Shuki Song`, whose kick stops 2.59 bars before
-/// the file does, the candidate labeled 16 bars was landing 13 bars before the
-/// music ended — which is exactly what the labeler heard and reported
-/// (HANDOFF §11-2).
-///
-/// Found by level: a 50 ms RMS envelope over the tail, a reference level from
-/// its own 75th percentile, and the last window that both clears
-/// [`TAIL_SILENCE_DB`] and is louder than the one before it — the last thing
-/// *struck*, since a tail only decays. Thresholding on level alone instead
-/// stops at an arbitrary point part way down the decay, which measured
-/// half a bar late on `… - 06 Love & Joy`. The threshold is relative to the
-/// track, so it needs no absolute calibration;
-/// [`ANCHOR_ONSET_SLACK_BARS`] covers the detection latency.
-pub fn music_end_frame(buffer: &AudioBuffer, analysis: &TrackAnalysis) -> u64 {
-    music_end_frame_with(buffer, analysis, TAIL_SILENCE_DB, TAIL_ONSET_RISE)
-}
-
-/// [`music_end_frame`] with its two thresholds exposed, so
-/// `examples/music_end_sweep.rs` can measure how the answer moves with them.
-pub fn music_end_frame_with(
+/// `bar_frames` is the analyzer's period; the grid only has to be good enough
+/// to sort onsets into beats, which a half-beat of accumulated drift does not
+/// threaten. Returns `None` when the track is too short to scan or carries no
+/// onsets at all, leaving the caller on the file end.
+pub fn music_end_bar(
     buffer: &AudioBuffer,
     analysis: &TrackAnalysis,
-    silence_db: f64,
-    onset_rise: f64,
-) -> u64 {
-    let sr = f64::from(buffer.sample_rate);
-    let total = buffer.frames as usize;
-    let win = (TAIL_WINDOW_SECONDS * sr).round() as usize;
-    if sr < 1.0 || total == 0 || win == 0 || buffer.samples.len() < total * 2 {
-        return analysis.total_frames;
+    bar_frames: f64,
+) -> Option<u32> {
+    let total = buffer.frames as f64;
+    let first_downbeat = analysis.first_downbeat as f64;
+    if !(bar_frames.is_finite() && bar_frames > 1.0) || total <= first_downbeat {
+        return None;
     }
-    let scan = ((TAIL_SCAN_SECONDS * sr).round() as usize).min(total);
-    let start = total - scan;
+    let last_bar = ((total - first_downbeat) / bar_frames).floor();
+    if !(last_bar.is_finite() && last_bar >= 2.0) {
+        return None;
+    }
+    let last_bar = last_bar as u32;
+    let first_bar = last_bar.saturating_sub(END_SCAN_BARS);
+    if last_bar - first_bar < 4 {
+        return None;
+    }
 
-    let mut levels: Vec<(usize, f64)> = Vec::with_capacity(scan / win + 1);
-    let mut at = start;
-    while at + win <= total {
-        let mut sum = 0.0f64;
-        for f in at..at + win {
-            let mono = f64::from(buffer.samples[f * 2] + buffer.samples[f * 2 + 1]) * 0.5;
-            sum += mono * mono;
+    let scan_start = (first_downbeat + f64::from(first_bar) * bar_frames).max(0.0) as usize;
+    let mono: Vec<f32> = buffer.samples[scan_start * 2..]
+        .chunks_exact(2)
+        .map(|f| (f[0] + f[1]) * 0.5)
+        .collect();
+    let flux = funkot_core::analysis::onset_flux_envelope(&mono);
+    if flux.is_empty() {
+        return None;
+    }
+    let hop = funkot_core::analysis::ONSET_FLUX_HOP as f64;
+    let at = |frames_from_scan: f64| -> usize {
+        ((frames_from_scan / hop).round().max(0.0) as usize).min(flux.len())
+    };
+
+    // Per bar: the strength of its weakest beat (is the rhythm running?) and
+    // of its typical one (what does a bar of this track look like?).
+    let mut weakest = Vec::with_capacity((last_bar - first_bar) as usize);
+    let mut typical = Vec::with_capacity((last_bar - first_bar) as usize);
+    for bar in first_bar..last_bar {
+        let mut beats = [0.0f64; BEATS_PER_BAR as usize];
+        for (b, slot) in beats.iter_mut().enumerate() {
+            let from = (f64::from(bar - first_bar) + b as f64 / f64::from(BEATS_PER_BAR))
+                * bar_frames;
+            let to = (f64::from(bar - first_bar) + (b + 1) as f64 / f64::from(BEATS_PER_BAR))
+                * bar_frames;
+            *slot = flux[at(from)..at(to)]
+                .iter()
+                .copied()
+                .fold(0.0f64, f64::max);
         }
-        levels.push((at, (sum / win as f64).sqrt()));
-        at += win;
-    }
-    if levels.len() < 8 {
-        return analysis.total_frames;
+        let mut sorted = beats;
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("flux values are finite"));
+        weakest.push((bar, sorted[0]));
+        typical.push(0.5 * (sorted[1] + sorted[2]));
     }
 
-    let mut sorted: Vec<f64> = levels.iter().map(|&(_, rms)| rms).collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("rms values are finite"));
-    let reference = sorted[((sorted.len() as f64 * TAIL_REFERENCE_PERCENTILE) as usize)
-        .min(sorted.len() - 1)];
+    let mut reference = typical.clone();
+    reference.sort_by(|a, b| a.partial_cmp(b).expect("flux values are finite"));
+    let reference = reference[reference.len() / 2];
     if !(reference > 0.0) {
-        return analysis.total_frames;
+        return None;
     }
-    let threshold = reference * 10f64.powf(silence_db / 20.0);
+    let threshold = reference * 10f64.powf(END_BEAT_ONSET_DB / 20.0);
 
-    // Prefer the last window where something was *struck*: a tail only
-    // decays, so the last rise above the threshold is the final hit, whereas
-    // the last window merely above the threshold is an arbitrary point part
-    // way down the decay. On `Surya Groxyn - … - 06 Love & Joy` that
-    // difference is half a bar, which is the difference between rounding onto
-    // the right bar line and the next one.
-    let last_onset = levels
-        .windows(2)
-        .rev()
-        .find(|pair| pair[1].1 >= threshold && pair[1].1 > pair[0].1 * onset_rise)
-        .map(|pair| pair[1].0);
-    let last_audible = levels
+    weakest
         .iter()
         .rev()
-        .find(|&&(_, rms)| rms >= threshold)
-        .map(|&(at, _)| at + win);
-    match last_onset.or(last_audible) {
-        Some(at) => (at as u64).min(analysis.total_frames),
-        None => analysis.total_frames,
-    }
+        .find(|&&(_, strength)| strength >= threshold)
+        .map(|&(bar, _)| bar + 1)
 }
 
 /// Shortest lever arm, in beats from `first_downbeat`, a reference point has
@@ -592,7 +548,7 @@ const REFIT_MIN_AGREEING_POINTS: usize = 3;
 pub fn outro_bar_frames_refit(
     buffer: &AudioBuffer,
     analysis: &TrackAnalysis,
-    music_end: u64,
+    outro_anchor: u64,
 ) -> f64 {
     let bar_nominal = bar_frames_for(analysis, Side::Outro);
     let beat_nominal = bar_nominal / f64::from(BEATS_PER_BAR);
@@ -606,8 +562,7 @@ pub fn outro_bar_frames_refit(
     for &bars in OUTRO_CANDIDATES.iter() {
         let grid = ClickGrid {
             bar_frames: bar_nominal,
-            music_end,
-            anchor_slack_bars: ANCHOR_ONSET_SLACK_BARS,
+            outro_anchor: outro_anchor as i64,
         };
         let nominal = boundary_frame_on_grid(analysis, Side::Outro, bars, grid);
         let locked = lock_boundary_to_groove(buffer, nominal, bar_nominal, NORMAL_HALF_WIDTH_BARS);
@@ -644,52 +599,31 @@ pub fn outro_bar_frames_refit(
 /// The grid the guide clicks are actually built on, measured against the
 /// audio: the analyzer's period for intro candidates (propagated at most 96
 /// bars, where drift is negligible), and for outro candidates the refined
-/// period ([`outro_bar_frames_refit`]) counted back from the end of the music
-/// ([`music_end_frame`]) rather than the end of the file.
+/// period ([`outro_bar_frames_refit`]) with candidates counted back from
+/// where the music ends ([`music_end_bar`]) rather than where the file does.
+///
+/// Composition matters here. The end of the music is found on the analyzer's
+/// grid — it only has to sort onsets into beats — and comes back as a *bar
+/// index*, which is drift-free by construction. The period is then refined,
+/// and the anchor rebuilt from the same index on the refined period, so the
+/// two corrections do not have to agree about frames.
 pub fn click_grid(buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) -> ClickGrid {
-    match side {
-        Side::Intro => ClickGrid::nominal(analysis, Side::Intro),
-        Side::Outro => {
-            let music_end = music_end_frame(buffer, analysis);
-            ClickGrid {
-                bar_frames: outro_bar_frames_refit(buffer, analysis, music_end),
-                music_end,
-                anchor_slack_bars: ANCHOR_ONSET_SLACK_BARS,
-            }
-        }
+    if side == Side::Intro {
+        return ClickGrid::nominal(analysis, Side::Intro);
+    }
+    let nominal = ClickGrid::nominal(analysis, Side::Outro);
+    let Some(end_bar) = music_end_bar(buffer, analysis, nominal.bar_frames) else {
+        return nominal;
+    };
+    let first_downbeat = analysis.first_downbeat as f64;
+    let anchor_nominal = (first_downbeat + f64::from(end_bar) * nominal.bar_frames).round() as u64;
+    let bar_frames = outro_bar_frames_refit(buffer, analysis, anchor_nominal);
+    ClickGrid {
+        bar_frames,
+        outro_anchor: (first_downbeat + f64::from(end_bar) * bar_frames).round() as i64,
     }
 }
 
-/// Move a nominal boundary by less than half a beat, onto the beat grid the
-/// music inside the listening window actually plays.
-///
-/// Neither analysis marker is accurate enough to place a click track on its
-/// own:
-///
-/// - The outro side counts back from `total_frames`, on the analyzer's
-///   "production ends on a bar boundary" convention. That holds to within a
-///   bar, not within a sample: measured across the real masters in
-///   `testdata/`, `(total_frames - first_downbeat) mod beat` is spread over
-///   the whole ±0.5 beat range. For `AntonFer - … - 02 IVY.flac` it is
-///   +0.494 beat — every click in the outro preview landed on the off-beat,
-///   which is the bug this exists to fix.
-/// - The intro side counts forward from `first_downbeat`, which is refined to
-///   a kick but still measured tens of bars away from the window being
-///   played, and is off by ~0.2 beat on some masters.
-///
-/// Two anchors that were tried and rejected, both measured on real audio:
-/// snapping the file end onto `first_downbeat + n × intro_bpm beats` breaks
-/// tracks whose end is already right (the tempo estimate's error accumulates
-/// to a full half beat over `Nicho - … - 04 Boom Boom Pow.flac`), and locking
-/// to the last few bars of the file breaks any master that fades into
-/// silence (`DimsR - … - 10 Shirube.flac`, `AntonFer - … - 09 Sakura
-/// Photograph.flac` — their final bars carry no onsets at all). The window
-/// the user is about to hear is the only evidence that is both local and
-/// guaranteed to contain the music being labeled.
-///
-/// The shift is always under half a beat, so bar identity — which bar the
-/// candidate names — comes from the analysis markers exactly as before. This
-/// is not the ±1/±2-beat coarse alignment HANDOFF §3/§8 rules out.
 pub fn lock_boundary_to_groove(
     buffer: &AudioBuffer,
     nominal: i64,
@@ -1765,68 +1699,227 @@ mod tests {
         );
     }
 
-    // --- outro tempo refit -------------------------------------------------
+    // --- outro grid: where the music ends, and how long a bar is -----------
 
     /// How far `pos` sits from the nearest bar head of the *true* grid the
-    /// fixture's music was synthesized on, in beats. Zero means the guide
-    /// click would fire on a downbeat; ±1 means it fires on a beat, but the
-    /// wrong one, which is the audible failure `outro_bar_frames_refit`
-    /// exists to remove.
+    /// fixture's music was synthesized on, in beats.
     fn beats_from_true_bar_head(pos: i64, first_downbeat: u64, beat_true: f64) -> f64 {
         let bars = (pos - first_downbeat as i64) as f64 / (beat_true * 4.0);
         (bars - bars.round()) * 4.0
     }
 
-    /// Fixture shaped like `Nicho - … - 04 Boom Boom Pow`: the music is on an
-    /// exact grid, but the analyzer's tempo is slightly wrong, so the grid
-    /// propagated from `first_downbeat` to the outro has drifted past the
-    /// half-beat point by the time the outro candidates are placed.
-    fn drifting_tempo_fixture(rel_tempo_error: f64) -> (AudioBuffer, TrackAnalysis, f64) {
+    /// `music_bars` of grid music, then whatever the caller appends. The
+    /// analyzer's tempo is off by `rel_tempo_error`, as it is by up to 0.04%
+    /// on real masters.
+    fn end_fixture(
+        music_bars: u32,
+        rel_tempo_error: f64,
+    ) -> (Vec<f32>, u32, u64, f64, TrackAnalysis) {
         let sr = 22_050u32;
         let bpm_true = 180.0;
         let beat_true = f64::from(sr) * 60.0 / bpm_true; // 7350 exactly
-        let first_downbeat = 1_820u64; // Shuki Shuki Song's own value
-        let music_beats = 1_024u64;
-        // End the file a fraction of a beat past the last beat, as every real
-        // master does, so `outro_anchor_frame`'s rounding is in play too.
-        let total = first_downbeat
-            + (beat_true * music_beats as f64).round() as u64
-            + (beat_true * 0.3).round() as u64;
+        let first_downbeat = 1_820u64;
+        let music_frames =
+            first_downbeat + (beat_true * 4.0 * f64::from(music_bars)).round() as u64;
         let samples =
-            synth_gridded_dense_loud_stereo(total as usize, sr, first_downbeat, beat_true);
+            synth_gridded_dense_loud_stereo(music_frames as usize, sr, first_downbeat, beat_true);
+        let analysis = sample_analysis(
+            sr,
+            bpm_true / (1.0 + rel_tempo_error),
+            bpm_true / (1.0 + rel_tempo_error),
+            first_downbeat,
+            music_frames,
+        );
+        (samples, sr, first_downbeat, beat_true, analysis)
+    }
+
+    fn finish(
+        samples: Vec<f32>,
+        sr: u32,
+        analysis: &TrackAnalysis,
+    ) -> (AudioBuffer, TrackAnalysis) {
+        let frames = (samples.len() / 2) as u64;
         let buffer = AudioBuffer {
             sample_rate: sr,
-            frames: total,
+            frames,
             samples,
         };
-        // The analyzer reports a tempo that is off by `rel_tempo_error`; the
-        // bar length it implies is what drifts.
-        let bpm_reported = bpm_true / (1.0 + rel_tempo_error);
-        let analysis = sample_analysis(sr, bpm_reported, bpm_reported, first_downbeat, total);
-        (buffer, analysis, beat_true)
+        let analysis = sample_analysis(
+            sr,
+            analysis.intro_bpm,
+            analysis.outro_bpm,
+            analysis.first_downbeat,
+            frames,
+        );
+        (buffer, analysis)
+    }
+
+    /// Ring-out: a decaying chord, then silence. Every master in `testdata/`
+    /// ends this way, from 0.64 bars to 3.86. Partials rather than noise on
+    /// purpose -- a reverb tail has almost no spectral flux in it, which is
+    /// exactly why flux can tell it apart from a bar of music, and noise
+    /// would fake an onset in every frame.
+    fn push_decaying_tail(
+        samples: &mut Vec<f32>,
+        bars: f64,
+        silence_bars: f64,
+        beat_true: f64,
+        sr: u32,
+    ) {
+        let bar = beat_true * 4.0;
+        let tail = (bar * bars).round() as usize;
+        let sr_f = f64::from(sr);
+        for i in 0..tail {
+            let t = i as f64 / sr_f;
+            let env = (-(i as f64) / (tail as f64 * 0.35)).exp() as f32;
+            let mut v = 0.0f32;
+            for (freq, amp) in [(220.0, 0.5), (330.0, 0.35), (440.0, 0.25)] {
+                v += amp * (2.0 * std::f64::consts::PI * freq * t).sin() as f32;
+            }
+            let v = v * env * 0.6;
+            samples.push(v);
+            samples.push(v);
+        }
+        let silence = (bar * silence_bars).round() as usize;
+        samples.extend(std::iter::repeat(0.0).take(silence * 2));
+    }
+
+    #[test]
+    fn music_end_bar_is_the_line_after_the_last_bar_the_rhythm_runs_through() {
+        let (mut samples, sr, _, beat_true, analysis) = end_fixture(120, 0.0);
+        push_decaying_tail(&mut samples, 2.6, 0.4, beat_true, sr);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
+        assert_eq!(
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            Some(120),
+            "the ring-out and the silence after it are not music"
+        );
+    }
+
+    /// The shape of `Surya Groxyn - … - 06 Love & Joy`: the last thing struck
+    /// is a one-shot sitting on the final bar line, with only decay after it.
+    /// That line *is* the end -- counting the bar it opens as still playing
+    /// (which is what a rule based on "the last onset" does) puts every
+    /// candidate a bar late, which is what the labeler reported.
+    #[test]
+    fn music_end_bar_treats_a_terminal_one_shot_as_the_end_not_a_bar_of_music() {
+        let (mut samples, sr, first_downbeat, beat_true, analysis) = end_fixture(120, 0.0);
+        // One loud hit exactly on bar line 120, then the ring-out.
+        let hit = (0.25 * f64::from(sr)) as usize;
+        let mut state = 0xBEEF_0001u32;
+        for i in 0..hit {
+            let env = (-(i as f64) / (0.10 * f64::from(sr))).exp() as f32;
+            let v = xorshift32(&mut state) * 0.9 * env;
+            samples.push(v);
+            samples.push(v);
+        }
+        push_decaying_tail(&mut samples, 2.0, 0.4, beat_true, sr);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
+        let _ = first_downbeat;
+        assert_eq!(
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            Some(120)
+        );
+    }
+
+    /// The shape of `Yukitama & Zhenz - … - 05 Kimi to Semi Blue`: the last
+    /// bars are well down in level but still play on every beat. They are
+    /// music, and stopping before them puts every candidate a bar early.
+    #[test]
+    fn music_end_bar_keeps_a_quiet_bar_that_still_plays_on_every_beat() {
+        let (mut samples, sr, first_downbeat, beat_true, analysis) = end_fixture(120, 0.0);
+        // Take the last two bars down to a third (-10 dB), like a master that
+        // pulls the faders before it stops.
+        let bar = (beat_true * 4.0) as usize;
+        let from = samples.len() - 2 * bar * 2;
+        for v in samples[from..].iter_mut() {
+            *v *= 0.30;
+        }
+        push_decaying_tail(&mut samples, 2.0, 0.4, beat_true, sr);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
+        let _ = first_downbeat;
+        assert_eq!(
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            Some(120),
+            "quiet bars that still carry every beat are music"
+        );
+    }
+
+    #[test]
+    fn music_end_bar_drops_a_fade_that_has_gone_far_enough_down() {
+        let (mut samples, sr, _, beat_true, analysis) = end_fixture(120, 0.0);
+        let bar = (beat_true * 4.0) as usize;
+        // -28 dB: past the point where a labeler still counts it as the track
+        // playing (measured separation is 12 dB wide; this is well outside).
+        let from = samples.len() - 4 * bar * 2;
+        for v in samples[from..].iter_mut() {
+            *v *= 0.04;
+        }
+        push_decaying_tail(&mut samples, 1.0, 0.4, beat_true, sr);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
+        assert_eq!(
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            Some(116),
+            "a fade this far down is the outro dying, not bars of music"
+        );
+    }
+
+    #[test]
+    fn outro_candidates_count_back_from_the_music_not_the_file() {
+        let (mut samples, sr, first_downbeat, beat_true, analysis) = end_fixture(120, 0.0);
+        push_decaying_tail(&mut samples, 2.6, 0.4, beat_true, sr);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
+        let bar = beat_true * 4.0;
+
+        let grid = click_grid(&buffer, &analysis, Side::Outro);
+        let anchor_bars = (grid.outro_anchor as f64 - first_downbeat as f64) / bar;
+        assert!(
+            (anchor_bars - 120.0).abs() < 0.05,
+            "anchor sits at bar {anchor_bars:.3}, want the music's last line (120)"
+        );
+
+        for &bars in OUTRO_CANDIDATES.iter() {
+            let with = boundary_frame_on_grid(&analysis, Side::Outro, bars, grid);
+            let off = beats_from_true_bar_head(with, first_downbeat, beat_true);
+            assert!(off.abs() <= 0.15, "{bars}bars: {off:+.3} beat off a bar head");
+
+            let file_anchored = boundary_frame_on_grid(
+                &analysis,
+                Side::Outro,
+                bars,
+                ClickGrid::nominal(&analysis, Side::Outro),
+            );
+            let late = (file_anchored - with) as f64 / bar;
+            assert!(
+                late >= 2.0,
+                "{bars}bars: file-anchored candidate only {late:+.2} bar late; \
+                 the fixture is not exercising the tail"
+            );
+        }
     }
 
     #[test]
     fn outro_refit_stops_the_lock_from_having_to_rescue_a_drifted_grid() {
-        // 0.04% is the worst tempo error measured across `testdata/`
-        // (`Nicho - … - 04 Boom Boom Pow`). Over a thousand beats it leaves
-        // every outro candidate a third of a beat or more off the music, which
-        // `lock_boundary_to_groove` can still just about rescue — that is the
-        // fragility being removed, so the assertions are on the *nominal*
-        // positions the lock is handed.
-        let (buffer, analysis, beat_true) = drifting_tempo_fixture(0.0004);
-        let first_downbeat = analysis.first_downbeat;
+        // 0.04% is the worst tempo error measured across `testdata/`; over a
+        // thousand beats it leaves every candidate a third of a beat or more
+        // off the music, which the lock can still just about rescue. That
+        // fragility is what the refit removes, so the assertions are on the
+        // nominal positions the lock is handed.
+        let (mut samples, sr, first_downbeat, beat_true, analysis) = end_fixture(256, 0.0004);
+        push_decaying_tail(&mut samples, 2.0, 0.4, beat_true, sr);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
         let bar_nominal = bar_frames_for(&analysis, Side::Outro);
-        let music_end = music_end_frame(&buffer, &analysis);
+        let anchor = (first_downbeat as f64 + 256.0 * bar_nominal).round() as u64;
 
-        let bar_refit = outro_bar_frames_refit(&buffer, &analysis, music_end);
-        let beat_refit = bar_refit / f64::from(BEATS_PER_BAR);
+        let bar_refit = outro_bar_frames_refit(&buffer, &analysis, anchor);
         assert!(
-            (beat_refit / beat_true - 1.0).abs() < 1e-4,
-            "refit should recover the real beat period: {beat_refit:.3} vs true {beat_true:.3}"
+            (bar_refit / (beat_true * 4.0) - 1.0).abs() < 1e-4,
+            "refit should recover the real bar length: {bar_refit:.3} vs {:.3}",
+            beat_true * 4.0
         );
 
-        let mut worst_nominal_without = 0.0f64;
+        let grid = click_grid(&buffer, &analysis, Side::Outro);
+        let mut worst_without = 0.0f64;
         for &bars in OUTRO_CANDIDATES.iter() {
             let without = boundary_frame_on_grid(
                 &analysis,
@@ -1834,233 +1927,56 @@ mod tests {
                 bars,
                 ClickGrid {
                     bar_frames: bar_nominal,
-                    music_end,
-                    anchor_slack_bars: ANCHOR_ONSET_SLACK_BARS,
+                    outro_anchor: anchor as i64,
                 },
             );
-            worst_nominal_without = worst_nominal_without
+            worst_without = worst_without
                 .max(beats_from_true_bar_head(without, first_downbeat, beat_true).abs());
 
-            let with = boundary_frame_on_grid(
-                &analysis,
-                Side::Outro,
-                bars,
-                ClickGrid {
-                    bar_frames: bar_refit,
-                    music_end,
-                    anchor_slack_bars: ANCHOR_ONSET_SLACK_BARS,
-                },
-            );
+            let with = boundary_frame_on_grid(&analysis, Side::Outro, bars, grid);
             let off = beats_from_true_bar_head(with, first_downbeat, beat_true);
             assert!(
                 off.abs() <= 0.1,
                 "{bars}bars: refit nominal sits {off:+.3} beat from a bar head, so the \
-                 lock is still being asked to rescue it (want |off| <= 0.1)"
-            );
-
-            let locked = locked_boundary_frame(
-                &buffer,
-                &analysis,
-                Side::Outro,
-                bars,
-                NORMAL_HALF_WIDTH_BARS,
-            );
-            let locked_off = beats_from_true_bar_head(locked, first_downbeat, beat_true);
-            assert!(
-                locked_off.abs() <= 0.15,
-                "{bars}bars: refit boundary sits {locked_off:+.3} beat from a bar head"
+                 lock is still being asked to rescue it"
             );
         }
         assert!(
-            worst_nominal_without >= 0.25,
+            worst_without >= 0.25,
             "fixture is not exercising the drift: worst pre-refit nominal was only \
-             {worst_nominal_without:+.3} beat off a bar head"
+             {worst_without:+.3} beat off a bar head"
         );
     }
 
     #[test]
     fn outro_refit_leaves_an_already_correct_tempo_alone() {
-        let (buffer, analysis, beat_true) = drifting_tempo_fixture(0.0);
+        let (mut samples, sr, first_downbeat, beat_true, analysis) = end_fixture(256, 0.0);
+        push_decaying_tail(&mut samples, 2.0, 0.4, beat_true, sr);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
         let bar_nominal = bar_frames_for(&analysis, Side::Outro);
-        let bar_refit =
-            outro_bar_frames_refit(&buffer, &analysis, music_end_frame(&buffer, &analysis));
+        let anchor = (first_downbeat as f64 + 256.0 * bar_nominal).round() as u64;
+        let bar_refit = outro_bar_frames_refit(&buffer, &analysis, anchor);
         assert!(
             (bar_refit / bar_nominal - 1.0).abs() < 1e-4,
             "refit moved an exact tempo by {:+.5}%",
             (bar_refit / bar_nominal - 1.0) * 100.0
         );
-        for &bars in OUTRO_CANDIDATES.iter() {
-            let locked = locked_boundary_frame(
-                &buffer,
-                &analysis,
-                Side::Outro,
-                bars,
-                NORMAL_HALF_WIDTH_BARS,
-            );
-            let off = beats_from_true_bar_head(locked, analysis.first_downbeat, beat_true);
-            assert!(
-                off.abs() <= 0.15,
-                "{bars}bars: boundary drifted {off:+.3} beat off a bar head on an exact tempo"
-            );
-        }
+        let _ = beat_true;
     }
 
     #[test]
-    fn outro_refit_falls_back_when_there_is_too_little_track_to_measure() {
-        // Two bars of audio: every candidate is either past the file start or
-        // too close to `first_downbeat` to say anything about the period, so
-        // the analyzer's value has to survive untouched.
-        let sr = 22_050u32;
-        let bpm = 180.0;
-        let beat = f64::from(sr) * 60.0 / bpm;
-        let first_downbeat = 100u64;
-        let total = first_downbeat + (beat * 8.0).round() as u64;
-        let samples = synth_gridded_dense_loud_stereo(total as usize, sr, first_downbeat, beat);
-        let buffer = AudioBuffer {
-            sample_rate: sr,
-            frames: total,
-            samples,
-        };
-        let analysis = sample_analysis(sr, bpm, bpm, first_downbeat, total);
+    fn outro_grid_falls_back_when_there_is_too_little_track_to_measure() {
+        let (samples, sr, first_downbeat, _, analysis) = end_fixture(2, 0.0);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
         assert_eq!(
-            outro_bar_frames_refit(&buffer, &analysis, music_end_frame(&buffer, &analysis)),
-            bar_frames_for(&analysis, Side::Outro)
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            None
         );
-    }
-
-    /// Real masters keep ringing after the last thing is struck, and then
-    /// pad with silence: every master in `testdata/` does, from 0.64 bars to
-    /// 3.86. Appends that shape to the fixture so the anchor has to find the
-    /// music's own end rather than the file's.
-    fn with_decaying_tail(
-        buffer: AudioBuffer,
-        tail_bars: f64,
-        silence_bars: f64,
-        beat_true: f64,
-    ) -> AudioBuffer {
-        let bar = beat_true * 4.0;
-        let tail = (bar * tail_bars).round() as usize;
-        let silence = (bar * silence_bars).round() as usize;
-        let mut samples = buffer.samples;
-        let mut state = 0x1234_5678u32;
-        for i in 0..tail {
-            let env = (-(i as f64) / (tail as f64 * 0.35)).exp() as f32;
-            let v = xorshift32(&mut state) * 0.5 * env;
-            samples.push(v);
-            samples.push(v);
-        }
-        samples.extend(std::iter::repeat(0.0).take(silence * 2));
-        let frames = buffer.frames + tail as u64 + silence as u64;
-        AudioBuffer {
-            sample_rate: buffer.sample_rate,
-            frames,
-            samples,
-        }
-    }
-
-    #[test]
-    fn outro_anchor_counts_back_from_the_last_hit_not_the_file_end() {
-        let (music, analysis_music, beat_true) = drifting_tempo_fixture(0.0);
-        let music_frames = music.frames;
-        let buffer = with_decaying_tail(music, 2.6, 0.4, beat_true);
-        // The analysis still describes the whole file, tail included, exactly
-        // as the analyzer would report it.
-        let analysis = sample_analysis(
-            buffer.sample_rate,
-            analysis_music.intro_bpm,
-            analysis_music.outro_bpm,
-            analysis_music.first_downbeat,
-            buffer.frames,
-        );
-        let bar = beat_true * 4.0;
-
-        let music_end = music_end_frame(&buffer, &analysis);
-        let missed = (music_frames as f64 - music_end as f64) / bar;
-        assert!(
-            missed.abs() <= 0.15,
-            "music end found {missed:+.3} bar away from where the music actually stopped"
-        );
-
         let grid = click_grid(&buffer, &analysis, Side::Outro);
-        for &bars in OUTRO_CANDIDATES.iter() {
-            let with = boundary_frame_on_grid(&analysis, Side::Outro, bars, grid);
-            let off = beats_from_true_bar_head(with, analysis.first_downbeat, beat_true);
-            assert!(
-                off.abs() <= 0.15,
-                "{bars}bars: boundary sits {off:+.3} beat off a bar head"
-            );
-            // The whole point: the same candidate anchored on `total_frames`
-            // lands the length of the tail later, which is what put the
-            // 16-bar candidate 13 bars before the end of Shuki Shuki Song.
-            let file_anchored = boundary_frame_on_grid(
-                &analysis,
-                Side::Outro,
-                bars,
-                ClickGrid {
-                    bar_frames: grid.bar_frames,
-                    music_end: buffer.frames,
-                    anchor_slack_bars: grid.anchor_slack_bars,
-                },
-            );
-            let late = (file_anchored - with) as f64 / bar;
-            assert!(
-                late >= 2.0,
-                "{bars}bars: file-anchored candidate was only {late:+.2} bar late, \
-                 so the fixture is not exercising the tail"
-            );
-        }
-    }
-
-    /// Masters that fade out rather than stopping are the case that pins
-    /// `TAIL_SILENCE_DB`: the fade is still music by any absolute measure, but
-    /// the bar it starts on is where the labeler hears the track end, and
-    /// counting candidates back from inside the fade puts every one of them a
-    /// bar late (`AntonFer - … - 09 Sakura Photograph`).
-    fn with_fade_out(
-        buffer: AudioBuffer,
-        fade_bars: f64,
-        silence_bars: f64,
-        beat_true: f64,
-    ) -> (AudioBuffer, u64) {
-        let bar = beat_true * 4.0;
-        let fade = (bar * fade_bars).round() as usize;
-        let silence = (bar * silence_bars).round() as usize;
-        let mut samples = buffer.samples;
-        let full_level_end = buffer.frames.saturating_sub(fade as u64);
-        for s in samples.iter_mut().skip(full_level_end as usize * 2) {
-            *s *= 0.12; // -18 dB: unmistakably still playing, unmistakably not the body
-        }
-        samples.extend(std::iter::repeat(0.0).take(silence * 2));
-        let frames = buffer.frames + silence as u64;
-        (
-            AudioBuffer {
-                sample_rate: buffer.sample_rate,
-                frames,
-                samples,
-            },
-            full_level_end,
-        )
-    }
-
-    #[test]
-    fn music_end_stops_where_a_fade_out_starts_not_where_it_becomes_inaudible() {
-        let (music, analysis_music, beat_true) = drifting_tempo_fixture(0.0);
-        let (buffer, fade_start) = with_fade_out(music, 4.0, 1.0, beat_true);
-        let analysis = sample_analysis(
-            buffer.sample_rate,
-            analysis_music.intro_bpm,
-            analysis_music.outro_bpm,
-            analysis_music.first_downbeat,
-            buffer.frames,
-        );
-        let bar = beat_true * 4.0;
-
-        let music_end = music_end_frame(&buffer, &analysis);
-        let off = (music_end as f64 - fade_start as f64) / bar;
-        assert!(
-            off.abs() <= 0.25,
-            "music end came out {off:+.3} bar from where the fade starts; a positive \
-             value means the fade was counted as music, which lands every candidate late"
+        assert_eq!(grid, ClickGrid::nominal(&analysis, Side::Outro));
+        assert_eq!(
+            outro_bar_frames_refit(&buffer, &analysis, first_downbeat),
+            bar_frames_for(&analysis, Side::Outro)
         );
     }
 }

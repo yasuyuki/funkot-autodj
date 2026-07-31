@@ -578,6 +578,32 @@ const LOCK_CLEAR_WIN_RATIO: f64 = 1.05;
 /// grid there — agrees with the analyzer's own intro downbeat to within a
 /// few hundredths of a beat.
 fn broadband_onset_flux(mono: &[f32]) -> Vec<f64> {
+    let mut out = onset_flux_envelope(mono);
+    if out.is_empty() {
+        return out;
+    }
+    let mut sorted = out.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    for v in out.iter_mut() {
+        *v = (*v - median).max(0.0);
+    }
+    out
+}
+
+/// Frames between successive values of [`onset_flux_envelope`].
+pub const ONSET_FLUX_HOP: usize = FLUX_HOP;
+
+/// The same envelope as [`broadband_onset_flux`], without the median
+/// subtraction: half-wave-rectified magnitude difference summed over the
+/// spectrum, one value per [`ONSET_FLUX_HOP`] frames.
+///
+/// The median is a sensible baseline when the question is "where are the
+/// onsets in this window" and every window is music. It is the wrong one when
+/// the question is "has the music stopped": subtract the median of a slice
+/// that is mostly music and the quiet-but-still-playing bars at the end go to
+/// zero along with the silence after them.
+pub fn onset_flux_envelope(mono: &[f32]) -> Vec<f64> {
     if mono.len() < FLUX_WIN + FLUX_HOP {
         return Vec::new();
     }
@@ -608,12 +634,6 @@ fn broadband_onset_flux(mono: &[f32]) -> Vec<f64> {
             prev[k] = m;
         }
         out.push(sum);
-    }
-    let mut sorted = out.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[sorted.len() / 2];
-    for v in out.iter_mut() {
-        *v = (*v - median).max(0.0);
     }
     out
 }

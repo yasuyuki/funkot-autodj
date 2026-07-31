@@ -75,20 +75,16 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
         let grid = click_grid(&buf, &analysis, side);
         let beat = grid.bar_frames / 4.0;
         if side == Side::Outro {
-            let bars_to_music_end =
-                (grid.music_end as f64 - analysis.first_downbeat as f64) / grid.bar_frames;
+            let anchor_bars =
+                (grid.outro_anchor as f64 - analysis.first_downbeat as f64) / grid.bar_frames;
             println!(
                 "  outro period refit: {:.3} -> {:.3} frames/beat ({:+.4}%)\n  \
-                 last hit {:.3} bars before EOF, {:.3} bars from fd; \
-                 anchor lands {:.3} bar after it",
+                 music ends {:.3} bars before EOF, at bar {:.2} from fd",
                 bar_frames_for(&analysis, side) / 4.0,
                 beat,
                 (grid.bar_frames / bar_frames_for(&analysis, side) - 1.0) * 100.0,
-                (analysis.total_frames - grid.music_end) as f64 / grid.bar_frames,
-                bars_to_music_end,
-                (boundary_frame_on_grid(&analysis, Side::Outro, 0, grid) as f64
-                    - grid.music_end as f64)
-                    / grid.bar_frames,
+                (analysis.total_frames as f64 - grid.outro_anchor as f64) / grid.bar_frames,
+                anchor_bars,
             );
         }
         for &bars in side.candidates() {
