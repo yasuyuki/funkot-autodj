@@ -105,7 +105,9 @@ pub struct TrackAnalysis {
     /// the structural boundary is never farther from the file end than the
     /// mix trigger derived from it. True by construction since cache version
     /// 10: `analysis::outro_trigger_bars` never returns less than the
-    /// boundary it is handed. `0` only in stripped/manual-only cache entries pending
+    /// boundary it is handed. Hand-edited triggers don't go through that rule,
+    /// so `cache::set_manual_bars` / `cache::apply_manual_overrides` lower this
+    /// field to match instead. `0` only in stripped/manual-only cache entries pending
     /// reanalysis (see `cache::purge_auto`); a completed analysis always
     /// sets a real value. Added in cache version 9; absent (defaults to 0)
     /// on entries written before that, but those are already invalidated by
