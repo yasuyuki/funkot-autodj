@@ -200,7 +200,12 @@ fn rhythm_vectors(feats: &[BarFeatures]) -> Vec<Vec<f64>> {
         .collect()
 }
 
-fn combined_vectors(feats: &[BarFeatures]) -> Vec<Vec<f64>> {
+/// The exact 21-dim vector (7-band log energy + 12-bin chroma + tonality +
+/// voiced_frac) [`compute`] hands to [`mahalanobis_from_prefix`]. `pub` only
+/// so diagnostics (`examples/section_diag.rs`) can report a per-dimension
+/// breakdown of the prefix model without duplicating this layout; `compute`
+/// and `mahalanobis_from_prefix` themselves are unaffected by this being `pub`.
+pub fn combined_vectors(feats: &[BarFeatures]) -> Vec<Vec<f64>> {
     feats
         .iter()
         .map(|f| {

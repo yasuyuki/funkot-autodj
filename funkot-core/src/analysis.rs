@@ -2313,6 +2313,14 @@ pub struct SectionDiag {
     /// intro-prefix-model / novelty computation as `intro_structure`, not a
     /// separately time-reversed variant.
     pub outro_structure: Option<crate::structure::StructureSignals>,
+    /// Number of leading bars (of `intro`) that fall entirely inside the
+    /// analysis scan window and were actually fed to `intro_structure`.
+    /// `features::bar_features` zero-fills bars outside its window (see its
+    /// doc), and those zero-filled bars must never reach `structure::compute`
+    /// — see [`bar_diag_rows`]. `0` unless `with_new_features` was set.
+    pub intro_covered: usize,
+    /// Same as [`Self::intro_covered`], for `outro` / `outro_structure`.
+    pub outro_covered: usize,
 }
 
 /// Compute per-bar features for intro (forward) and outro (backward) scan
@@ -2362,14 +2370,14 @@ pub fn diagnose_section_bars_ext(
     let head_window = with_new_features.then_some((head.as_slice(), 0u64));
     let tail_window = with_new_features.then_some((tail.as_slice(), tail_start));
 
-    let (intro, intro_new_feats) = bar_diag_rows(
+    let (intro, intro_new_feats, intro_covered) = bar_diag_rows(
         buffer,
         first_downbeat,
         intro_bar_len,
         SectionDir::Forward,
         head_window,
     )?;
-    let (outro, outro_new_feats) = bar_diag_rows(
+    let (outro, outro_new_feats, outro_covered) = bar_diag_rows(
         buffer,
         buffer.frames,
         outro_bar_len,
@@ -2377,34 +2385,75 @@ pub fn diagnose_section_bars_ext(
         tail_window,
     )?;
 
-    let intro_structure = intro_new_feats
-        .as_deref()
-        .map(|f| crate::structure::compute(f, crate::structure::DEFAULT_PREFIX_BARS));
-    let outro_structure = outro_new_feats
-        .as_deref()
-        .map(|f| crate::structure::compute(f, crate::structure::DEFAULT_PREFIX_BARS));
+    // Only the leading `*_covered` bars are real window audio; the rest are
+    // `BarFeatures::default()` zero-fill and must not reach `structure::compute`
+    // (see `bar_diag_rows`).
+    let intro_structure = intro_new_feats.as_deref().and_then(|f| {
+        (intro_covered > 0).then(|| {
+            crate::structure::compute(&f[..intro_covered], crate::structure::DEFAULT_PREFIX_BARS)
+        })
+    });
+    let outro_structure = outro_new_feats.as_deref().and_then(|f| {
+        (outro_covered > 0).then(|| {
+            crate::structure::compute(&f[..outro_covered], crate::structure::DEFAULT_PREFIX_BARS)
+        })
+    });
 
     Ok(SectionDiag {
         intro,
         outro,
         intro_structure,
         outro_structure,
+        intro_covered,
+        outro_covered,
     })
 }
 
+/// Per-bar diagnostics for one side (intro or outro), plus the Stage 2
+/// feature vectors and how many leading bars of them are safe to feed to
+/// [`crate::structure::compute`].
+///
+/// `window` bounds the audio [`crate::features::bar_features`] actually has
+/// samples for; bars whose `[start, start + bar_len_frames)` span is not
+/// fully inside it come back as `BarFeatures::default()` (all-zero — see that
+/// function's doc), which would otherwise contaminate the SSM/novelty/
+/// prefix-Mahalanobis signals with fake structure. `covered` is the number of
+/// leading bars (bar 0 first, matching `starts`' anchor-nearest-first order
+/// on both the forward intro side and the backward outro side) that are
+/// fully inside the window, determined purely from bar position vs window
+/// bounds — never from whether a bar's features happen to be zero, which
+/// would also drop genuinely silent bars. Scanned front-to-back and stopped
+/// at the first bar that falls outside the window, since both scan
+/// directions lay bars out contiguously from the window's near edge.
 fn bar_diag_rows(
     buffer: &AudioBuffer,
     anchor: u64,
     bar_len: f64,
     dir: SectionDir,
     window: Option<(&[f32], u64)>,
-) -> Result<(Vec<BarDiag>, Option<Vec<crate::features::BarFeatures>>)> {
+) -> Result<(Vec<BarDiag>, Option<Vec<crate::features::BarFeatures>>, usize)> {
     let bar_len_frames = bar_len.round().max(1.0) as u64;
     let starts = section_bar_starts(buffer, anchor, bar_len_frames, dir);
     let feats = bar_features(buffer, &starts, bar_len_frames);
     let new_feats = window.map(|(mono, offset)| {
         crate::features::bar_features(mono, offset, buffer.sample_rate, &starts, bar_len_frames)
     });
+    let covered = match window {
+        Some((mono, offset)) => {
+            let win_end = offset.saturating_add(mono.len() as u64);
+            let mut c = 0usize;
+            for &start in &starts {
+                let end = start.saturating_add(bar_len_frames);
+                if start >= offset && end <= win_end {
+                    c += 1;
+                } else {
+                    break;
+                }
+            }
+            c
+        }
+        None => 0,
+    };
     let rows = feats
         .into_iter()
         .enumerate()
@@ -2425,7 +2474,7 @@ fn bar_diag_rows(
             new_features: new_feats.as_ref().and_then(|v| v.get(i).copied()),
         })
         .collect();
-    Ok((rows, new_feats))
+    Ok((rows, new_feats, covered))
 }
 
 #[derive(Clone, Copy)]
