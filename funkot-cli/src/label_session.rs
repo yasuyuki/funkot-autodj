@@ -485,6 +485,110 @@ pub fn music_end_bar(
         .map(|&(bar, _)| bar + 1)
 }
 
+/// Bars folded together to read a section's bar phase. Long enough that a few
+/// atypical bars cannot carry the answer, short enough to sit inside one
+/// section of the arrangement.
+const PHASE_WINDOW_BARS: u32 = 48;
+/// Bars skipped at each end of the track before folding, so the window never
+/// includes the count-in or the ring-out.
+const PHASE_EDGE_BARS: u32 = 4;
+/// How far the quietest beat slot must sit below the next quietest before the
+/// fold is allowed to name it.
+///
+/// Measured across `testdata/` the margin is 0.9–2.5 dB where the answer is
+/// readable at all, and five of the fourteen masters are a wash on at least
+/// one side — dense arrangements with no dynamic bar shape. Those must come
+/// back `None` and leave the grid alone rather than pick a slot out of noise.
+const PHASE_CLEAR_DB: f64 = 0.8;
+
+/// Beats the outro's own bars sit *later* than the `first_downbeat` grid says.
+///
+/// Bar identity comes from `first_downbeat` and is counted forward, which
+/// assumes the master's own bars never move against that grid. Three of the
+/// fourteen masters in `testdata/` break the assumption — somewhere mid-track
+/// a section is spliced in a beat short or long, and every outro candidate
+/// then clicks on the wrong beat of the bar. No tempo refinement or
+/// end-detection fix can reach it: the anchor is quantised to integer bars on
+/// the grid that has already slipped.
+///
+/// What reads the slip is the bar's dynamic shape. Dance masters put the lift
+/// before the downbeat, so the fourth beat is the quietest of the four; fold
+/// the track over the bar near the intro and near the outro, and if the
+/// quietest slot has moved, the bars have. The answer is the distance it
+/// moved. Deliberately relative: which slot is quietest in absolute terms is a
+/// musical assumption, but *that it is the same slot at both ends* is a
+/// property of the grid, and it is the grid that is in question.
+///
+/// Returns 0 when either window is a wash ([`PHASE_CLEAR_DB`]) or the track is
+/// too short to hold two disjoint windows — i.e. leaves the propagated grid
+/// alone unless there is evidence against it.
+///
+/// Ear-verified on all four masters put in front of a listener as A/B clips
+/// (`examples/outro_phase_ab`): `03. KazuyaP - Monitoring Db` +2 beats,
+/// `… - 04 Eternal Light` +3, `… - 06 Love & Joy` +1, and
+/// `… - 05 Kimi to Semi Blue` unshifted, each matching this measurement.
+pub fn outro_beat_phase_shift(
+    buffer: &AudioBuffer,
+    analysis: &TrackAnalysis,
+    bar_frames: f64,
+    end_bar: u32,
+) -> u32 {
+    let win = PHASE_WINDOW_BARS;
+    let edge = PHASE_EDGE_BARS;
+    if !(bar_frames.is_finite() && bar_frames > 1.0) || end_bar < 2 * (win + edge) {
+        return 0;
+    }
+    let mono: Vec<f32> = buffer
+        .samples
+        .chunks_exact(2)
+        .map(|f| (f[0] + f[1]) * 0.5)
+        .collect();
+    let fd = analysis.first_downbeat as f64;
+
+    let intro = quietest_beat_slot(&mono, fd, bar_frames, edge, edge + win);
+    let outro = quietest_beat_slot(&mono, fd, bar_frames, end_bar - edge - win, end_bar - edge);
+    match (intro, outro) {
+        (Some(qi), Some(qo)) => (qo + BEATS_PER_BAR - qi) % BEATS_PER_BAR,
+        _ => 0,
+    }
+}
+
+/// Which beat slot of the `first_downbeat` bar is quietest over `[lo, hi)`
+/// bars, or `None` when the four are too close for the answer to mean
+/// anything. Mean square rather than onset flux: the statistic is the lift
+/// *taken out* before the downbeat, which is an absence of level, and flux
+/// reads the hat that often still runs through it.
+fn quietest_beat_slot(mono: &[f32], fd: f64, bar_frames: f64, lo: u32, hi: u32) -> Option<u32> {
+    let beat_frames = bar_frames / f64::from(BEATS_PER_BAR);
+    let mut power = [0.0f64; BEATS_PER_BAR as usize];
+    for bar in lo..hi {
+        for (beat, slot) in power.iter_mut().enumerate() {
+            let from = fd + f64::from(bar) * bar_frames + beat as f64 * beat_frames;
+            *slot += mean_square(mono, from, from + beat_frames);
+        }
+    }
+    let db: Vec<f64> = power
+        .iter()
+        .map(|v| 10.0 * v.max(1e-12).log10())
+        .collect();
+    let mut order: Vec<usize> = (0..db.len()).collect();
+    order.sort_by(|&a, &b| db[a].partial_cmp(&db[b]).expect("levels are finite"));
+    (db[order[1]] - db[order[0]] >= PHASE_CLEAR_DB).then_some(order[0] as u32)
+}
+
+fn mean_square(mono: &[f32], from: f64, to: f64) -> f64 {
+    let i0 = (from.max(0.0) as usize).min(mono.len());
+    let i1 = (to.max(0.0) as usize).min(mono.len());
+    if i1 <= i0 {
+        return 0.0;
+    }
+    let sum: f64 = mono[i0..i1]
+        .iter()
+        .map(|&s| f64::from(s) * f64::from(s))
+        .sum();
+    sum / (i1 - i0) as f64
+}
+
 /// Shortest lever arm, in beats from `first_downbeat`, a reference point has
 /// to sit at before its position says anything useful about the beat period.
 const REFIT_MIN_LEVER_BEATS: f64 = 64.0;
@@ -606,7 +710,11 @@ pub fn outro_bar_frames_refit(
 /// grid — it only has to sort onsets into beats — and comes back as a *bar
 /// index*, which is drift-free by construction. The period is then refined,
 /// and the anchor rebuilt from the same index on the refined period, so the
-/// two corrections do not have to agree about frames.
+/// two corrections do not have to agree about frames. Last, the bar index is
+/// offset by whatever [`outro_beat_phase_shift`] finds the master's own bars
+/// have slipped against the propagated grid, which is the one error the other
+/// two cannot express: they move the anchor by whole bars and by fractions of
+/// a beat respectively, never by a beat.
 pub fn click_grid(buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) -> ClickGrid {
     if side == Side::Intro {
         return ClickGrid::nominal(analysis, Side::Intro);
@@ -618,9 +726,11 @@ pub fn click_grid(buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) ->
     let first_downbeat = analysis.first_downbeat as f64;
     let anchor_nominal = (first_downbeat + f64::from(end_bar) * nominal.bar_frames).round() as u64;
     let bar_frames = outro_bar_frames_refit(buffer, analysis, anchor_nominal);
+    let shift = outro_beat_phase_shift(buffer, analysis, bar_frames, end_bar);
+    let end = f64::from(end_bar) + f64::from(shift) / f64::from(BEATS_PER_BAR);
     ClickGrid {
         bar_frames,
-        outro_anchor: (first_downbeat + f64::from(end_bar) * bar_frames).round() as i64,
+        outro_anchor: (first_downbeat + end * bar_frames).round() as i64,
     }
 }
 
@@ -1879,6 +1989,110 @@ mod tests {
             music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
             Some(116),
             "a fade this far down is the outro dying, not bars of music"
+        );
+    }
+
+    /// A master whose own bars have slipped `shift` beats against the
+    /// `first_downbeat` grid by the time the outro arrives. The lift before
+    /// the downbeat -- the level taken out of the bar's last beat, which is
+    /// what the fold reads -- sits in grid slot 3 for the first half and in
+    /// slot `(3 + shift) % 4` for the second, which is how a section spliced
+    /// a beat short looks from the grid's side. Nothing else about the track
+    /// changes: the tempo is exact and every beat still carries a kick, so
+    /// only the bar phase can explain what comes out.
+    fn phase_slip_fixture(music_bars: u32, shift: u32) -> (AudioBuffer, TrackAnalysis) {
+        let (mut samples, sr, first_downbeat, beat_true, analysis) = end_fixture(music_bars, 0.0);
+        let quiet_from = |bar: u32| {
+            let slot = if bar < music_bars / 2 {
+                3
+            } else {
+                (3 + shift) % BEATS_PER_BAR
+            };
+            first_downbeat as f64 + (f64::from(bar * BEATS_PER_BAR + slot)) * beat_true
+        };
+        for bar in 0..music_bars {
+            let from = quiet_from(bar);
+            let i0 = (from.round() as usize).min(samples.len() / 2);
+            let i1 = ((from + beat_true).round() as usize).min(samples.len() / 2);
+            for v in samples[i0 * 2..i1 * 2].iter_mut() {
+                *v *= 0.25;
+            }
+        }
+        push_decaying_tail(&mut samples, 2.6, 0.4, beat_true, sr);
+        finish(samples, sr, &analysis)
+    }
+
+    #[test]
+    fn outro_beat_phase_shift_reads_bars_that_slipped_mid_track() {
+        for shift in 1..BEATS_PER_BAR {
+            let (buffer, analysis) = phase_slip_fixture(120, shift);
+            let bar_frames = bar_frames_for(&analysis, Side::Outro);
+            let end_bar = music_end_bar(&buffer, &analysis, bar_frames).expect("has an end");
+            assert_eq!(
+                outro_beat_phase_shift(&buffer, &analysis, bar_frames, end_bar),
+                shift,
+                "the outro's bars sit {shift} beat(s) past the propagated grid"
+            );
+        }
+    }
+
+    #[test]
+    fn outro_beat_phase_shift_leaves_a_steady_grid_alone() {
+        let (buffer, analysis) = phase_slip_fixture(120, 0);
+        let bar_frames = bar_frames_for(&analysis, Side::Outro);
+        let end_bar = music_end_bar(&buffer, &analysis, bar_frames).expect("has an end");
+        assert_eq!(
+            outro_beat_phase_shift(&buffer, &analysis, bar_frames, end_bar),
+            0
+        );
+    }
+
+    /// Five of the fourteen masters in `testdata/` are a wash on at least one
+    /// side -- dense arrangements with no dynamic bar shape to read. Naming a
+    /// slot there would move every outro candidate on noise, so the fold has
+    /// to decline and leave the propagated grid standing.
+    #[test]
+    fn outro_beat_phase_shift_declines_when_the_bar_has_no_shape() {
+        let (buffer, analysis) = {
+            let (samples, sr, _, _, analysis) = end_fixture(120, 0.0);
+            finish(samples, sr, &analysis)
+        };
+        let bar_frames = bar_frames_for(&analysis, Side::Outro);
+        let mono: Vec<f32> = buffer
+            .samples
+            .chunks_exact(2)
+            .map(|f| (f[0] + f[1]) * 0.5)
+            .collect();
+        assert_eq!(
+            quietest_beat_slot(&mono, analysis.first_downbeat as f64, bar_frames, 4, 52),
+            None,
+            "every beat of this fixture carries a kick and hats; there is no lift to find"
+        );
+    }
+
+    /// A track too short to hold two disjoint windows cannot be measured, and
+    /// an unmeasurable track must not be moved.
+    #[test]
+    fn outro_beat_phase_shift_declines_on_a_track_too_short_to_measure() {
+        let (buffer, analysis) = phase_slip_fixture(60, 2);
+        let bar_frames = bar_frames_for(&analysis, Side::Outro);
+        assert_eq!(
+            outro_beat_phase_shift(&buffer, &analysis, bar_frames, 60),
+            0
+        );
+    }
+
+    #[test]
+    fn outro_candidates_follow_the_slipped_bar_phase() {
+        let (buffer, analysis) = phase_slip_fixture(120, 2);
+        let grid = click_grid(&buffer, &analysis, Side::Outro);
+        let beat = grid.bar_frames / f64::from(BEATS_PER_BAR);
+        let anchor_beats =
+            (grid.outro_anchor as f64 - analysis.first_downbeat as f64) / beat;
+        assert!(
+            (anchor_beats - (120.0 * 4.0 + 2.0)).abs() < 0.05,
+            "anchor sits {anchor_beats:.2} beats past the downbeat, \
+             want the music's last line plus the 2-beat slip (482)"
         );
     }
 

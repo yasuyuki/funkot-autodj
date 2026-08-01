@@ -16,8 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use funkot_cli::label_session::{
-    build_candidate_clip_on_grid, click_grid, ClickGrid, ClickOptions, Side,
-    NORMAL_HALF_WIDTH_BARS,
+    bar_frames_for, build_candidate_clip_on_grid, click_grid, music_end_bar,
+    outro_beat_phase_shift, ClickGrid, ClickOptions, Side, NORMAL_HALF_WIDTH_BARS,
 };
 use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
 use funkot_core::{cache, decode::decode_file};
@@ -55,6 +55,13 @@ fn render(
     let beat_frames = grid.bar_frames / 4.0;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
     let opts = ClickOptions::default();
+
+    // What the grid already corrected for, so a listener reading these clips
+    // knows whether `plus0` is the propagated grid or an already-shifted one.
+    let applied = music_end_bar(&buf, &analysis, bar_frames_for(&analysis, Side::Outro))
+        .map(|end_bar| outro_beat_phase_shift(&buf, &analysis, grid.bar_frames, end_bar))
+        .unwrap_or(0);
+    println!("{stem}  (grid already applies +{applied} beat)");
 
     for beats in 0..4i64 {
         let shifted = ClickGrid {
