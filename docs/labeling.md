@@ -40,6 +40,23 @@ PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
 クリック位置や候補の出方を変えたら、聴く前に**必ず上のビルドをやり直す**
 （症状: 直したはずのずれがラベリング中だけ再現する）。
 
+## 大量の曲を扱うとき
+
+`-l LIST.txt` に自分のライブラリのファイルを直接並べてよい。**変換して置き直す必要はない。**
+
+- **ALAC(m4a) は変換不要。** symphonia が直接読む（`alac` + `isomp4` feature）。
+  実測で、同じ音源の ALAC と FLAC の解析結果は完全一致した
+- symphonia が読めない形式（Opus / WMA / AIFF / APE 等）は、`ffmpeg` が PATH にあれば
+  自動で FLAC へ変換して読む。変換物は `FUNKOT_CONVERT_DIR`（既定
+  `$XDG_CACHE_HOME/funkot-autodj/converted`）に**元ファイルの content_hash 名**で
+  キャッシュされ、2回目以降は ffmpeg を起動しない
+- **曲の正体は常に元ファイル。** `labels.tsv` と `funkot-cache` のキーは元ファイルの
+  content_hash なので、**変換キャッシュを消しても ffmpeg を上げても、手で付けたラベルは
+  そのまま有効**。ディスクが厳しくなったらキャッシュごと消してよい
+- **`./dev.sh`（Docker）には ffmpeg が入っていない。** 未対応形式をコンテナ内で渡すと
+  「ffmpeg が無い」と言って失敗する。ラベリングはホスト実行なので実用上は問題ない
+- ライブラリが read-only マウントでも動く（変換物を元ファイルの隣に置かないため）
+
 ## 操作
 
 `y`/Enter 採用 · `←`/`→` 候補移動 · `+` ±8/±16小節切替 · `r` 頭から再生し直し ·

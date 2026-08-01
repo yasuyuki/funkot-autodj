@@ -16,6 +16,7 @@
 
 pub mod analysis;
 pub mod cache;
+pub mod convert;
 pub mod decode;
 pub mod engine;
 pub mod features;
