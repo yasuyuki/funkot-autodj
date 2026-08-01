@@ -93,10 +93,15 @@ pub enum LabelOutcome {
     Replay,
     /// Both sides labeled; caller persists and moves to the next track.
     Done { intro: LabelChoice, outro: LabelChoice },
-    /// Skip this track: write nothing, move on.
+    /// Skip this track: no label side is confirmed here. The caller is
+    /// still responsible for persisting a note typed before `s`, if any --
+    /// see [`TrackSession::note`] and [`TrackSession::intro_choice`].
     Skip,
     /// Stop the whole session. Already-finished tracks were saved as they
-    /// completed, so there is nothing left to flush here.
+    /// completed, but the *current* track's session state is not: the
+    /// caller must persist whatever [`TrackSession::note`] and
+    /// [`TrackSession::intro_choice`] hold before dropping this session, the
+    /// same as for [`LabelOutcome::Skip`].
     Quit,
 }
 
@@ -148,6 +153,14 @@ impl TrackSession {
 
     pub fn note(&self) -> &str {
         &self.note
+    }
+
+    /// The intro side's confirmed choice, if `y` has already been pressed
+    /// on it this session (i.e. the session has moved on to the outro
+    /// side). `None` before that, including for a track abandoned by
+    /// [`LabelKey::Skip`]/[`LabelKey::Quit`] while still on the intro side.
+    pub fn intro_choice(&self) -> Option<&LabelChoice> {
+        self.intro_choice.as_ref()
     }
 
     /// `Some(selected bar values, ascending)` while in ambiguous-set mode.
@@ -1219,6 +1232,35 @@ mod tests {
             LabelOutcome::Continue
         );
         assert_eq!(s.note(), "clean drop");
+    }
+
+    // A `Skip`/`Quit` after `n` must not lose the note (or an already
+    // -confirmed intro side): the caller reads both back off the session
+    // to persist them, since neither `LabelOutcome` variant carries them.
+    #[test]
+    fn note_survives_skip_with_no_side_confirmed() {
+        let mut s = TrackSession::new(8, 8);
+        s.apply_key(LabelKey::Note("no candidate fits here".to_string()));
+        assert_eq!(s.apply_key(LabelKey::Skip), LabelOutcome::Skip);
+        assert_eq!(s.note(), "no candidate fits here");
+        assert_eq!(s.intro_choice(), None);
+    }
+
+    #[test]
+    fn note_and_intro_choice_survive_quit_on_the_outro_side() {
+        let mut s = TrackSession::new(32, 8);
+        match s.apply_key(LabelKey::Accept) {
+            LabelOutcome::Replay => {}
+            other => panic!("expected Replay (advancing to outro), got {other:?}"),
+        }
+        assert_eq!(s.current_side(), Side::Outro);
+        s.apply_key(LabelKey::Note("outro doesn't match any candidate".to_string()));
+        assert_eq!(s.apply_key(LabelKey::Quit), LabelOutcome::Quit);
+        assert_eq!(s.note(), "outro doesn't match any candidate");
+        assert_eq!(
+            s.intro_choice(),
+            Some(&LabelChoice { best: 32, ok: Vec::new() })
+        );
     }
 
     #[test]

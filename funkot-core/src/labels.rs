@@ -14,9 +14,14 @@
 //! content_hash	file_name	intro_best	intro_ok	outro_best	outro_ok	note
 //! ```
 //!
-//! - `intro_best` / `outro_best`: the single best bar count (integer).
+//! - `intro_best` / `outro_best`: the single best bar count (integer), or
+//!   empty. Empty means that side has not been labeled yet — e.g. a row
+//!   written for its `note` alone (see `funkot-cli`'s `--label-sections`
+//!   `s`/`q` handling), or a hand-edited file recording only one side so
+//!   far. A row with both sides empty is legal and only carries a note.
 //! - `intro_ok` / `outro_ok`: pipe-separated set of additionally acceptable
-//!   bar counts (e.g. `32|48`). Empty means only `best` is acceptable.
+//!   bar counts (e.g. `32|48`). Empty means only `best` is acceptable (or,
+//!   when `best` is itself empty, that there is no acceptable set at all).
 //! - `note`: free text, may be empty. On load it may itself contain tabs
 //!   (it is always the last field on the line, so [`load_labels`] doesn't
 //!   need to split on them); [`save_labels`] replaces any tabs/newlines it
@@ -47,14 +52,16 @@ pub struct SectionLabel {
     pub hash: String,
     /// Original file name, informational only (not used to identify the track).
     pub file_name: String,
-    /// Best intro length in bars.
-    pub intro_best: u32,
+    /// Best intro length in bars, or `None` if the intro side hasn't been
+    /// labeled yet (see module docs).
+    pub intro_best: Option<u32>,
     /// Additional acceptable intro lengths, as parsed from the file (does
     /// not necessarily include `intro_best`; callers that need the full
     /// tolerant set should union it in).
     pub intro_ok: Vec<u32>,
-    /// Best outro *structural boundary* length in bars (see module docs).
-    pub outro_best: u32,
+    /// Best outro *structural boundary* length in bars (see module docs),
+    /// or `None` if the outro side hasn't been labeled yet.
+    pub outro_best: Option<u32>,
     /// Additional acceptable outro lengths, as parsed from the file.
     pub outro_ok: Vec<u32>,
     /// Free-text note, may be empty.
@@ -62,21 +69,25 @@ pub struct SectionLabel {
 }
 
 impl SectionLabel {
-    /// `intro_ok` plus `intro_best`, deduplicated. This is the set an
-    /// estimate should be checked against for "tolerant" correctness.
+    /// `intro_ok` plus `intro_best` (if labeled), deduplicated. This is the
+    /// set an estimate should be checked against for "tolerant" correctness.
+    /// If `intro_best` is `None`, this is just the deduplicated `intro_ok`
+    /// list.
     pub fn intro_ok_set(&self) -> Vec<u32> {
         ok_set(self.intro_best, &self.intro_ok)
     }
 
-    /// `outro_ok` plus `outro_best`, deduplicated.
+    /// `outro_ok` plus `outro_best` (if labeled), deduplicated.
     pub fn outro_ok_set(&self) -> Vec<u32> {
         ok_set(self.outro_best, &self.outro_ok)
     }
 }
 
-fn ok_set(best: u32, extra: &[u32]) -> Vec<u32> {
+fn ok_set(best: Option<u32>, extra: &[u32]) -> Vec<u32> {
     let mut set = Vec::with_capacity(extra.len() + 1);
-    set.push(best);
+    if let Some(best) = best {
+        set.push(best);
+    }
     for &v in extra {
         if !set.contains(&v) {
             set.push(v);
@@ -132,9 +143,9 @@ fn parse_row(raw_line: &str, line_no: usize) -> Result<SectionLabel> {
         )));
     }
     let file_name = fields[1].trim().to_string();
-    let intro_best = parse_u32(fields[2], line_no, "intro_best")?;
+    let intro_best = parse_u32_opt(fields[2], line_no, "intro_best")?;
     let intro_ok = parse_ok_list(fields[3], line_no, "intro_ok")?;
-    let outro_best = parse_u32(fields[4], line_no, "outro_best")?;
+    let outro_best = parse_u32_opt(fields[4], line_no, "outro_best")?;
     let outro_ok = parse_ok_list(fields[5], line_no, "outro_ok")?;
     let note = fields[6].to_string();
     Ok(SectionLabel {
@@ -148,12 +159,21 @@ fn parse_row(raw_line: &str, line_no: usize) -> Result<SectionLabel> {
     })
 }
 
-fn parse_u32(field: &str, line_no: usize, name: &str) -> Result<u32> {
-    field.trim().parse::<u32>().map_err(|e| {
-        Error::Labels(format!(
-            "labels line {line_no}: {name} '{field}' is not a non-negative integer: {e}"
-        ))
-    })
+/// Parses a `best` column: empty (after trim) means "not labeled yet"
+/// (`None`); anything else must be a valid non-negative integer.
+fn parse_u32_opt(field: &str, line_no: usize, name: &str) -> Result<Option<u32>> {
+    let trimmed = field.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|e| {
+            Error::Labels(format!(
+                "labels line {line_no}: {name} '{field}' is not a non-negative integer: {e}"
+            ))
+        })
 }
 
 fn parse_ok_list(field: &str, line_no: usize, name: &str) -> Result<Vec<u32>> {
@@ -197,9 +217,9 @@ fn render_row(label: &SectionLabel) -> String {
         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
         sanitize_field(&label.hash),
         file_name,
-        label.intro_best,
+        render_opt(label.intro_best),
         render_ok_list(&label.intro_ok),
-        label.outro_best,
+        render_opt(label.outro_best),
         render_ok_list(&label.outro_ok),
         note,
     )
@@ -207,6 +227,11 @@ fn render_row(label: &SectionLabel) -> String {
 
 fn sanitize_field(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
+}
+
+/// Renders a `best` column: `None` as an empty field, `Some(v)` as `v`.
+fn render_opt(v: Option<u32>) -> String {
+    v.map(|v| v.to_string()).unwrap_or_default()
 }
 
 fn render_ok_list(values: &[u32]) -> String {
@@ -285,18 +310,18 @@ mod tests {
             SectionLabel {
                 hash: "aaaa1111".to_string(),
                 file_name: "track-a.flac".to_string(),
-                intro_best: 32,
+                intro_best: Some(32),
                 intro_ok: vec![48],
-                outro_best: 32,
+                outro_best: Some(32),
                 outro_ok: vec![],
                 note: "clean drop".to_string(),
             },
             SectionLabel {
                 hash: "bbbb2222".to_string(),
                 file_name: "track-b.flac".to_string(),
-                intro_best: 16,
+                intro_best: Some(16),
                 intro_ok: vec![],
-                outro_best: 48,
+                outro_best: Some(48),
                 outro_ok: vec![32, 64],
                 note: String::new(),
             },
@@ -338,7 +363,7 @@ bbbb2222\ttrack-b.flac\t16\t\t48\t32|64\t
         save_labels(f.path(), &sample_labels()).unwrap();
 
         let mut replacement = sample_labels()[0].clone();
-        replacement.intro_best = 64;
+        replacement.intro_best = Some(64);
         replacement.note = "revised".to_string();
         upsert_label(f.path(), replacement.clone()).unwrap();
 
@@ -356,9 +381,9 @@ bbbb2222\ttrack-b.flac\t16\t\t48\t32|64\t
         let new_label = SectionLabel {
             hash: "cccc3333".to_string(),
             file_name: "track-c.flac".to_string(),
-            intro_best: 8,
+            intro_best: Some(8),
             intro_ok: vec![],
-            outro_best: 8,
+            outro_best: Some(8),
             outro_ok: vec![],
             note: String::new(),
         };
@@ -414,5 +439,93 @@ bbbb2222\ttrack-b.flac\t16\t\t48\t32|64\t
             }
             other => panic!("expected Error::Labels, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_one_side_empty_as_none() {
+        let text = "\
+content_hash\tfile_name\tintro_best\tintro_ok\toutro_best\toutro_ok\tnote
+aaaa1111\ttrack-a.flac\t\t\t32\t\toutro only so far
+";
+        let labels = parse_labels(text).unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].intro_best, None);
+        assert_eq!(labels[0].outro_best, Some(32));
+        assert_eq!(labels[0].note, "outro only so far");
+    }
+
+    #[test]
+    fn parses_both_sides_empty_as_note_only_row() {
+        let text = "\
+content_hash\tfile_name\tintro_best\tintro_ok\toutro_best\toutro_ok\tnote
+aaaa1111\ttrack-a.flac\t\t\t\t\tconstruction boundary, no candidate fits
+";
+        let labels = parse_labels(text).unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].intro_best, None);
+        assert_eq!(labels[0].outro_best, None);
+        assert_eq!(labels[0].intro_ok, Vec::<u32>::new());
+        assert_eq!(labels[0].outro_ok, Vec::<u32>::new());
+        assert_eq!(labels[0].note, "construction boundary, no candidate fits");
+    }
+
+    #[test]
+    fn round_trip_save_and_load_with_none_best() {
+        let f = TempFile::new("roundtrip-none");
+        let labels = vec![
+            SectionLabel {
+                hash: "aaaa1111".to_string(),
+                file_name: "track-a.flac".to_string(),
+                intro_best: None,
+                intro_ok: vec![],
+                outro_best: Some(32),
+                outro_ok: vec![48],
+                note: "intro not labeled yet".to_string(),
+            },
+            SectionLabel {
+                hash: "bbbb2222".to_string(),
+                file_name: "track-b.flac".to_string(),
+                intro_best: None,
+                intro_ok: vec![],
+                outro_best: None,
+                outro_ok: vec![],
+                note: "note only, nothing labeled".to_string(),
+            },
+        ];
+        save_labels(f.path(), &labels).unwrap();
+        let loaded = load_labels(f.path()).unwrap();
+        assert_eq!(loaded, labels);
+    }
+
+    #[test]
+    fn ok_set_is_ok_list_alone_when_best_is_none() {
+        let label = SectionLabel {
+            hash: "aaaa1111".to_string(),
+            file_name: "track-a.flac".to_string(),
+            intro_best: None,
+            intro_ok: vec![16, 32],
+            outro_best: None,
+            outro_ok: vec![],
+            note: String::new(),
+        };
+        assert_eq!(label.intro_ok_set(), vec![16, 32]);
+        assert_eq!(label.outro_ok_set(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn existing_numeric_only_tsv_still_loads() {
+        // Regression guard for backward compatibility: a file written before
+        // best columns could be empty must still parse identically.
+        let text = "\
+content_hash\tfile_name\tintro_best\tintro_ok\toutro_best\toutro_ok\tnote
+aaaa1111\ttrack-a.flac\t32\t48\t32\t\tclean drop
+bbbb2222\ttrack-b.flac\t16\t\t48\t32|64\t
+";
+        let labels = parse_labels(text).unwrap();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].intro_best, Some(32));
+        assert_eq!(labels[0].outro_best, Some(32));
+        assert_eq!(labels[1].intro_best, Some(16));
+        assert_eq!(labels[1].outro_best, Some(48));
     }
 }

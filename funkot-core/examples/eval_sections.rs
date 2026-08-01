@@ -245,6 +245,7 @@ fn run(opts: &Opts) -> Result<(), String> {
     let mut decode_errors = 0usize;
     let mut analyze_errors = 0usize;
     let mut unlabeled = 0usize;
+    let mut partial_labels = 0usize;
     let mut seen_hashes: Vec<String> = Vec::new();
     let mut records: Vec<TrackEval> = Vec::new();
 
@@ -261,6 +262,18 @@ fn run(opts: &Opts) -> Result<(), String> {
 
         let Some(label) = by_hash.get(&hash) else {
             unlabeled += 1;
+            continue;
+        };
+
+        // A row with only one side labeled (the other still `None`, e.g. a
+        // note-only row saved by `--label-sections`'s `s`/`q` handling)
+        // isn't ready to evaluate. While these are rare, mixing partial rows
+        // into the metrics would need per-side sample counts that differ
+        // from every other report here; excluding them keeps the baseline
+        // comparison simple. Revisit with a side-by-side evaluation once
+        // enough partial rows accumulate to matter.
+        let (Some(intro_best), Some(outro_best)) = (label.intro_best, label.outro_best) else {
+            partial_labels += 1;
             continue;
         };
 
@@ -300,14 +313,14 @@ fn run(opts: &Opts) -> Result<(), String> {
             || (a.intro_bpm - a.outro_bpm).abs() >= GRID_BPM_DRIFT_MAX;
 
         let intro_cost = section_cost(
-            label.intro_best,
+            intro_best,
             a.intro_bars,
             &intro_ok,
             INTRO_UNDERESTIMATE_WEIGHT,
             INTRO_OVERESTIMATE_WEIGHT,
         );
         let outro_cost = section_cost(
-            label.outro_best,
+            outro_best,
             outro_pred,
             &outro_ok,
             OUTRO_UNDERESTIMATE_WEIGHT,
@@ -317,12 +330,12 @@ fn run(opts: &Opts) -> Result<(), String> {
         records.push(TrackEval {
             hash: hash.clone(),
             file_name: label.file_name.clone(),
-            intro_true: label.intro_best,
+            intro_true: intro_best,
             intro_ok,
             intro_pred: a.intro_bars,
             intro_low_conf: a.intro_bars_low_confidence,
             intro_cost,
-            outro_true: label.outro_best,
+            outro_true: outro_best,
             outro_ok,
             outro_pred,
             outro_low_conf: a.outro_bars_low_confidence,
@@ -345,6 +358,7 @@ fn run(opts: &Opts) -> Result<(), String> {
     println!("audio files given:{:>4}", files.len());
     println!("evaluated:        {}", records.len());
     println!("unlabeled (skip): {unlabeled}");
+    println!("partial (skip):   {partial_labels} (one side unlabeled, not evaluated)");
     println!("missing audio:    {} (labeled, no matching file given)", missing_audio.len());
     if !missing_audio.is_empty() {
         for l in &missing_audio {
@@ -365,6 +379,7 @@ fn run(opts: &Opts) -> Result<(), String> {
             labels.len(),
             files.len(),
             unlabeled,
+            partial_labels,
             hash_errors,
             decode_errors,
             analyze_errors,
@@ -415,6 +430,7 @@ fn run(opts: &Opts) -> Result<(), String> {
         labels.len(),
         files.len(),
         unlabeled,
+        partial_labels,
         hash_errors,
         decode_errors,
         analyze_errors,
@@ -773,6 +789,9 @@ struct CountsJson {
     audio_files_given: usize,
     evaluated: usize,
     unlabeled: usize,
+    /// Rows with only one side labeled (the other still `None`) — not
+    /// evaluated, see the comment at the exclusion site in `run`.
+    partial_labels: usize,
     missing_audio: usize,
     hash_errors: usize,
     decode_errors: usize,
@@ -799,6 +818,7 @@ fn write_json_if_requested(
     labels_loaded: usize,
     audio_files_given: usize,
     unlabeled: usize,
+    partial_labels: usize,
     hash_errors: usize,
     decode_errors: usize,
     analyze_errors: usize,
@@ -844,6 +864,7 @@ fn write_json_if_requested(
             audio_files_given,
             evaluated: records.len(),
             unlabeled,
+            partial_labels,
             missing_audio: missing_audio.len(),
             hash_errors,
             decode_errors,

@@ -1483,8 +1483,15 @@ fn run_label_sections(
     } else {
         Vec::new()
     };
-    let labeled: std::collections::HashSet<String> =
-        existing.into_iter().map(|l| l.hash).collect();
+    // A row only counts as "labeled" (and so gets skipped on the next run)
+    // once both sides are confirmed. A row with only a note and/or one side
+    // set (see `save_pending_note` / `save_label_and_cache`) is still missing
+    // information, so the track must be offered again.
+    let labeled: std::collections::HashSet<String> = existing
+        .into_iter()
+        .filter(|l| l.intro_best.is_some() && l.outro_best.is_some())
+        .map(|l| l.hash)
+        .collect();
 
     let mut hashes = Vec::with_capacity(playlist.len());
     let mut skipped = 0usize;
@@ -2016,43 +2023,131 @@ fn map_label_key(key: KeyEvent) -> Result<Option<LabelKey>> {
     })
 }
 
-/// Persist one finished track: append/replace its row in `labels.tsv`, then
-/// reflect the intro side onto the analysis cache.
+/// Existing row for `hash` in `labels.tsv`, or `None` if the file doesn't
+/// exist yet, can't be read, or has no row for this track -- any of those
+/// just means there is nothing to merge into, not a fatal error.
+fn existing_label(labels_path: &Path, hash: &str) -> Option<SectionLabel> {
+    if !labels_path.exists() {
+        return None;
+    }
+    funkot_core::labels::load_labels(labels_path)
+        .ok()?
+        .into_iter()
+        .find(|l| l.hash == hash)
+}
+
+/// Persist one track's current state to `labels.tsv`, then (only if the
+/// intro side was confirmed this session) reflect it onto the analysis
+/// cache.
+///
+/// `intro` / `outro` are `None` when that side hasn't been decided in this
+/// session -- e.g. a `note`-only save from `s`/`q` before either side (or
+/// only the intro side) was accepted. Each side is written independently:
+/// a side present here overwrites the stored row; a side absent here keeps
+/// whatever was already on disk for that hash (or stays unset if there was
+/// no prior row), so labeling one side now and the other side in a later
+/// session doesn't clobber the first. `note` is always taken from this
+/// call, since notes are meant to be edited/replaced by the labeler.
+///
+/// Returns the row as written, so callers can report what actually ended up
+/// on disk (which may include a side merged in from an earlier session, not
+/// just what was decided just now).
 fn save_label_and_cache(
     labels_path: &Path,
     cache_dir: &Path,
     hash: &str,
     path: &Path,
-    intro: &label_session::LabelChoice,
-    outro: &label_session::LabelChoice,
+    intro: Option<&label_session::LabelChoice>,
+    outro: Option<&label_session::LabelChoice>,
     note: &str,
-) -> Result<()> {
+) -> Result<SectionLabel> {
+    let existing = existing_label(labels_path, hash);
+    let (intro_best, intro_ok) = match intro {
+        Some(choice) => (Some(choice.best), choice.ok.clone()),
+        None => existing
+            .as_ref()
+            .map(|l| (l.intro_best, l.intro_ok.clone()))
+            .unwrap_or((None, Vec::new())),
+    };
+    let (outro_best, outro_ok) = match outro {
+        Some(choice) => (Some(choice.best), choice.ok.clone()),
+        None => existing
+            .as_ref()
+            .map(|l| (l.outro_best, l.outro_ok.clone()))
+            .unwrap_or((None, Vec::new())),
+    };
+
     let label = SectionLabel {
         hash: hash.to_string(),
         file_name: file_name(path),
-        intro_best: intro.best,
-        intro_ok: intro.ok.clone(),
-        outro_best: outro.best,
-        outro_ok: outro.ok.clone(),
+        intro_best,
+        intro_ok,
+        outro_best,
+        outro_ok,
         note: note.to_string(),
     };
-    upsert_label(labels_path, label).map_err(|e| anyhow::anyhow!("{e}"))?;
+    upsert_label(labels_path, label.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Reflect the intro side onto the cache immediately (so live/render
-    // playback picks it up, and `--purge-auto-cache` keeps it). The outro
-    // side is deliberately *not* written here: `cache::set_manual_bars`'s
-    // `outro` argument sets `TrackAnalysis::outro_bars`, the DJ mix-trigger,
-    // which is *not* a fixed offset from the structural boundary this tool
-    // collects (see `funkot_core::labels` module docs and the
-    // `outro_structure_bars` doc comment in `funkot-core/src/lib.rs`).
-    // Synthesizing a lead-in here to convert one into the other would plant
-    // a guessed value in the cache that the analyzer itself doesn't stand
-    // behind -- the exact outro_bars/outro_structure_bars conflation Stage 0
-    // introduced `outro_structure_bars` to avoid. The cached outro stays
-    // whatever `analysis::analyze` computed; only the label file records the
+    // playback picks it up, and `--purge-auto-cache` keeps it). Only when
+    // this session actually confirmed it: a side merged in from an earlier
+    // row was already reflected to the cache when it was first accepted, so
+    // re-writing it here would be redundant, and skipping it means a
+    // note-only save never touches the cache as a side effect of *reading*
+    // an old row. The outro side is deliberately *not* written here:
+    // `cache::set_manual_bars`'s `outro` argument sets
+    // `TrackAnalysis::outro_bars`, the DJ mix-trigger, which is *not* a
+    // fixed offset from the structural boundary this tool collects (see
+    // `funkot_core::labels` module docs and the `outro_structure_bars` doc
+    // comment in `funkot-core/src/lib.rs`). Synthesizing a lead-in here to
+    // convert one into the other would plant a guessed value in the cache
+    // that the analyzer itself doesn't stand behind -- the exact
+    // outro_bars/outro_structure_bars conflation Stage 0 introduced
+    // `outro_structure_bars` to avoid. The cached outro stays whatever
+    // `analysis::analyze` computed; only the label file records the
     // structural ground truth, for Stage 2+ to use.
-    cache::set_manual_bars(cache_dir, hash, Some(intro.best), None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(intro) = intro {
+        cache::set_manual_bars(cache_dir, hash, Some(intro.best), None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(label)
+}
+
+/// Save whatever note the user typed for the track being abandoned by `s`
+/// (skip) or `q` (quit), so it survives even though the labeling itself
+/// isn't finished. A no-op when no note was typed, so `s`'s "write nothing"
+/// behavior is unchanged for the common case. The intro side is included if
+/// this session confirmed it (`y` on the intro candidate before `s`/`q`);
+/// the outro side is left for `save_label_and_cache` to merge in from any
+/// prior row, since this session never confirmed it -- reaching `Skip`/
+/// `Quit` from the outro side means outro was *not* accepted.
+fn save_pending_note(
+    labels_path: &Path,
+    cache_dir: &Path,
+    hash: &str,
+    path: &Path,
+    session: &TrackSession,
+) -> Result<()> {
+    if session.note().is_empty() {
+        return Ok(());
+    }
+    let label = save_label_and_cache(
+        labels_path,
+        cache_dir,
+        hash,
+        path,
+        session.intro_choice(),
+        None,
+        session.note(),
+    )?;
+    let fmt =
+        |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_else(|| "unlabeled".to_string());
+    println!(
+        "\r  note saved for {} (intro={}, outro={})\r",
+        file_name(path),
+        fmt(label.intro_best),
+        fmt(label.outro_best)
+    );
     Ok(())
 }
 
@@ -2141,11 +2236,13 @@ fn run_label_sections_interactive(
                 }
                 LabelOutcome::Skip => {
                     player.stop();
+                    save_pending_note(labels_path, cache_dir, hash, path, &session)?;
                     println!("\r  skipped {}\r", file_name(path));
                     continue 'tracks;
                 }
                 LabelOutcome::Quit => {
                     player.stop();
+                    save_pending_note(labels_path, cache_dir, hash, path, &session)?;
                     println!("\rsaved & quit\r");
                     break 'tracks;
                 }
@@ -2156,8 +2253,8 @@ fn run_label_sections_interactive(
                         cache_dir,
                         hash,
                         path,
-                        &intro,
-                        &outro,
+                        Some(&intro),
+                        Some(&outro),
                         session.note(),
                     )?;
                     println!(
