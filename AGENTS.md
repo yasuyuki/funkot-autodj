@@ -28,6 +28,7 @@
 | 文書 | 内容 |
 |---|---|
 | `docs/guide-clicks.md` | `--label-sections` のガイドクリック位置決定（4層方式、失敗した方式、実測） |
+| `docs/memory.md` | 全曲展開のメモリ内訳（保持側/一時側）、実測値、削れる場所と検証手順 |
 | `docs/labeling.md` | ラベリングのホスト実行手順と音声まわりの罠 |
 | `docs/section-analysis-redesign.md` | 区間解析再設計の意図・Stage 構成・着手前チェック |
 | `docs/transition-phase.md` | 遷移の位相・小節 identity と v6〜v17 の失敗履歴 |

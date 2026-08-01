@@ -2068,7 +2068,7 @@ fn prepare_first_live(
             frames: head_frames,
             samples: buffer.samples[..head_frames as usize * 2].to_vec(),
         };
-        match finish_prepare(options, path, index, &head, &analysis, true) {
+        match finish_prepare(options, path, index, head, &analysis, true) {
             Ok(preview) => {
                 if !send_msg(tx, LoaderMsg::Ready(preview), shutdown) {
                     return false;
@@ -2109,7 +2109,10 @@ fn prepare_first_live(
         analysis
     };
 
-    let full = match finish_prepare(options, path, index, &buffer, &analysis, false) {
+    // Read before `finish_prepare` moves `buffer`; used below to pick the
+    // final message variant.
+    let total_frames = buffer.frames;
+    let full = match finish_prepare(options, path, index, buffer, &analysis, false) {
         Ok(t) => t,
         Err(e) => {
             return send_msg(
@@ -2124,7 +2127,7 @@ fn prepare_first_live(
     };
 
     // Short file: only one Ready (no separate preview). Long file: Upgrade.
-    let msg = if head_frames < buffer.frames {
+    let msg = if head_frames < total_frames {
         LoaderMsg::Upgrade(full)
     } else {
         LoaderMsg::Ready(full)
@@ -2142,14 +2145,14 @@ pub fn prepare_track(
 ) -> Result<PreparedTrack> {
     let buffer = decode::decode_file(path)?;
     let analysis = cache::get_or_analyze(path, &options.cache_dir, &buffer)?;
-    finish_prepare(options, path, index, &buffer, &analysis, false)
+    finish_prepare(options, path, index, buffer, &analysis, false)
 }
 
 fn finish_prepare(
     options: &EngineOptions,
     path: &std::path::Path,
     index: usize,
-    buffer: &decode::AudioBuffer,
+    buffer: decode::AudioBuffer,
     analysis: &crate::TrackAnalysis,
     preview: bool,
 ) -> Result<PreparedTrack> {
@@ -2161,15 +2164,21 @@ fn finish_prepare(
     };
     let speed = options.target_bpm() / intro_bpm;
 
-    let rendered = stretch::render_track(
-        &buffer.samples,
-        buffer.sample_rate,
+    // Take sample_rate/frames before moving `buffer.samples` so the decoded
+    // buffer can be dropped as soon as the stretch stage is done with it
+    // (see `stretch::render_track_owned`), instead of staying alive until the
+    // resample stage allocates its output.
+    let sample_rate = buffer.sample_rate;
+    let in_frames = buffer.frames;
+
+    let rendered = stretch::render_track_owned(
+        buffer.samples,
+        sample_rate,
         options.output_sample_rate,
         speed,
         options.pitch_mode,
     )?;
 
-    let in_frames = buffer.frames;
     let out_frames = (rendered.len() / 2) as u64;
     let scale = position_scale(in_frames, out_frames);
     let bar_frames = options.bar_frames();
@@ -2193,7 +2202,7 @@ fn finish_prepare(
             analysis.first_downbeat,
             analysis.outro_start,
             intro_bpm,
-            buffer.sample_rate,
+            sample_rate,
             mapped_fd,
             mapped_outro,
             analysis.outro_bars,
