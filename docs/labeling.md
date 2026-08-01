@@ -35,6 +35,11 @@ PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
 `PKG_CONFIG_PATH` が要るのは PATH 先頭の Homebrew 版 pkg-config が
 `/usr/lib/x86_64-linux-gnu/pkgconfig` を見ないため（ALSA 自体は入っている）。
 
+**ホストとコンテナは別の target を持つ。** `./dev.sh cargo test` が通っても、
+`--render-clips` で書いたクリップが正しくても、`target-host` のバイナリは古いまま。
+クリック位置や候補の出方を変えたら、聴く前に**必ず上のビルドをやり直す**
+（症状: 直したはずのずれがラベリング中だけ再現する）。
+
 ## 操作
 
 `y`/Enter 採用 · `←`/`→` 候補移動 · `+` ±8/±16小節切替 · `r` 頭から再生し直し ·
