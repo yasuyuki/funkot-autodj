@@ -58,7 +58,7 @@ fn render(
 
     // What the grid already corrected for, so a listener reading these clips
     // knows whether `plus0` is the propagated grid or an already-shifted one.
-    let applied = music_end_bar(&buf, &analysis, bar_frames_for(&analysis, Side::Outro))
+    let applied = music_end_bar(&buf, &analysis, bar_frames_for(&analysis, Side::Outro), 0)
         .map(|end_bar| outro_beat_phase_shift(&buf, &analysis, grid.bar_frames, end_bar))
         .unwrap_or(0);
     println!("{stem}  (grid already applies +{applied} beat)");

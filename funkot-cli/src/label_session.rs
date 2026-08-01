@@ -405,7 +405,8 @@ const END_SCAN_BARS: u32 = 64;
 /// and this sits in the middle of it.
 const END_BEAT_ONSET_DB: f64 = -16.0;
 
-/// The bar line, counted from `first_downbeat`, where the music stops.
+/// The bar line, counted from a bar grid `beat_phase` beats later than
+/// `first_downbeat`, where the music stops.
 ///
 /// Not where the *file* stops: masters ring out and then pad with silence,
 /// and every one of the 14 in `testdata/` does, from 0.64 bars to 3.86. Nor
@@ -425,19 +426,36 @@ const END_BEAT_ONSET_DB: f64 = -16.0;
 ///
 /// `bar_frames` is the analyzer's period; the grid only has to be good enough
 /// to sort onsets into beats, which a half-beat of accumulated drift does not
-/// threaten. Returns `None` when the track is too short to scan or carries no
-/// onsets at all, leaving the caller on the file end.
+/// threaten. `beat_phase` (0..4) moves the scan's own bar lines — and
+/// therefore the answer — `beat_phase` beats later than `first_downbeat`;
+/// pass 0 to scan on the propagated grid itself. This has to be the *caller's*
+/// choice rather than something added to the result afterwards: the question
+/// "where does the last bar of music end" is about the master's own bars, and
+/// on a track whose bars have slipped against `first_downbeat`, answering it
+/// on the wrong grid and then shifting the answer is not the same thing. A
+/// terminal one-shot that lands in what the wrong grid calls the fourth beat
+/// of its final bar makes that bar look like it is still playing, which
+/// pushes the returned line one whole bar late — this is the bug reported on
+/// `… - 04 Eternal Light` (`beat_phase` 3), and shifting the `beat_phase = 0`
+/// answer afterwards reproduces it exactly. Scanning on the master's own grid
+/// from the start does not have that failure mode, because the one-shot then
+/// sits on the *next* bar's grid the same way it does on the propagated one.
+///
+/// Returns `None` when the track is too short to scan or carries no onsets at
+/// all, leaving the caller on the file end.
 pub fn music_end_bar(
     buffer: &AudioBuffer,
     analysis: &TrackAnalysis,
     bar_frames: f64,
+    beat_phase: u32,
 ) -> Option<u32> {
     let total = buffer.frames as f64;
     let first_downbeat = analysis.first_downbeat as f64;
     if !(bar_frames.is_finite() && bar_frames > 1.0) || total <= first_downbeat {
         return None;
     }
-    let last_bar = ((total - first_downbeat) / bar_frames).floor();
+    let origin = first_downbeat + f64::from(beat_phase) * bar_frames / f64::from(BEATS_PER_BAR);
+    let last_bar = ((total - origin) / bar_frames).floor();
     if !(last_bar.is_finite() && last_bar >= 2.0) {
         return None;
     }
@@ -447,7 +465,7 @@ pub fn music_end_bar(
         return None;
     }
 
-    let scan_start = (first_downbeat + f64::from(first_bar) * bar_frames).max(0.0) as usize;
+    let scan_start = (origin + f64::from(first_bar) * bar_frames).max(0.0) as usize;
     let mono: Vec<f32> = buffer.samples[scan_start * 2..]
         .chunks_exact(2)
         .map(|f| (f[0] + f[1]) * 0.5)
@@ -719,27 +737,49 @@ pub fn outro_bar_frames_refit(
 /// period ([`outro_bar_frames_refit`]) with candidates counted back from
 /// where the music ends ([`music_end_bar`]) rather than where the file does.
 ///
-/// Composition matters here. The end of the music is found on the analyzer's
-/// grid — it only has to sort onsets into beats — and comes back as a *bar
-/// index*, which is drift-free by construction. The period is then refined,
-/// and the anchor rebuilt from the same index on the refined period, so the
-/// two corrections do not have to agree about frames. Last, the bar index is
-/// offset by whatever [`outro_beat_phase_shift`] finds the master's own bars
-/// have slipped against the propagated grid, which is the one error the other
-/// two cannot express: they move the anchor by whole bars and by fractions of
-/// a beat respectively, never by a beat.
+/// Composition matters here. Finding the end of the music needs the master's
+/// own `beat_phase` ([`outro_beat_phase_shift`]) to scan on, but measuring
+/// that shift needs a bar index near the outro to fold the window against —
+/// so this runs in two passes rather than one. The first pass scans on the
+/// propagated (`beat_phase = 0`) grid; that end is provisional, used only as
+/// a foothold for [`outro_bar_frames_refit`] (which does not care which whole
+/// bar it locks onto) and for [`outro_beat_phase_shift`] (which folds a
+/// window ending near there, not exactly there). If the shift comes back
+/// non-zero, the end is measured a second time, scanning on the master's own
+/// grid (`beat_phase = shift`) — this is the answer that is actually used,
+/// because a terminal one-shot can fill what the propagated grid calls the
+/// last bar's fourth beat and make [`music_end_bar`] return a line one whole
+/// bar late when read off the wrong grid (see its doc). When the shift is
+/// zero the two passes agree by construction, so the second scan is skipped.
+/// The period is refined once, on the provisional anchor, and the anchor
+/// actually returned is rebuilt from the final bar index and shift on that
+/// refined period, so the period correction and the bar-identity correction
+/// never have to agree about frames.
 pub fn click_grid(buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) -> ClickGrid {
     if side == Side::Intro {
         return ClickGrid::nominal(analysis, Side::Intro);
     }
     let nominal = ClickGrid::nominal(analysis, Side::Outro);
-    let Some(end_bar) = music_end_bar(buffer, analysis, nominal.bar_frames) else {
+    let Some(end_on_grid) = music_end_bar(buffer, analysis, nominal.bar_frames, 0) else {
         return nominal;
     };
     let first_downbeat = analysis.first_downbeat as f64;
-    let anchor_nominal = (first_downbeat + f64::from(end_bar) * nominal.bar_frames).round() as u64;
+    let anchor_nominal =
+        (first_downbeat + f64::from(end_on_grid) * nominal.bar_frames).round() as u64;
     let bar_frames = outro_bar_frames_refit(buffer, analysis, anchor_nominal);
-    let shift = outro_beat_phase_shift(buffer, analysis, bar_frames, end_bar);
+    let shift = outro_beat_phase_shift(buffer, analysis, bar_frames, end_on_grid);
+    // The `unwrap_or` is unreachable, and deliberately not an `expect`: the
+    // second scan differs from the first only in an origin under a bar later,
+    // and a non-zero shift already means the track ran long enough for
+    // `outro_beat_phase_shift` to fold two disjoint windows (over a hundred
+    // bars), so neither of the scan's length guards can newly trip. Falling
+    // back on the provisional end is the pre-fix composition, which is worth
+    // knowing if this ever does fire.
+    let end_bar = if shift == 0 {
+        end_on_grid
+    } else {
+        music_end_bar(buffer, analysis, nominal.bar_frames, shift).unwrap_or(end_on_grid)
+    };
     let end = f64::from(end_bar) + f64::from(shift) / f64::from(BEATS_PER_BAR);
     ClickGrid {
         bar_frames,
@@ -1960,7 +2000,7 @@ mod tests {
         push_decaying_tail(&mut samples, 2.6, 0.4, beat_true, sr);
         let (buffer, analysis) = finish(samples, sr, &analysis);
         assert_eq!(
-            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro), 0),
             Some(120),
             "the ring-out and the silence after it are not music"
         );
@@ -1987,7 +2027,7 @@ mod tests {
         let (buffer, analysis) = finish(samples, sr, &analysis);
         let _ = first_downbeat;
         assert_eq!(
-            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro), 0),
             Some(120)
         );
     }
@@ -2009,7 +2049,7 @@ mod tests {
         let (buffer, analysis) = finish(samples, sr, &analysis);
         let _ = first_downbeat;
         assert_eq!(
-            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro), 0),
             Some(120),
             "quiet bars that still carry every beat are music"
         );
@@ -2028,7 +2068,7 @@ mod tests {
         push_decaying_tail(&mut samples, 1.0, 0.4, beat_true, sr);
         let (buffer, analysis) = finish(samples, sr, &analysis);
         assert_eq!(
-            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro), 0),
             Some(116),
             "a fade this far down is the outro dying, not bars of music"
         );
@@ -2040,10 +2080,20 @@ mod tests {
     /// what the fold reads -- sits in grid slot 3 for the first half and in
     /// slot `(3 + shift) % 4` for the second, which is how a section spliced
     /// a beat short looks from the grid's side. Nothing else about the track
-    /// changes: the tempo is exact and every beat still carries a kick, so
-    /// only the bar phase can explain what comes out.
+    /// changes: the tempo is exact and every beat still carries a kick.
+    ///
+    /// The music itself has to end on its *own* slipped bar line, `shift`
+    /// beats past the propagated grid's line at `music_bars`, with a terminal
+    /// one-shot sitting on it and only decay after -- the shape every
+    /// ear-verified master in `testdata/` actually has (see
+    /// `music_end_bar_treats_a_terminal_one_shot_as_the_end_not_a_bar_of_music`).
+    /// A fixture that instead stopped exactly on the propagated grid's line
+    /// is not a shape any real master has: a track whose own bars have moved
+    /// still ends on its own bars, not on the grid that has drifted away from
+    /// them.
     fn phase_slip_fixture(music_bars: u32, shift: u32) -> (AudioBuffer, TrackAnalysis) {
-        let (mut samples, sr, first_downbeat, beat_true, analysis) = end_fixture(music_bars, 0.0);
+        let (mut samples, sr, first_downbeat, beat_true, analysis) =
+            end_fixture(music_bars + 1, 0.0);
         let quiet_from = |bar: u32| {
             let slot = if bar < music_bars / 2 {
                 3
@@ -2060,6 +2110,24 @@ mod tests {
                 *v *= 0.25;
             }
         }
+
+        // Truncate the extra bar back to the music's own (slipped) bar line:
+        // `music_bars` bars plus `shift` beats past `first_downbeat`.
+        let end_frame =
+            first_downbeat as f64 + (f64::from(music_bars) * 4.0 + f64::from(shift)) * beat_true;
+        let end_sample = (end_frame.round() as usize).min(samples.len() / 2);
+        samples.truncate(end_sample * 2);
+
+        // One loud hit exactly on that line, then the ring-out -- the same
+        // shape `end_fixture`-based tests use for a terminal one-shot.
+        let hit = (0.25 * f64::from(sr)) as usize;
+        let mut state = 0xBEEF_0001u32;
+        for i in 0..hit {
+            let env = (-(i as f64) / (0.10 * f64::from(sr))).exp() as f32;
+            let v = xorshift32(&mut state) * 0.9 * env;
+            samples.push(v);
+            samples.push(v);
+        }
         push_decaying_tail(&mut samples, 2.6, 0.4, beat_true, sr);
         finish(samples, sr, &analysis)
     }
@@ -2069,7 +2137,7 @@ mod tests {
         for shift in 1..BEATS_PER_BAR {
             let (buffer, analysis) = phase_slip_fixture(120, shift);
             let bar_frames = bar_frames_for(&analysis, Side::Outro);
-            let end_bar = music_end_bar(&buffer, &analysis, bar_frames).expect("has an end");
+            let end_bar = music_end_bar(&buffer, &analysis, bar_frames, 0).expect("has an end");
             assert_eq!(
                 outro_beat_phase_shift(&buffer, &analysis, bar_frames, end_bar),
                 shift,
@@ -2082,7 +2150,7 @@ mod tests {
     fn outro_beat_phase_shift_leaves_a_steady_grid_alone() {
         let (buffer, analysis) = phase_slip_fixture(120, 0);
         let bar_frames = bar_frames_for(&analysis, Side::Outro);
-        let end_bar = music_end_bar(&buffer, &analysis, bar_frames).expect("has an end");
+        let end_bar = music_end_bar(&buffer, &analysis, bar_frames, 0).expect("has an end");
         assert_eq!(
             outro_beat_phase_shift(&buffer, &analysis, bar_frames, end_bar),
             0
@@ -2124,18 +2192,32 @@ mod tests {
         );
     }
 
+    /// Regression for the labeler's report on `… - 04 Eternal Light`: solving
+    /// `music_end_bar` on the propagated (`first_downbeat`) grid and then
+    /// adding `shift` beats afterwards is not the same as solving it on the
+    /// master's own (slipped) grid. On a track whose terminal one-shot fills
+    /// what the propagated grid calls the fourth beat of its final bar --
+    /// which is exactly `shift == 3` here, since [`phase_slip_fixture`] puts
+    /// the one-shot `shift` beats past the propagated grid's bar line --
+    /// `music_end_bar(..., 0)` reads that bar as still playing and returns
+    /// one whole bar too many, landing the anchor a full bar past the music's
+    /// actual last line. Confirmed against the pre-fix `click_grid` before
+    /// writing this test: `shift = 1` and `2` passed, `shift = 3` failed by
+    /// exactly one bar (4 beats).
     #[test]
     fn outro_candidates_follow_the_slipped_bar_phase() {
-        let (buffer, analysis) = phase_slip_fixture(120, 2);
-        let grid = click_grid(&buffer, &analysis, Side::Outro);
-        let beat = grid.bar_frames / f64::from(BEATS_PER_BAR);
-        let anchor_beats =
-            (grid.outro_anchor as f64 - analysis.first_downbeat as f64) / beat;
-        assert!(
-            (anchor_beats - (120.0 * 4.0 + 2.0)).abs() < 0.05,
-            "anchor sits {anchor_beats:.2} beats past the downbeat, \
-             want the music's last line plus the 2-beat slip (482)"
-        );
+        for shift in 1..BEATS_PER_BAR {
+            let (buffer, analysis) = phase_slip_fixture(120, shift);
+            let grid = click_grid(&buffer, &analysis, Side::Outro);
+            let beat = grid.bar_frames / f64::from(BEATS_PER_BAR);
+            let anchor_beats = (grid.outro_anchor as f64 - analysis.first_downbeat as f64) / beat;
+            let want = 120.0 * 4.0 + f64::from(shift);
+            assert!(
+                (anchor_beats - want).abs() < 0.05,
+                "shift {shift}: anchor sits {anchor_beats:.2} beats past the downbeat, \
+                 want the music's last line plus the {shift}-beat slip ({want})"
+            );
+        }
     }
 
     #[test]
@@ -2243,7 +2325,7 @@ mod tests {
         let (samples, sr, first_downbeat, _, analysis) = end_fixture(2, 0.0);
         let (buffer, analysis) = finish(samples, sr, &analysis);
         assert_eq!(
-            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro)),
+            music_end_bar(&buffer, &analysis, bar_frames_for(&analysis, Side::Outro), 0),
             None
         );
         let grid = click_grid(&buffer, &analysis, Side::Outro);
