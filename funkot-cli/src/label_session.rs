@@ -719,6 +719,22 @@ pub fn build_candidate_clip(
     click_opts: &ClickOptions,
 ) -> Vec<f32> {
     let grid = click_grid(buffer, analysis, side);
+    build_candidate_clip_on_grid(buffer, analysis, side, bars, half_width_bars, click_opts, grid)
+}
+
+/// [`build_candidate_clip`] on a caller-supplied grid, so a diagnostic can
+/// render the same clip against a deliberately altered anchor or period and
+/// A/B the two by ear.
+#[allow(clippy::too_many_arguments)]
+pub fn build_candidate_clip_on_grid(
+    buffer: &AudioBuffer,
+    analysis: &TrackAnalysis,
+    side: Side,
+    bars: u32,
+    half_width_bars: u32,
+    click_opts: &ClickOptions,
+    grid: ClickGrid,
+) -> Vec<f32> {
     let boundary = locked_boundary_on_grid(buffer, analysis, side, bars, half_width_bars, grid);
     render_click_clip(buffer, boundary, grid.bar_frames, half_width_bars, click_opts)
 }
