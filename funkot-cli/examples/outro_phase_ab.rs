@@ -67,6 +67,7 @@ fn render(
         let shifted = ClickGrid {
             bar_frames: grid.bar_frames,
             outro_anchor: grid.outro_anchor + (beats as f64 * beat_frames).round() as i64,
+            lock_offset: grid.lock_offset,
         };
         let clip = build_candidate_clip_on_grid(
             &buf,

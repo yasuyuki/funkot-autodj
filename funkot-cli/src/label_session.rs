@@ -352,12 +352,18 @@ pub struct ClickGrid {
     /// the music ends ([`music_end_bar`]), which is not the end of the file.
     /// Unused on the intro side, which counts forward from `first_downbeat`.
     pub outro_anchor: i64,
+    /// The single sub-beat offset (frames, from the nominal position) every
+    /// candidate on this side is expected to lock to. `None` when it could
+    /// not be measured — then each candidate keeps its own lock, which is
+    /// what this code did before the offbeat branch was found.
+    pub lock_offset: Option<f64>,
 }
 
 impl ClickGrid {
     /// The grid implied by the analysis markers alone — no audio, so the
-    /// outro anchor can only be the file end rounded onto the bar grid. Kept
-    /// for [`boundary_frame`] and its tests.
+    /// outro anchor can only be the file end rounded onto the bar grid, and
+    /// `lock_offset` can't be measured at all. Kept for [`boundary_frame`]
+    /// and its tests.
     pub fn nominal(analysis: &TrackAnalysis, side: Side) -> Self {
         let bar_frames = bar_frames_for(analysis, side);
         let first_downbeat = analysis.first_downbeat as f64;
@@ -372,6 +378,7 @@ impl ClickGrid {
         Self {
             bar_frames,
             outro_anchor,
+            lock_offset: None,
         }
     }
 }
@@ -636,6 +643,100 @@ const REFIT_MAX_RESIDUAL_BEATS: f64 = 0.25;
 /// Reference points that must agree before the refined period is trusted.
 const REFIT_MIN_AGREEING_POINTS: usize = 3;
 
+/// How far a candidate's own lock may sit from the side's consensus before it
+/// is treated as having landed on the other branch — the offbeat.
+const BRANCH_SPLIT_BEATS: f64 = 0.25;
+/// How close two branch medians must be to exactly half a beat apart before
+/// the split is read as the beat/offbeat ambiguity rather than as scatter.
+const BRANCH_HALF_BEAT_TOL: f64 = 0.15;
+
+/// Median of `values` (must be non-empty); the average of the middle two
+/// when the count is even. Shared by [`side_lock_offset`] and
+/// [`outro_bar_frames_refit`] so "how to summarize a cluster of offsets" is
+/// answered once.
+fn median(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("offsets are finite"));
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        0.5 * (sorted[n / 2 - 1] + sorted[n / 2])
+    }
+}
+
+/// Which indices of `offsets` (each a candidate's own `locked - nominal`
+/// lock offset, in frames, on the same side's grid) belong to the branch the
+/// side should agree on, or `None` when there are too few offsets to have an
+/// opinion.
+///
+/// One side's candidates all sit on the same propagated bar grid, so a
+/// correct lock moves every one of them by (up to scatter) the same sub-beat
+/// amount — [`lock_beat_phase`](funkot_core::analysis::lock_beat_phase)'s
+/// comb repeats every beat, not every bar, so it cannot itself tell a
+/// downbeat from the offbeat, and on some masters the two peaks are close
+/// enough (1-7%) that a handful of candidates lock half a beat away from the
+/// rest. Enforcing "one side, one phase" as an explicit invariant here, and
+/// preferring the branch closer to the nominal (propagated) grid when the
+/// two are ambiguous, is what recovers from that: the lock is a sub-beat
+/// refinement layer, not a layer with the authority to flip which beat the
+/// analyzer called the bar head (see `docs/guide-clicks.md`, "裏拍へロック
+/// する", the layer-5 argument this is built on).
+///
+/// Known limitation: this reads the split as beat-vs-offbeat only when the
+/// two branch medians sit close to half a beat apart
+/// ([`BRANCH_HALF_BEAT_TOL`]); on a track whose true phase is *itself* more
+/// than [`BRANCH_SPLIT_BEATS`] off the nominal grid, and which also has
+/// offbeat contamination, this picks the wrong branch. Measured across 31
+/// masters the true one-sided offset is at most 0.40 beat (`DEKZ - Dora
+/// Dora`, the largest uniform offset seen), and tracks like it never split
+/// into two branches in the first place, so the failure mode doesn't fire in
+/// practice — but it is not ruled out by construction.
+///
+/// This does not take a majority vote between the two branches: on
+/// `Alvian - … - 15 Yao Bu Neng Ting` the contaminated (offbeat) branch is
+/// the larger one, 3 of 5 points, so "pick whichever cluster has more
+/// points" would pick the wrong one. Distance from the nominal grid is what
+/// decides it instead.
+fn branch_indices(offsets: &[f64], beat: f64) -> Option<Vec<usize>> {
+    if offsets.len() < 3 {
+        return None;
+    }
+    let med = median(offsets);
+    let near: Vec<usize> = (0..offsets.len())
+        .filter(|&i| (offsets[i] - med).abs() <= BRANCH_SPLIT_BEATS * beat)
+        .collect();
+    let far: Vec<usize> = (0..offsets.len())
+        .filter(|&i| (offsets[i] - med).abs() > BRANCH_SPLIT_BEATS * beat)
+        .collect();
+    if far.is_empty() {
+        return Some(near);
+    }
+    if near.is_empty() {
+        // No cluster formed around the median at all: with an even count the
+        // median is the average of the middle two, so two offsets more than
+        // `2 * BRANCH_SPLIT_BEATS` apart straddle it and leave every point
+        // outside the near band (e.g. -0.40/-0.35/+0.20/+0.25 beat, which is
+        // the size of offsets these masters actually produce). That is
+        // scatter too wide to read a branch out of, not a beat/offbeat split
+        // — say so, and let the caller keep each candidate's own lock rather
+        // than inventing a consensus that sits in the gap between clusters
+        // and would then override every candidate.
+        return None;
+    }
+    let near_med = median(&near.iter().map(|&i| offsets[i]).collect::<Vec<_>>());
+    let far_med = median(&far.iter().map(|&i| offsets[i]).collect::<Vec<_>>());
+    if ((far_med - med).abs() - 0.5 * beat).abs() <= BRANCH_HALF_BEAT_TOL * beat {
+        // Beat/offbeat ambiguity: keep whichever branch sits closer to the
+        // nominal (propagated) grid, i.e. the smaller |offset|.
+        Some(if near_med.abs() <= far_med.abs() { near } else { far })
+    } else {
+        // Not half a beat apart -- ordinary scatter, not the offbeat branch.
+        // Only the majority cluster is a real reading of it.
+        Some(near)
+    }
+}
+
 /// The outro-side bar length, with the analyzer's tempo refined against the
 /// audio near the outro.
 ///
@@ -680,6 +781,19 @@ const REFIT_MIN_AGREEING_POINTS: usize = 3;
 /// absolute beat identity is not recoverable from this evidence, and no
 /// residual check here can tell the two apart. Resolving that needs downbeat
 /// evidence from the audio (HANDOFF §11-5), not a better fit.
+///
+/// Before the period is fit, the reference points are put through the same
+/// beat/offbeat branch check as [`side_lock_offset`]
+/// ([`branch_indices`]): a point whose own lock landed on the wrong branch
+/// is exactly the kind of "locked onto the wrong beat" reference this
+/// function's own doc above already warns about, and left in, it poisons the
+/// fit even though it never fails [`REFIT_MAX_RESIDUAL_BEATS`] (an offbeat
+/// lock is still within a quarter beat of *some* whole-beat position, just
+/// not the right one). Measured: on `Alvian - … - 15 Yao Bu Neng Ting`, 3 of
+/// the 5 reference points land on the offbeat, the median folds them in, and
+/// the period comes out +0.0376% long — inside `REFIT_MAX_REL_ADJUST` and
+/// past `REFIT_MAX_RESIDUAL_BEATS`, so nothing downstream catches it. This
+/// check does.
 pub fn outro_bar_frames_refit(
     buffer: &AudioBuffer,
     analysis: &TrackAnalysis,
@@ -692,12 +806,16 @@ pub fn outro_bar_frames_refit(
     }
     let first_downbeat = analysis.first_downbeat as f64;
 
-    // (whole beats from first_downbeat, measured distance in frames)
+    // (whole beats from first_downbeat, measured distance in frames), and
+    // the sub-beat lock offset (locked - nominal) each point carries — the
+    // latter only feeds the branch check just below, not the fit itself.
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(OUTRO_CANDIDATES.len());
+    let mut offsets: Vec<f64> = Vec::with_capacity(OUTRO_CANDIDATES.len());
     for &bars in OUTRO_CANDIDATES.iter() {
         let grid = ClickGrid {
             bar_frames: bar_nominal,
             outro_anchor: outro_anchor as i64,
+            lock_offset: None,
         };
         let nominal = boundary_frame_on_grid(analysis, Side::Outro, bars, grid);
         let locked = lock_boundary_to_groove(buffer, nominal, bar_nominal, NORMAL_HALF_WIDTH_BARS);
@@ -705,7 +823,11 @@ pub fn outro_bar_frames_refit(
         let beats = (dist / beat_nominal).round();
         if beats >= REFIT_MIN_LEVER_BEATS {
             points.push((beats, dist));
+            offsets.push((locked - nominal) as f64);
         }
+    }
+    if let Some(keep) = branch_indices(&offsets, beat_nominal) {
+        points = keep.into_iter().map(|i| points[i]).collect();
     }
     if points.len() < REFIT_MIN_AGREEING_POINTS {
         return bar_nominal;
@@ -757,7 +879,9 @@ pub fn outro_bar_frames_refit(
 /// never have to agree about frames.
 pub fn click_grid(buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) -> ClickGrid {
     if side == Side::Intro {
-        return ClickGrid::nominal(analysis, Side::Intro);
+        let grid = ClickGrid::nominal(analysis, Side::Intro);
+        let lock_offset = side_lock_offset(buffer, analysis, Side::Intro, grid);
+        return ClickGrid { lock_offset, ..grid };
     }
     let nominal = ClickGrid::nominal(analysis, Side::Outro);
     let Some(end_on_grid) = music_end_bar(buffer, analysis, nominal.bar_frames, 0) else {
@@ -781,10 +905,64 @@ pub fn click_grid(buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) ->
         music_end_bar(buffer, analysis, nominal.bar_frames, shift).unwrap_or(end_on_grid)
     };
     let end = f64::from(end_bar) + f64::from(shift) / f64::from(BEATS_PER_BAR);
-    ClickGrid {
+    let grid = ClickGrid {
         bar_frames,
         outro_anchor: (first_downbeat + end * bar_frames).round() as i64,
+        lock_offset: None,
+    };
+    // Measured against the final grid (period and anchor both settled), not
+    // the provisional one above -- see `click_grid`'s own doc on why the
+    // period and anchor are only trustworthy once refit and phase-shift have
+    // both run.
+    let lock_offset = side_lock_offset(buffer, analysis, Side::Outro, grid);
+    ClickGrid { lock_offset, ..grid }
+}
+
+/// How far every candidate on `side` should agree its lock moved it from the
+/// nominal (propagated-grid) position, in frames — the side's consensus
+/// sub-beat phase. `None` when there isn't enough clean evidence to have an
+/// opinion, in which case each candidate keeps its own lock unchanged (the
+/// pre-existing behaviour).
+///
+/// Each candidate is locked independently with [`lock_boundary_to_groove`],
+/// which only sees one candidate's window and can't know what the others
+/// did. On most tracks that's harmless because every window agrees anyway;
+/// this function is what checks that, and what to do when a minority
+/// disagrees -- see [`branch_indices`] for the disagreement/branch-selection
+/// rule itself, which this and [`outro_bar_frames_refit`] share.
+///
+/// Candidates whose ±[`NORMAL_HALF_WIDTH_BARS`] listening window would run
+/// off either end of the file are dropped before the branch check, not kept
+/// with an offset of 0: [`lock_boundary_to_groove`] itself returns the
+/// nominal position unmoved when its window doesn't fit
+/// (`clip_start < 0`), which is indistinguishable from "this candidate
+/// genuinely locked onto the nominal position" and would silently pull the
+/// consensus toward zero if it were mixed in.
+fn side_lock_offset(
+    buffer: &AudioBuffer,
+    analysis: &TrackAnalysis,
+    side: Side,
+    grid: ClickGrid,
+) -> Option<f64> {
+    let beat = grid.bar_frames / f64::from(BEATS_PER_BAR);
+    if !(beat.is_finite() && beat > 1.0) {
+        return None;
     }
+    let total = buffer.frames as f64;
+    let half_span = grid.bar_frames * f64::from(NORMAL_HALF_WIDTH_BARS);
+    let mut offsets: Vec<f64> = Vec::with_capacity(side.candidates().len());
+    for &bars in side.candidates() {
+        let nominal = boundary_frame_on_grid(analysis, side, bars, grid);
+        let nominal_f = nominal as f64;
+        if nominal_f - half_span < 0.0 || nominal_f + half_span > total {
+            continue;
+        }
+        let locked =
+            lock_boundary_to_groove(buffer, nominal, grid.bar_frames, NORMAL_HALF_WIDTH_BARS);
+        offsets.push((locked - nominal) as f64);
+    }
+    let keep = branch_indices(&offsets, beat)?;
+    Some(median(&keep.iter().map(|&i| offsets[i]).collect::<Vec<_>>()))
 }
 
 pub fn lock_boundary_to_groove(
@@ -920,6 +1098,16 @@ pub fn locked_boundary_frame(
 /// [`locked_boundary_frame`] on a caller-supplied grid, so
 /// [`build_candidate_clip`] can lay out its click grid on the same period it
 /// placed the boundary with instead of paying for [`click_grid`] twice.
+///
+/// When `grid.lock_offset` is `Some`, a candidate whose own lock landed more
+/// than [`BRANCH_SPLIT_BEATS`] away from it is replaced with the consensus
+/// position instead: it has landed on the other branch (see
+/// [`side_lock_offset`]/[`branch_indices`]), and letting it through would
+/// reintroduce the exact half-beat split this whole mechanism exists to
+/// close. A candidate that *agrees* with the consensus keeps its own lock
+/// verbatim rather than being snapped onto the consensus exactly -- measured,
+/// the two differ by about 0.05 beat, and forcing that would move candidates
+/// that are already clicking correctly.
 fn locked_boundary_on_grid(
     buffer: &AudioBuffer,
     analysis: &TrackAnalysis,
@@ -929,7 +1117,15 @@ fn locked_boundary_on_grid(
     grid: ClickGrid,
 ) -> i64 {
     let nominal = boundary_frame_on_grid(analysis, side, bars, grid);
-    lock_boundary_to_groove(buffer, nominal, grid.bar_frames, half_width_bars)
+    let locked = lock_boundary_to_groove(buffer, nominal, grid.bar_frames, half_width_bars);
+    if let Some(consensus) = grid.lock_offset {
+        let beat = grid.bar_frames / f64::from(BEATS_PER_BAR);
+        let own = (locked - nominal) as f64;
+        if beat.is_finite() && beat > 1.0 && (own - consensus).abs() > BRANCH_SPLIT_BEATS * beat {
+            return nominal + consensus.round() as i64;
+        }
+    }
+    locked
 }
 
 /// How far past the listening window a candidate clip keeps playing, in bars.
@@ -2284,6 +2480,7 @@ mod tests {
                 ClickGrid {
                     bar_frames: bar_nominal,
                     outro_anchor: anchor as i64,
+                    lock_offset: None,
                 },
             );
             worst_without = worst_without
@@ -2334,5 +2531,193 @@ mod tests {
             outro_bar_frames_refit(&buffer, &analysis, first_downbeat),
             bar_frames_for(&analysis, Side::Outro)
         );
+    }
+
+    // --- one side, one sub-beat phase: the offbeat-lock branch check -------
+    //
+    // `lock_beat_phase`'s comb repeats every beat, so it cannot itself tell a
+    // downbeat from the offbeat; on some masters the two peaks are close
+    // enough that a handful of candidates lock half a beat away from the
+    // rest (`docs/guide-clicks.md`, "裏拍へロックする"). `side_lock_offset`
+    // is the consensus check that catches that; these fixtures give each
+    // candidate its own isolated listening window (`lock_beat_phase` only
+    // ever reads the samples inside the window it's handed) so a single
+    // candidate's lock can be steered independently of the rest.
+
+    #[test]
+    fn side_lock_offset_pulls_a_lone_offbeat_candidate_back_to_the_majority_branch() {
+        let sr = 22_050u32;
+        let bpm = 180.0;
+        let beat = f64::from(sr) * 60.0 / bpm; // 7350.0 exactly
+        let bar = beat * 4.0;
+        let first_downbeat = 1_820u64;
+        let half_width = NORMAL_HALF_WIDTH_BARS;
+        // The largest candidate sits at the far end of the track, where the
+        // 16-bar gap to its neighbour means the rewrite below reaches only
+        // one bar into the 80-bar candidate's own window (4 beats of that
+        // window's 64). The assertions confirm what that has to leave
+        // standing: the isolated candidate locks onto the offbeat by itself,
+        // and the consensus stays on the majority phase anyway.
+        let offbeat_bars = *INTRO_CANDIDATES.last().unwrap();
+
+        let total_bars = offbeat_bars + half_width + 6;
+        let frames = first_downbeat + (bar * f64::from(total_bars)).round() as u64;
+        let mut samples =
+            synth_gridded_dense_loud_stereo(frames as usize, sr, first_downbeat, beat);
+        let analysis = sample_analysis(sr, bpm, bpm, first_downbeat, frames);
+        let grid = ClickGrid::nominal(&analysis, Side::Intro);
+        let beat_frames = grid.bar_frames / 4.0;
+
+        // Overwrite the isolated candidate's own listening window -- plus a
+        // 1-bar margin, comfortably past lock_beat_phase's own half-beat
+        // search radius -- with the same rhythm shifted half a beat later,
+        // so its own lock finds the offbeat instead of the majority phase
+        // every other candidate agrees on.
+        let nominal = boundary_frame_on_grid(&analysis, Side::Intro, offbeat_bars, grid);
+        let win = (grid.bar_frames * f64::from(half_width)).round() as i64;
+        let margin = grid.bar_frames.round() as i64;
+        let region_lo = (nominal - win - margin).max(0) as u64;
+        let region_hi = ((nominal + win + margin).max(0) as u64).min(frames);
+        let region_len = (region_hi - region_lo) as usize;
+        let phase = ((first_downbeat as f64 + beat * 0.5) - region_lo as f64).rem_euclid(beat);
+        let shifted =
+            synth_gridded_dense_loud_stereo(region_len, sr, phase.round().max(0.0) as u64, beat);
+        for i in 0..region_len {
+            let f = (region_lo as usize + i) * 2;
+            samples[f] = shifted[i * 2];
+            samples[f + 1] = shifted[i * 2 + 1];
+        }
+        let buffer = AudioBuffer { sample_rate: sr, frames, samples };
+
+        // Confirm the fixture actually does what it claims: left alone, the
+        // isolated candidate locks onto the offbeat.
+        let locked_alone = lock_boundary_to_groove(&buffer, nominal, grid.bar_frames, half_width);
+        let own_offset = (locked_alone - nominal) as f64;
+        assert!(
+            (own_offset.abs() - 0.5 * beat_frames).abs() < 0.1 * beat_frames,
+            "fixture setup: the isolated candidate should lock onto the offbeat on \
+             its own, got offset {:+.3} beat",
+            own_offset / beat_frames
+        );
+
+        let consensus = side_lock_offset(&buffer, &analysis, Side::Intro, grid)
+            .expect("6 of 7 candidates agree on the majority (near-zero) phase");
+        assert!(
+            consensus.abs() < 0.15 * beat_frames,
+            "consensus should follow the majority phase, got {:+.3} beat",
+            consensus / beat_frames
+        );
+
+        let grid_with_consensus = ClickGrid { lock_offset: Some(consensus), ..grid };
+        let pulled = locked_boundary_on_grid(
+            &buffer,
+            &analysis,
+            Side::Intro,
+            offbeat_bars,
+            half_width,
+            grid_with_consensus,
+        );
+        let pulled_offset = (pulled - nominal) as f64;
+        assert!(
+            pulled_offset.abs() < 0.15 * beat_frames,
+            "the offbeat candidate should be pulled back near the majority phase, \
+             got {:+.3} beat (own lock was {:+.3} beat)",
+            pulled_offset / beat_frames,
+            own_offset / beat_frames
+        );
+    }
+
+    #[test]
+    fn side_lock_offset_leaves_a_uniformly_shifted_side_alone() {
+        let sr = 22_050u32;
+        let bpm = 180.0;
+        let beat = f64::from(sr) * 60.0 / bpm;
+        let bar = beat * 4.0;
+        let first_downbeat = 1_820u64;
+        let half_width = NORMAL_HALF_WIDTH_BARS;
+        // Every candidate sees the same offset here -- scatter, not the
+        // beat/offbeat split BRANCH_HALF_BEAT_TOL guards against (0.3 beat
+        // is not within tolerance of half a beat) -- so the branch check
+        // must leave every candidate's own lock untouched.
+        let true_shift = 0.3 * beat;
+
+        let last = *INTRO_CANDIDATES.last().unwrap();
+        let total_bars = last + half_width + 4;
+        let frames =
+            (first_downbeat as f64 + true_shift + bar * f64::from(total_bars)).ceil() as u64;
+        let samples = synth_gridded_dense_loud_stereo(
+            frames as usize,
+            sr,
+            (first_downbeat as f64 + true_shift).round() as u64,
+            beat,
+        );
+        let buffer = AudioBuffer { sample_rate: sr, frames, samples };
+        let analysis = sample_analysis(sr, bpm, bpm, first_downbeat, frames);
+        let grid = ClickGrid::nominal(&analysis, Side::Intro);
+        let beat_frames = grid.bar_frames / 4.0;
+
+        let consensus = side_lock_offset(&buffer, &analysis, Side::Intro, grid)
+            .expect("every candidate agrees on the same shifted phase");
+        assert!(
+            (consensus - true_shift).abs() < 0.15 * beat_frames,
+            "consensus should read the uniform shift, got {:+.3} beat, want {:+.3}",
+            consensus / beat_frames,
+            true_shift / beat_frames
+        );
+
+        let grid_with_consensus = ClickGrid { lock_offset: Some(consensus), ..grid };
+        for &bars in INTRO_CANDIDATES.iter() {
+            let nominal = boundary_frame_on_grid(&analysis, Side::Intro, bars, grid);
+            let direct = lock_boundary_to_groove(&buffer, nominal, grid.bar_frames, half_width);
+            let via_grid = locked_boundary_on_grid(
+                &buffer,
+                &analysis,
+                Side::Intro,
+                bars,
+                half_width,
+                grid_with_consensus,
+            );
+            assert_eq!(
+                via_grid, direct,
+                "{bars}bars: a uniformly-shifted side must not be touched"
+            );
+        }
+    }
+
+    // Regression: with an even number of offsets the median is the average
+    // of the middle two, so a wide split leaves *no* point within
+    // BRANCH_SPLIT_BEATS of it. `median` is documented as taking a non-empty
+    // slice, and the empty `near` branch used to reach it and panic on the
+    // index arithmetic -- crashing every `click_grid` caller on such a track.
+    #[test]
+    fn branch_indices_declines_when_no_cluster_forms_around_the_median() {
+        let beat = 1.0;
+        // Straddles the median (-0.075) with every point outside the band.
+        assert_eq!(branch_indices(&[-0.40, -0.35, 0.20, 0.25], beat), None);
+        // Odd counts put the median on a real point, so a branch still forms.
+        assert!(branch_indices(&[-0.40, -0.35, 0.20], beat).is_some());
+    }
+
+    #[test]
+    fn locked_boundary_uses_the_candidates_own_lock_when_the_grid_has_no_consensus() {
+        let sr = 22_050u32;
+        let bpm = 180.0;
+        let beat = f64::from(sr) * 60.0 / bpm;
+        let first_downbeat = 1_820u64;
+        let bars = 32u32;
+        let half_width = NORMAL_HALF_WIDTH_BARS;
+        let total_bars = bars + half_width + 4;
+        let frames = first_downbeat + (beat * 4.0 * f64::from(total_bars)).round() as u64;
+        let samples = synth_gridded_dense_loud_stereo(frames as usize, sr, first_downbeat, beat);
+        let buffer = AudioBuffer { sample_rate: sr, frames, samples };
+        let analysis = sample_analysis(sr, bpm, bpm, first_downbeat, frames);
+        let grid = ClickGrid::nominal(&analysis, Side::Intro);
+        assert_eq!(grid.lock_offset, None);
+
+        let nominal = boundary_frame_on_grid(&analysis, Side::Intro, bars, grid);
+        let direct = lock_boundary_to_groove(&buffer, nominal, grid.bar_frames, half_width);
+        let via_grid =
+            locked_boundary_on_grid(&buffer, &analysis, Side::Intro, bars, half_width, grid);
+        assert_eq!(via_grid, direct, "no consensus -> the candidate's own lock stands");
     }
 }
