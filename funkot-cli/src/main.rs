@@ -2356,6 +2356,207 @@ fn save_pending_note(
     Ok(())
 }
 
+/// Identifies one candidate clip already prepared for playback: which side,
+/// which candidate bar count on that side, and the listening window's
+/// half-width in bars (`±8`/`±16`, toggled by `+`). Doesn't carry the
+/// [`label_session::ClickGrid`] used to build it -- that's memoized per
+/// track/side by `SideGrids` and is therefore identical for every entry that
+/// shares a `Side`.
+type ClipKey = (Side, u32, u32);
+
+/// How many already-built clips [`ClipCache`] keeps at once.
+///
+/// A cached clip is what `prepare_clip_for_playback` returned, so it is the
+/// *played* length at the device rate: at `±8` bars the clip spans
+/// `2 * 8 + CONTINUE_AFTER_WINDOW_BARS` = 80 bars ~= 107 s of 180 BPM
+/// source, which `--rate` 1.10 shortens to ~97 s, and at 48 kHz stereo
+/// `f32` that is ~37 MB. `+` widens the window to `±16` bars, i.e. 96 bars
+/// ~= 116 s played and ~45 MB. So 4 entries costs ~150 MB normally and
+/// ~180 MB with the wide window held throughout.
+///
+/// Only 3 are normally alive at a time (the current candidate plus its two
+/// neighbours); the 4th is headroom so stepping back after having stepped
+/// forward still hits the cache.
+const CLIP_CACHE_CAPACITY: usize = 4;
+
+/// Insertion-order cache of already-prepared candidate clips for the
+/// *current* track only. A fresh one is built per track in
+/// [`run_label_sections_interactive`], since `buf`/`analysis` change with
+/// the track and this cache must not be reused across them. Evicts the
+/// oldest *insertion* once full, not the least-recently-used entry: the goal
+/// is a small bounded window of candidates around the cursor, not a general
+/// LRU.
+struct ClipCache {
+    entries: Vec<(ClipKey, Vec<f32>)>,
+}
+
+impl ClipCache {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// A clone of the cached clip for `key`, or `None` if it isn't cached
+    /// yet. Clones rather than borrowing: the caller hands the clip straight
+    /// to `ClipPlayer::play`, which takes ownership, and cloning ~41 MB is
+    /// cheap next to the stretch it would otherwise replace.
+    fn get(&self, key: &ClipKey) -> Option<Vec<f32>> {
+        self.entries.iter().find(|(k, _)| k == key).map(|(_, clip)| clip.clone())
+    }
+
+    fn contains(&self, key: &ClipKey) -> bool {
+        self.entries.iter().any(|(k, _)| k == key)
+    }
+
+    /// No-op if `key` is already cached: the prefetch worker and the
+    /// foreground path can race to build the same candidate, and whichever
+    /// inserts first wins -- the other's (identical, see
+    /// [`build_and_prepare_clip`]) result is simply discarded.
+    fn insert(&mut self, key: ClipKey, clip: Vec<f32>) {
+        if self.contains(&key) {
+            return;
+        }
+        if self.entries.len() >= CLIP_CACHE_CAPACITY {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, clip));
+    }
+}
+
+#[cfg(test)]
+mod clip_cache_tests {
+    use super::*;
+
+    fn clip(tag: f32) -> Vec<f32> {
+        vec![tag]
+    }
+
+    #[test]
+    fn insert_then_get_returns_a_clone_of_the_same_clip() {
+        let mut cache = ClipCache::new();
+        let key: ClipKey = (Side::Intro, 32, 8);
+        cache.insert(key, clip(1.0));
+        assert_eq!(cache.get(&key), Some(clip(1.0)));
+        assert!(cache.contains(&key));
+    }
+
+    #[test]
+    fn get_on_a_missing_key_is_none() {
+        let cache = ClipCache::new();
+        assert_eq!(cache.get(&(Side::Intro, 32, 8)), None);
+    }
+
+    #[test]
+    fn insert_on_an_already_cached_key_keeps_the_original() {
+        let mut cache = ClipCache::new();
+        let key: ClipKey = (Side::Outro, 16, 8);
+        cache.insert(key, clip(1.0));
+        cache.insert(key, clip(2.0));
+        assert_eq!(cache.get(&key), Some(clip(1.0)));
+    }
+
+    #[test]
+    fn capacity_four_evicts_the_oldest_insertion() {
+        let mut cache = ClipCache::new();
+        let keys: [ClipKey; 5] = [
+            (Side::Intro, 8, 8),
+            (Side::Intro, 16, 8),
+            (Side::Intro, 32, 8),
+            (Side::Intro, 48, 8),
+            (Side::Intro, 64, 8),
+        ];
+        for (i, &key) in keys.iter().enumerate() {
+            cache.insert(key, clip(i as f32));
+        }
+        assert_eq!(
+            cache.get(&keys[0]),
+            None,
+            "the first insertion must have been evicted once the 5th arrived"
+        );
+        for &key in &keys[1..] {
+            assert!(cache.contains(&key), "{key:?} should still be cached");
+        }
+    }
+}
+
+/// One candidate clip to build in the background: `key` names it, `grid` is
+/// the already-measured [`label_session::ClickGrid`] for its side (`Copy`,
+/// cheap to send across the channel).
+struct PrefetchRequest {
+    key: ClipKey,
+    grid: label_session::ClickGrid,
+}
+
+/// Builds and playback-prepares one candidate clip: the same call sequence
+/// on both the synchronous (foreground) and prefetch (background) paths, so
+/// a cache hit is guaranteed to be the bytes a fresh build would have
+/// produced.
+#[allow(clippy::too_many_arguments)]
+fn build_and_prepare_clip(
+    buf: &funkot_core::decode::AudioBuffer,
+    analysis: &funkot_core::TrackAnalysis,
+    key: ClipKey,
+    grid: label_session::ClickGrid,
+    click_opts: &label_session::ClickOptions,
+    device_rate: u32,
+    rate: f64,
+    pitch_mode: PitchMode,
+) -> Vec<f32> {
+    let (side, bars, half_width) = key;
+    let clip = label_session::build_candidate_clip_on_grid(
+        buf, analysis, side, bars, half_width, click_opts, grid,
+    );
+    prepare_clip_for_playback(clip, buf.sample_rate, device_rate, rate, pitch_mode)
+}
+
+/// The clip for `session`'s current side/candidate/width: a cache hit if the
+/// prefetch worker (or an earlier visit) already built it, otherwise built
+/// synchronously here -- same as before prefetching existed -- and cached
+/// for next time.
+#[allow(clippy::too_many_arguments)]
+fn build_or_cached_clip(
+    session: &TrackSession,
+    buf: &funkot_core::decode::AudioBuffer,
+    analysis: &funkot_core::TrackAnalysis,
+    side_grids: &mut label_session::SideGrids,
+    cache: &Mutex<ClipCache>,
+    click_opts: &label_session::ClickOptions,
+    device_rate: u32,
+    rate: f64,
+    pitch_mode: PitchMode,
+) -> Vec<f32> {
+    let side = session.current_side();
+    let key: ClipKey = (side, session.current_bars(), session.context_half_width_bars());
+    if let Some(clip) = cache.lock().unwrap().get(&key) {
+        return clip;
+    }
+    let grid = side_grids.get(buf, analysis, side);
+    let clip =
+        build_and_prepare_clip(buf, analysis, key, grid, click_opts, device_rate, rate, pitch_mode);
+    cache.lock().unwrap().insert(key, clip.clone());
+    clip
+}
+
+/// Kicks off background builds, via `tx`, for the candidates a single
+/// `Left`/`Right` press from `session`'s current position would land on
+/// ([`TrackSession::neighbour_bars`]) -- so that by the time the user
+/// actually presses it, [`build_or_cached_clip`] hits the cache instead of
+/// re-stretching. Best-effort: a `send` failure (the worker already exited)
+/// is silently ignored, same as the plan calls for.
+fn send_prefetch_requests(
+    session: &TrackSession,
+    buf: &funkot_core::decode::AudioBuffer,
+    analysis: &funkot_core::TrackAnalysis,
+    side_grids: &mut label_session::SideGrids,
+    tx: &mpsc::Sender<PrefetchRequest>,
+) {
+    let side = session.current_side();
+    let half_width = session.context_half_width_bars();
+    let grid = side_grids.get(buf, analysis, side);
+    for bars in session.neighbour_bars() {
+        let _ = tx.send(PrefetchRequest { key: (side, bars, half_width), grid });
+    }
+}
+
 fn run_label_sections_interactive(
     playlist: &[PathBuf],
     hashes: &[String],
@@ -2395,9 +2596,10 @@ fn run_label_sections_interactive(
         }
         let progress = format!("[{}/{total}]", i + 1);
 
-        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let analysis =
-            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let buf = Arc::new(decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?);
+        let analysis = Arc::new(
+            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
         // Decode + analyze can run for a minute with no key polling; check the
         // stream now so a device that died meanwhile is torn down here rather
         // than spinning until the next keystroke.
@@ -2412,22 +2614,63 @@ fn run_label_sections_interactive(
 
         let mut session = TrackSession::new(analysis.intro_bars, analysis.outro_structure_bars);
         let mut side_grids = label_session::SideGrids::default();
-        let mut build_clip = |session: &TrackSession| -> Vec<f32> {
-            let grid = side_grids.get(&buf, &analysis, session.current_side());
-            let clip = label_session::build_candidate_clip_on_grid(
-                &buf,
-                &analysis,
-                session.current_side(),
-                session.current_bars(),
-                session.context_half_width_bars(),
-                click_opts,
-                grid,
-            );
-            prepare_clip_for_playback(clip, buf.sample_rate, device_rate, rate, pitch_mode)
-        };
+
+        // Speculative prefetch: while the user listens to the current
+        // candidate (tens of seconds), a single background worker builds the
+        // clip(s) a `Left`/`Right` press would land on next, so consecutive
+        // arrow presses hit `cache` instead of paying for
+        // `prepare_clip_for_playback`'s stretch again. Both `cache` and the
+        // worker are scoped to this track: they close over this track's
+        // `buf`/`analysis` (via `Arc` clones) and must not survive into the
+        // next one. `prefetch_tx` is a plain `let` inside this loop body, so
+        // it -- and with it the worker's only sender -- is dropped whenever
+        // this iteration ends, however it ends (`continue 'tracks`,
+        // `break 'tracks`, or falling off the end); the worker is not
+        // joined, it simply finishes once `recv` starts returning `Err`.
+        let cache: Arc<Mutex<ClipCache>> = Arc::new(Mutex::new(ClipCache::new()));
+        let (prefetch_tx, prefetch_rx) = mpsc::channel::<PrefetchRequest>();
+        {
+            let worker_buf = Arc::clone(&buf);
+            let worker_analysis = Arc::clone(&analysis);
+            let worker_cache = Arc::clone(&cache);
+            let worker_click_opts = *click_opts;
+            thread::spawn(move || {
+                for req in prefetch_rx {
+                    // Lock only to check, never held across the stretch
+                    // below.
+                    if worker_cache.lock().unwrap().contains(&req.key) {
+                        continue;
+                    }
+                    let clip = build_and_prepare_clip(
+                        &worker_buf,
+                        &worker_analysis,
+                        req.key,
+                        req.grid,
+                        &worker_click_opts,
+                        device_rate,
+                        rate,
+                        pitch_mode,
+                    );
+                    // Lock again only to insert, again never held across the
+                    // stretch that built `clip`.
+                    worker_cache.lock().unwrap().insert(req.key, clip);
+                }
+            });
+        }
 
         print_label_track_header(&progress, path);
-        player.play(build_clip(&session));
+        player.play(build_or_cached_clip(
+            &session,
+            &buf,
+            &analysis,
+            &mut side_grids,
+            &cache,
+            click_opts,
+            device_rate,
+            rate,
+            pitch_mode,
+        ));
+        send_prefetch_requests(&session, &buf, &analysis, &mut side_grids, &prefetch_tx);
         print_label_status(&session);
 
         loop {
@@ -2449,7 +2692,18 @@ fn run_label_sections_interactive(
             match session.apply_key(label_key) {
                 LabelOutcome::Continue => print_label_status(&session),
                 LabelOutcome::Replay => {
-                    player.play(build_clip(&session));
+                    player.play(build_or_cached_clip(
+                        &session,
+                        &buf,
+                        &analysis,
+                        &mut side_grids,
+                        &cache,
+                        click_opts,
+                        device_rate,
+                        rate,
+                        pitch_mode,
+                    ));
+                    send_prefetch_requests(&session, &buf, &analysis, &mut side_grids, &prefetch_tx);
                     print_label_status(&session);
                 }
                 LabelOutcome::Skip => {

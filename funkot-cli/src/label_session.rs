@@ -151,6 +151,33 @@ impl TrackSession {
         }
     }
 
+    /// The bar counts a single `Left` or `Right` press would land the cursor
+    /// on from here, for speculative prefetch of the neighbouring candidate
+    /// clips while the current one plays. Same side as [`current_bars`],
+    /// which the caller is responsible for combining with
+    /// [`context_half_width_bars`] itself (not repeated here).
+    ///
+    /// [`move_cursor`] clamps at both ends, so at the first/last candidate
+    /// one direction lands back on the current position; that duplicate (and
+    /// the current position itself) is never included, so the result is 0,
+    /// 1, or 2 bar counts, all distinct from [`current_bars`] and from each
+    /// other.
+    ///
+    /// [`current_bars`]: TrackSession::current_bars
+    /// [`context_half_width_bars`]: TrackSession::context_half_width_bars
+    /// [`move_cursor`]: TrackSession::move_cursor
+    pub fn neighbour_bars(&self) -> Vec<u32> {
+        let candidates = self.side.candidates();
+        let mut out = Vec::with_capacity(2);
+        if self.cursor > 0 {
+            out.push(candidates[self.cursor - 1]);
+        }
+        if self.cursor + 1 < candidates.len() {
+            out.push(candidates[self.cursor + 1]);
+        }
+        out
+    }
+
     pub fn note(&self) -> &str {
         &self.note
     }
@@ -1434,6 +1461,37 @@ mod tests {
             s.current_bars(),
             *INTRO_CANDIDATES.last().unwrap(),
             "must not go past the last candidate"
+        );
+    }
+
+    // --- speculative-prefetch neighbour lookup ------------------------------
+
+    #[test]
+    fn neighbour_bars_at_a_middle_position_returns_both_sides() {
+        // INTRO_CANDIDATES = [8, 16, 32, 48, 64, 80, 96]; nearest to 48 is
+        // index 3, with 32 before it and 64 after.
+        let s = TrackSession::new(48, 8);
+        assert_eq!(s.current_bars(), 48);
+        assert_eq!(s.neighbour_bars(), vec![32, 64]);
+    }
+
+    #[test]
+    fn neighbour_bars_at_the_first_candidate_has_only_a_next() {
+        let s = TrackSession::new(8, 8); // nearest to 8 is index 0
+        assert_eq!(s.current_bars(), 8);
+        assert_eq!(s.neighbour_bars(), vec![16]);
+    }
+
+    #[test]
+    fn neighbour_bars_at_the_last_candidate_has_only_a_prev() {
+        let mut s = TrackSession::new(8, 8);
+        for _ in 0..INTRO_CANDIDATES.len() + 3 {
+            s.apply_key(LabelKey::Right);
+        }
+        assert_eq!(s.current_bars(), *INTRO_CANDIDATES.last().unwrap());
+        assert_eq!(
+            s.neighbour_bars(),
+            vec![INTRO_CANDIDATES[INTRO_CANDIDATES.len() - 2]]
         );
     }
 
