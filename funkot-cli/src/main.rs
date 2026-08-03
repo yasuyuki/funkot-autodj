@@ -36,7 +36,9 @@ struct Args {
     /// Audio files in play order
     files: Vec<PathBuf>,
 
-    /// Playlist file: one path per line (# comments / blank lines ignored)
+    /// Playlist file: one path per line (# comments / blank lines ignored;
+    /// absolute paths used as-is, relative ones resolved against the list
+    /// file's own directory, not the working directory)
     #[arg(short = 'l', long = "list", value_name = "FILE")]
     list: Option<PathBuf>,
 
@@ -192,6 +194,7 @@ fn run() -> Result<()> {
     }
 
     if args.label_sections {
+        validate_rate(args.rate)?;
         // clap's `requires` guarantees this is Some.
         let labels_path = args.labels.clone().expect("--labels required by clap");
         let playlist = resolve_playlist(&args)?;
@@ -199,12 +202,19 @@ fn run() -> Result<()> {
             click_db_above_rms: args.click_db,
             duck_db: args.click_duck_db,
         };
+        let pitch_mode = if args.pitch_shift {
+            PitchMode::Shift
+        } else {
+            PitchMode::Preserve
+        };
         return run_label_sections(
             &playlist,
             &labels_path,
             &args.cache_dir,
             args.render_clips.as_deref(),
             &click_opts,
+            args.rate,
+            pitch_mode,
         );
     }
 
@@ -295,10 +305,18 @@ fn resolve_playlist(args: &Args) -> Result<Vec<PathBuf>> {
     }
 }
 
-fn build_options(args: &Args) -> Result<EngineOptions> {
-    if !args.rate.is_finite() || !(0.5..=2.0).contains(&args.rate) {
-        bail!("--rate must be finite and in [0.5, 2.0], got {}", args.rate);
+/// Shared by `build_options` (normal playback) and the `--label-sections`
+/// branch of `run()`, which never calls `build_options` and so previously
+/// left `--rate` unvalidated on that path.
+fn validate_rate(rate: f64) -> Result<()> {
+    if !rate.is_finite() || !(0.5..=2.0).contains(&rate) {
+        bail!("--rate must be finite and in [0.5, 2.0], got {}", rate);
     }
+    Ok(())
+}
+
+fn build_options(args: &Args) -> Result<EngineOptions> {
+    validate_rate(args.rate)?;
     if !(1..=16).contains(&args.fade_bars) {
         bail!("--fade-bars must be in 1..=16, got {}", args.fade_bars);
     }
@@ -1477,6 +1495,8 @@ fn run_label_sections(
     cache_dir: &Path,
     render_clips_dir: Option<&Path>,
     click_opts: &label_session::ClickOptions,
+    rate: f64,
+    pitch_mode: PitchMode,
 ) -> Result<()> {
     let existing = if labels_path.exists() {
         funkot_core::labels::load_labels(labels_path).map_err(|e| anyhow::anyhow!("{e}"))?
@@ -1518,7 +1538,16 @@ fn run_label_sections(
         return render_label_clips(&todo, cache_dir, dir, click_opts);
     }
 
-    run_label_sections_interactive(playlist, &hashes, &labeled, labels_path, cache_dir, click_opts)
+    run_label_sections_interactive(
+        playlist,
+        &hashes,
+        &labeled,
+        labels_path,
+        cache_dir,
+        click_opts,
+        rate,
+        pitch_mode,
+    )
 }
 
 /// `--render-clips DIR`: for every candidate on both sides of every track in
@@ -1566,28 +1595,97 @@ fn render_label_clips(
     Ok(())
 }
 
-/// Resample a `--label-sections` click clip from the source file's own
-/// sample rate to the output device's rate. [`ClipPlayer`] streams whatever
-/// buffer it's handed straight into the device callback with no rate
-/// conversion of its own, so without this, a device default that differs
-/// from the file's rate (e.g. a 48 kHz device against 44.1 kHz Funkot
-/// masters) played every clip audibly fast/sharp or slow/flat. `speed` is
-/// pinned to `1.0` and [`PitchMode::Shift`] used deliberately: this needs an
-/// exact sample-rate match for correct playback speed, not a tempo change,
-/// so the plain-resample path (reused from the loader's existing
-/// [`funkot_core::stretch`]) is the right one, not the pitch-preserving
-/// stretch.
-fn resample_clip_for_device(clip: Vec<f32>, source_rate: u32, device_rate: u32) -> Vec<f32> {
-    if source_rate == device_rate {
+/// Highest instantaneous sample magnitude label-sections playback is allowed
+/// to reach after speed/pitch/rate conversion. Same value and same reasoning
+/// as `label_session::CLIP_SAFETY_CEILING` (slightly below 1.0 for float
+/// rounding margin, not because 1.0 itself is a problem) -- that constant
+/// caps what the click-track synthesis in `label_session.rs` produces before
+/// this stage ever sees it; this one caps what `render_track` can do to a
+/// clip that came in under that ceiling.
+const PLAYBACK_PEAK_CEILING: f32 = 0.97;
+
+/// Scale `samples` down by a single factor if their peak magnitude exceeds
+/// [`PLAYBACK_PEAK_CEILING`]; a no-op otherwise.
+///
+/// Needed because `PitchMode::Preserve` at `--rate` 1.10 measurably pushes
+/// hot Funkot masters over full scale: on a real clip (`03. KazuyaP -
+/// Monitoring Db.flac`, intro 16 bars, source peak 0.991) `Preserve` at 1.10
+/// came out at peak 1.749 with 0.1255% of samples over 1.0, i.e. audibly
+/// clipped at the device. Production mixing never sees this because the
+/// engine applies `analysis.gain_db` (RMS-normalizing gain toward
+/// `TARGET_RMS_DBFS`, see `gain_linear` in `funkot-core/src/engine.rs`)
+/// before the mix bus reaches the device; label clips are built straight
+/// from the source material and never go through that gain stage, so
+/// nothing else in this path stops the peak from exceeding full scale.
+///
+/// Scales the whole clip by one scalar rather than per-sample limiting, so
+/// the click/music balance `label_session`'s synthesis decided (via
+/// `click_db_above_rms` and the sidechain ducking) is preserved exactly --
+/// only the overall level moves.
+fn clamp_playback_peak(samples: &mut [f32]) {
+    let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak <= PLAYBACK_PEAK_CEILING {
+        return;
+    }
+    let scale = PLAYBACK_PEAK_CEILING / peak;
+    for s in samples.iter_mut() {
+        *s *= scale;
+    }
+}
+
+/// Prepare a `--label-sections` click clip for playback: apply the `--rate`
+/// playback speed and, in the same pass, match the output device's sample
+/// rate. [`ClipPlayer`] streams whatever buffer it's handed straight into
+/// the device callback with no rate conversion of its own, so both of these
+/// have to happen here or not at all.
+///
+/// Playback runs at `speed` (normally `--rate`, default 1.10) rather than
+/// 1.0 because production DJ playback is always sped up by that factor, and
+/// labeling by ear at the production speed is more representative than
+/// labeling at the source tempo. This is a fixed multiplier on the
+/// material's own tempo, deliberately *not* the engine's 198 BPM
+/// normalization (`180 * rate / intro_bpm`, see `EngineOptions`/loader):
+/// tying the labeling speed to BPM estimation would mean a track whose BPM
+/// was mis-detected at half or double time gets labeled at 2x speed by
+/// accident. The label clips are built from the source material, which is
+/// nominally 180 BPM, so in practice this comes out to the same multiplier
+/// as the engine's normalization anyway.
+///
+/// Device sample-rate matching is unconditional whenever `source_rate !=
+/// device_rate` (e.g. a 48 kHz device against 44.1 kHz Funkot masters);
+/// without it every clip played audibly fast/sharp or slow/flat. It rides
+/// along in the same [`funkot_core::stretch::render_track`] call as the
+/// speed change rather than a separate resample step.
+///
+/// Measured cost (106 s clip, 44.1 kHz → 48 kHz, release build, this dev
+/// environment): `PitchMode::Preserve` 1.67 s, `PitchMode::Shift` 0.46 s,
+/// vs. 0.54 s for the old speed-1.0 resample-only path. So the default
+/// (pitch preserved, matching production) adds roughly 1.2 s of wait per
+/// keystroke; `--pitch-shift` does not.
+///
+/// Runs the result through [`clamp_playback_peak`] before returning: see
+/// that function for why a speed change alone can drive a clip over full
+/// scale here even though nothing else in this path does.
+fn prepare_clip_for_playback(
+    clip: Vec<f32>,
+    source_rate: u32,
+    device_rate: u32,
+    speed: f64,
+    pitch_mode: PitchMode,
+) -> Vec<f32> {
+    if source_rate == device_rate && speed == 1.0 {
         return clip;
     }
-    match funkot_core::stretch::render_track(&clip, source_rate, device_rate, 1.0, PitchMode::Shift)
-    {
-        Ok(resampled) => resampled,
+    match funkot_core::stretch::render_track(&clip, source_rate, device_rate, speed, pitch_mode) {
+        Ok(mut rendered) => {
+            clamp_playback_peak(&mut rendered);
+            rendered
+        }
         Err(e) => {
             eprintln!(
-                "warn: could not resample label-sections clip {source_rate} Hz -> \
-                 {device_rate} Hz ({e}); playing at source rate (pitch/tempo will be off)"
+                "warn: could not prepare label-sections clip for playback ({source_rate} Hz -> \
+                 {device_rate} Hz, speed {speed}, {e}); playing at source rate and speed \
+                 (pitch/tempo will be off)"
             );
             clip
         }
@@ -1595,14 +1693,14 @@ fn resample_clip_for_device(clip: Vec<f32>, source_rate: u32, device_rate: u32) 
 }
 
 #[cfg(test)]
-mod resample_clip_for_device_tests {
+mod prepare_clip_for_playback_tests {
     use super::*;
 
-    fn stereo_sine(frames: usize, freq: f32, sr: u32) -> Vec<f32> {
+    fn stereo_sine(frames: usize, freq: f32, sr: u32, amp: f32) -> Vec<f32> {
         let mut out = vec![0.0f32; frames * 2];
         for i in 0..frames {
             let t = i as f32 / sr as f32;
-            let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.5;
+            let s = (2.0 * std::f32::consts::PI * freq * t).sin() * amp;
             out[i * 2] = s;
             out[i * 2 + 1] = s;
         }
@@ -1610,10 +1708,11 @@ mod resample_clip_for_device_tests {
     }
 
     #[test]
-    fn matching_rates_pass_through_unchanged() {
-        let clip = stereo_sine(2_000, 440.0, 44_100);
-        let out = resample_clip_for_device(clip.clone(), 44_100, 44_100);
-        assert_eq!(out, clip, "same source/device rate must be a no-op");
+    fn matching_rates_and_unit_speed_pass_through_unchanged() {
+        let clip = stereo_sine(2_000, 440.0, 44_100, 0.5);
+        let out =
+            prepare_clip_for_playback(clip.clone(), 44_100, 44_100, 1.0, PitchMode::Preserve);
+        assert_eq!(out, clip, "same source/device rate and speed 1.0 must be a no-op");
     }
 
     #[test]
@@ -1623,8 +1722,9 @@ mod resample_clip_for_device_tests {
         // with no rate conversion at all.
         let source_rate = 44_100;
         let device_rate = 48_000;
-        let clip = stereo_sine(4_410, 440.0, source_rate); // 100 ms
-        let out = resample_clip_for_device(clip, source_rate, device_rate);
+        let clip = stereo_sine(4_410, 440.0, source_rate, 0.5); // 100 ms
+        let out =
+            prepare_clip_for_playback(clip, source_rate, device_rate, 1.0, PitchMode::Preserve);
 
         let expected_frames = 4_410 * device_rate as usize / source_rate as usize;
         let out_frames = out.len() / 2;
@@ -1633,6 +1733,108 @@ mod resample_clip_for_device_tests {
             "out_frames={out_frames} expected≈{expected_frames}"
         );
         assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn same_rate_speed_1_10_preserve_shortens_by_the_rate() {
+        // Amplitude 0.95, not 0.5: the stretch overshoots its input peak by
+        // about 1.35x (measured), so 0.5 comes out at ~0.676 and never reaches
+        // the ceiling -- the peak assertion below would then hold even if
+        // `prepare_clip_for_playback` stopped clamping at all.
+        let sr = 44_100;
+        let clip = stereo_sine(sr as usize, 440.0, sr, 0.95); // 1s
+        let out = prepare_clip_for_playback(clip.clone(), sr, sr, 1.10, PitchMode::Preserve);
+
+        let in_frames = clip.len() / 2;
+        let expected_frames = (in_frames as f64 / 1.10).round() as usize;
+        let out_frames = out.len() / 2;
+        assert!(
+            out_frames.abs_diff(expected_frames) <= expected_frames / 50 + 8,
+            "out_frames={out_frames} expected≈{expected_frames}"
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            (peak - PLAYBACK_PEAK_CEILING).abs() < 1e-6,
+            "peak {peak} must equal the ceiling (clamped)"
+        );
+    }
+
+    #[test]
+    fn mismatched_rates_and_speed_1_10_combine_both_effects() {
+        // Amplitude 0.95 for the same reason as the same-rate case above: at
+        // 0.5 the stretch's ~1.35x overshoot stops short of the ceiling and the
+        // peak assertion stops testing anything.
+        let source_rate = 44_100;
+        let device_rate = 48_000;
+        let clip = stereo_sine(source_rate as usize, 440.0, source_rate, 0.95); // 1s
+        let out = prepare_clip_for_playback(
+            clip.clone(),
+            source_rate,
+            device_rate,
+            1.10,
+            PitchMode::Preserve,
+        );
+
+        let in_frames = clip.len() / 2;
+        let expected_frames =
+            (in_frames as f64 * device_rate as f64 / source_rate as f64 / 1.10).round() as usize;
+        let out_frames = out.len() / 2;
+        assert!(
+            out_frames.abs_diff(expected_frames) <= expected_frames / 50 + 8,
+            "out_frames={out_frames} expected≈{expected_frames}"
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            (peak - PLAYBACK_PEAK_CEILING).abs() < 1e-6,
+            "peak {peak} must equal the ceiling (clamped)"
+        );
+    }
+
+    #[test]
+    fn preserve_and_shift_agree_on_output_length() {
+        let sr = 44_100;
+        let clip = stereo_sine(sr as usize, 440.0, sr, 0.5); // 1s
+        let preserve =
+            prepare_clip_for_playback(clip.clone(), sr, sr, 1.10, PitchMode::Preserve);
+        let shift = prepare_clip_for_playback(clip, sr, sr, 1.10, PitchMode::Shift);
+
+        let preserve_frames = preserve.len() / 2;
+        let shift_frames = shift.len() / 2;
+        assert!(
+            preserve_frames.abs_diff(shift_frames) <= shift_frames / 50 + 8,
+            "preserve={preserve_frames} shift={shift_frames}"
+        );
+    }
+
+    #[test]
+    fn clamp_playback_peak_scales_an_over_ceiling_clip_down_and_keeps_ratios() {
+        // Mirrors the measured `Preserve` 1.10 overshoot (peak 1.749).
+        let mut samples = vec![1.75f32, -0.875, 0.0, -1.75];
+        clamp_playback_peak(&mut samples);
+
+        let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            peak <= PLAYBACK_PEAK_CEILING + 1e-6,
+            "peak {peak} must not exceed the ceiling"
+        );
+        // Relative balance within the clip (music vs. click) must be untouched:
+        // the second sample was exactly half the first in magnitude before,
+        // and must still be after a single uniform scale.
+        assert!(
+            (samples[0].abs() / samples[1].abs() - 2.0).abs() < 1e-4,
+            "a single scalar must preserve inter-sample ratios"
+        );
+        assert!((samples[0] - samples[3].abs()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn clamp_playback_peak_leaves_a_below_ceiling_clip_untouched() {
+        let mut samples = vec![0.5f32, -0.3, 0.1, -0.5];
+        let before = samples.clone();
+        clamp_playback_peak(&mut samples);
+        assert_eq!(samples, before, "peak 0.5 is under the ceiling; must be a no-op");
     }
 }
 
@@ -2158,6 +2360,8 @@ fn run_label_sections_interactive(
     labels_path: &Path,
     cache_dir: &Path,
     click_opts: &label_session::ClickOptions,
+    rate: f64,
+    pitch_mode: PitchMode,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = host
@@ -2171,6 +2375,14 @@ fn run_label_sections_interactive(
     let _raw_guard = RawModeGuard;
 
     print_label_key_help();
+    // Playback runs at production speed (see `prepare_clip_for_playback`), so
+    // say so up front — otherwise a labeler who doesn't know that can mistake
+    // a sped-up track for one whose BPM was mis-detected.
+    let pitch_note = match pitch_mode {
+        PitchMode::Preserve => "pitch preserved",
+        PitchMode::Shift => "pitch shifted",
+    };
+    println!("\rplayback {rate:.2}x ({pitch_note})\r");
 
     let total = playlist.len();
     'tracks: for (i, path) in playlist.iter().enumerate() {
@@ -2205,7 +2417,7 @@ fn run_label_sections_interactive(
                 session.context_half_width_bars(),
                 click_opts,
             );
-            resample_clip_for_device(clip, buf.sample_rate, device_rate)
+            prepare_clip_for_playback(clip, buf.sample_rate, device_rate, rate, pitch_mode)
         };
 
         print_label_track_header(&progress, path);
