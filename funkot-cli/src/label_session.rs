@@ -918,6 +918,36 @@ pub fn click_grid(buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) ->
     ClickGrid { lock_offset, ..grid }
 }
 
+/// Per-side memo for [`click_grid`]: `--label-sections` calls it once per
+/// candidate clip built (both on cursor movement and on `--render-clips`'s
+/// per-candidate loop), but its result only depends on `(buffer, analysis,
+/// side)`, so for a fixed track it never changes. Measured in release
+/// (Docker): intro 176-207ms, outro 569-709ms per call — cost this type
+/// exists to pay once per track/side instead of once per keystroke.
+///
+/// **Scoped to one track.** This does not check that `buffer`/`analysis`
+/// passed to [`SideGrids::get`] match what was cached; a `SideGrids` reused
+/// across tracks silently returns the previous track's grid. Construct a
+/// fresh one (e.g. `SideGrids::default()`) per track.
+#[derive(Debug, Default)]
+pub struct SideGrids {
+    intro: Option<ClickGrid>,
+    outro: Option<ClickGrid>,
+}
+
+impl SideGrids {
+    /// The grid for `side`, computing it with [`click_grid`] on the first
+    /// call and returning the memoized value on every later call — for the
+    /// same track/side only, see the type's own doc.
+    pub fn get(&mut self, buffer: &AudioBuffer, analysis: &TrackAnalysis, side: Side) -> ClickGrid {
+        let slot = match side {
+            Side::Intro => &mut self.intro,
+            Side::Outro => &mut self.outro,
+        };
+        *slot.get_or_insert_with(|| click_grid(buffer, analysis, side))
+    }
+}
+
 /// How far every candidate on `side` should agree its lock moved it from the
 /// nominal (propagated-grid) position, in frames — the side's consensus
 /// sub-beat phase. `None` when there isn't enough clean evidence to have an
@@ -2719,5 +2749,61 @@ mod tests {
         let via_grid =
             locked_boundary_on_grid(&buffer, &analysis, Side::Intro, bars, half_width, grid);
         assert_eq!(via_grid, direct, "no consensus -> the candidate's own lock stands");
+    }
+
+    // --- SideGrids memoization ---------------------------------------------
+
+    #[test]
+    fn side_grids_get_matches_click_grid_and_is_stable_across_repeat_calls() {
+        let sr = 22_050u32;
+        let bpm = 180.0;
+        let beat = f64::from(sr) * 60.0 / bpm;
+        let first_downbeat = 1_820u64;
+        let half_width = NORMAL_HALF_WIDTH_BARS;
+        let last = *INTRO_CANDIDATES.last().unwrap();
+        let total_bars = last + half_width + 4;
+        let frames = first_downbeat + (beat * 4.0 * f64::from(total_bars)).round() as u64;
+        let samples = synth_gridded_dense_loud_stereo(frames as usize, sr, first_downbeat, beat);
+        let buffer = AudioBuffer { sample_rate: sr, frames, samples };
+        let analysis = sample_analysis(sr, bpm, bpm, first_downbeat, frames);
+
+        let mut grids = SideGrids::default();
+        let intro_expected = click_grid(&buffer, &analysis, Side::Intro);
+        let intro_first = grids.get(&buffer, &analysis, Side::Intro);
+        assert_eq!(intro_first, intro_expected);
+        let intro_second = grids.get(&buffer, &analysis, Side::Intro);
+        assert_eq!(
+            intro_second, intro_first,
+            "a second Intro call must return the memoized grid unchanged"
+        );
+
+        let outro_expected = click_grid(&buffer, &analysis, Side::Outro);
+        let outro_first = grids.get(&buffer, &analysis, Side::Outro);
+        assert_eq!(outro_first, outro_expected);
+        let outro_second = grids.get(&buffer, &analysis, Side::Outro);
+        assert_eq!(
+            outro_second, outro_first,
+            "a second Outro call must return the memoized grid unchanged"
+        );
+
+        // The two sides must never share a slot.
+        assert_ne!(
+            intro_first, outro_first,
+            "Intro and Outro grids should not collide on this fixture"
+        );
+    }
+
+    #[test]
+    fn side_grids_get_matches_click_grid_on_the_outro_side_with_a_real_music_end() {
+        let (mut samples, sr, _, beat_true, analysis) = end_fixture(120, 0.0);
+        push_decaying_tail(&mut samples, 2.6, 0.4, beat_true, sr);
+        let (buffer, analysis) = finish(samples, sr, &analysis);
+
+        let mut grids = SideGrids::default();
+        let expected = click_grid(&buffer, &analysis, Side::Outro);
+        let first = grids.get(&buffer, &analysis, Side::Outro);
+        assert_eq!(first, expected);
+        let second = grids.get(&buffer, &analysis, Side::Outro);
+        assert_eq!(second, first, "memoized outro grid must not change on a repeat call");
     }
 }

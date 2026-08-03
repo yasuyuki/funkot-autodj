@@ -1572,15 +1572,18 @@ fn render_label_clips(
             .unwrap_or("track");
 
         let mut n = 0usize;
+        let mut side_grids = label_session::SideGrids::default();
         for side in [Side::Intro, Side::Outro] {
             for &bars in side.candidates() {
-                let clip = label_session::build_candidate_clip(
+                let grid = side_grids.get(&buf, &analysis, side);
+                let clip = label_session::build_candidate_clip_on_grid(
                     &buf,
                     &analysis,
                     side,
                     bars,
                     label_session::NORMAL_HALF_WIDTH_BARS,
                     click_opts,
+                    grid,
                 );
                 let clip_path =
                     out_dir.join(format!("{stem}_{}_{bars:03}bars.wav", side.label()));
@@ -2408,14 +2411,17 @@ fn run_label_sections_interactive(
         }
 
         let mut session = TrackSession::new(analysis.intro_bars, analysis.outro_structure_bars);
-        let build_clip = |session: &TrackSession| -> Vec<f32> {
-            let clip = label_session::build_candidate_clip(
+        let mut side_grids = label_session::SideGrids::default();
+        let mut build_clip = |session: &TrackSession| -> Vec<f32> {
+            let grid = side_grids.get(&buf, &analysis, session.current_side());
+            let clip = label_session::build_candidate_clip_on_grid(
                 &buf,
                 &analysis,
                 session.current_side(),
                 session.current_bars(),
                 session.context_half_width_bars(),
                 click_opts,
+                grid,
             );
             prepare_clip_for_playback(clip, buf.sample_rate, device_rate, rate, pitch_mode)
         };
