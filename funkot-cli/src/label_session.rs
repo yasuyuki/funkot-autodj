@@ -1212,6 +1212,99 @@ pub fn locked_boundary_on_grid(
     locked
 }
 
+// ---------------------------------------------------------------------
+// `--survey` clip synthesis.
+//
+// A separate, much simpler clip than `build_candidate_clip`'s: one fixed
+// window per track (no candidate bar counts, no navigation), with a click on
+// every *beat* rather than every bar head. `--label-sections`' bar-head
+// clicks answer "is the grid's bar identity right"; `--survey` is checking
+// something narrower and specifically not that -- whether the whole grid has
+// slipped by a sub-bar (half-beat) amount, which a bar-head-only click
+// cannot expose (a click a beat early and a click a beat late both still
+// land "on some beat", the ear can't tell drift from bar miscount from a
+// single click a bar apart). Clicking every beat turns that into "is *this*
+// beat's click on the beat or in the gap between two", four times as much
+// evidence per bar as a bar-head click gives, and audibly different in kind
+// (a steady four-per-bar tick against the groove) from a bar-phase error.
+// ---------------------------------------------------------------------
+
+/// Bars the `--survey` window spans, counted back from the window's end
+/// frame (normally [`ClickGrid::outro_anchor`] -- the measured end of the
+/// music, not the file end). See [`build_survey_clip`].
+pub const SURVEY_WINDOW_BARS: u32 = 8;
+
+/// Frame offsets, relative to the window start, of every beat-head click
+/// [`build_survey_clip_on_grid`] places across [`SURVEY_WINDOW_BARS`] bars --
+/// `SURVEY_WINDOW_BARS * BEATS_PER_BAR` of them, evenly spaced `bar_frames /
+/// BEATS_PER_BAR` apart starting at 0. Empty when `bar_frames` isn't usable
+/// (non-finite or degenerate), matching every other grid helper in this
+/// module.
+pub fn survey_click_offsets(bar_frames: f64) -> Vec<i64> {
+    if !(bar_frames.is_finite() && bar_frames > 1.0) {
+        return Vec::new();
+    }
+    let beat_frames = bar_frames / f64::from(BEATS_PER_BAR);
+    let n = SURVEY_WINDOW_BARS * BEATS_PER_BAR;
+    (0..n).map(|k| (beat_frames * f64::from(k)).round() as i64).collect()
+}
+
+/// Build the `--survey` listening clip: [`SURVEY_WINDOW_BARS`] bars of
+/// source audio ending at `end_frame`, with a click synthesized on every beat
+/// in that range ([`survey_click_offsets`]). Deliberately excludes the tail
+/// (`end_frame` onward, e.g. the file's ring-out past the last hit): the
+/// survey is asking whether the grid is on the beat *there*, at the worst
+/// case for accumulated drift (see `outro_bar_frames_refit`'s doc on lever
+/// arm), and the material after it answers a different question.
+///
+/// `end_frame` may be negative or run past `buffer.frames`; out-of-range
+/// parts of the window are left silent, same as [`render_click_clip`] --
+/// the clicks are synthesized independently of what source audio is present.
+pub fn build_survey_clip_on_grid(
+    buffer: &AudioBuffer,
+    bar_frames: f64,
+    end_frame: i64,
+    click_opts: &ClickOptions,
+) -> Vec<f32> {
+    let window_frames = (bar_frames * f64::from(SURVEY_WINDOW_BARS)).round().max(0.0) as i64;
+    let clip_start = end_frame - window_frames;
+
+    let mut out = vec![0.0f32; window_frames as usize * 2];
+    for i in 0..window_frames {
+        let src_frame = clip_start + i;
+        if src_frame >= 0 && (src_frame as u64) < buffer.frames {
+            let src_idx = src_frame as usize * 2;
+            out[i as usize * 2] = buffer.samples[src_idx];
+            out[i as usize * 2 + 1] = buffer.samples[src_idx + 1];
+        }
+    }
+
+    let sr = f64::from(buffer.sample_rate);
+    let base_amp = click_base_amplitude(rms(&out), click_opts.click_db_above_rms);
+    for offset in survey_click_offsets(bar_frames) {
+        if offset < 0 {
+            continue;
+        }
+        let start = offset as usize;
+        if start * 2 >= out.len() {
+            break;
+        }
+        add_click(&mut out, start, sr, ClickKind::Normal, base_amp, click_opts.duck_db);
+    }
+    out
+}
+
+/// [`build_survey_clip_on_grid`] against the measured grid for a track's
+/// outro ([`click_grid`]) -- the entry point `--survey` actually calls.
+pub fn build_survey_clip(
+    buffer: &AudioBuffer,
+    analysis: &TrackAnalysis,
+    click_opts: &ClickOptions,
+) -> Vec<f32> {
+    let grid = click_grid(buffer, analysis, Side::Outro);
+    build_survey_clip_on_grid(buffer, grid.bar_frames, grid.outro_anchor, click_opts)
+}
+
 /// How far past the listening window a candidate clip keeps playing, in bars.
 ///
 /// The window on its own answers "is the boundary click on a bar line", but
@@ -2955,5 +3048,105 @@ mod tests {
         assert_eq!(first, expected);
         let second = grids.get(&buffer, &analysis, Side::Outro);
         assert_eq!(second, first, "memoized outro grid must not change on a repeat call");
+    }
+
+    // --- `--survey` clip synthesis ------------------------------------------
+
+    #[test]
+    fn survey_click_offsets_are_every_beat_across_8_bars() {
+        // bar_frames = 240 -> beat_frames = 60 (nice round numbers, same
+        // choice as `click_clip_has_expected_length_and_bar_head_clicks`).
+        let bar_frames = 240.0;
+        let offsets = survey_click_offsets(bar_frames);
+        assert_eq!(
+            offsets.len(),
+            (SURVEY_WINDOW_BARS * BEATS_PER_BAR) as usize,
+            "one click per beat across the whole window, not one per bar"
+        );
+        assert_eq!(offsets[0], 0);
+        for w in offsets.windows(2) {
+            assert_eq!(w[1] - w[0], 60, "beats must be evenly spaced a quarter-bar apart");
+        }
+        let window_frames = (bar_frames * f64::from(SURVEY_WINDOW_BARS)) as i64;
+        assert!(
+            *offsets.last().unwrap() < window_frames,
+            "every click must land inside the window"
+        );
+    }
+
+    #[test]
+    fn survey_click_offsets_is_empty_for_a_degenerate_bar_frames() {
+        assert_eq!(survey_click_offsets(0.0), Vec::<i64>::new());
+        assert_eq!(survey_click_offsets(f64::NAN), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn survey_clip_window_is_exactly_8_bars_and_excludes_the_tail() {
+        // sr=180, bpm=180 -> bar_frames=240; end_frame chosen well past both
+        // the window and a further "tail" of source audio, so a clip that
+        // wrongly ran to the file end (instead of stopping at end_frame)
+        // would be caught by the length assertion below.
+        let sr = 180u32;
+        let bar_frames = 240.0;
+        let window_frames = (bar_frames * f64::from(SURVEY_WINDOW_BARS)).round() as i64;
+        let end_frame = 5_000i64;
+        let tail_frames = 2_000usize; // audio that exists past end_frame
+        let total_frames = end_frame as usize + tail_frames;
+        let buffer = AudioBuffer {
+            sample_rate: sr,
+            frames: total_frames as u64,
+            samples: vec![0.3f32; total_frames * 2],
+        };
+        let clip =
+            build_survey_clip_on_grid(&buffer, bar_frames, end_frame, &ClickOptions::default());
+        assert_eq!(
+            clip.len() as i64,
+            window_frames * 2,
+            "the clip must be exactly SURVEY_WINDOW_BARS bars long, not extend to the file end"
+        );
+    }
+
+    #[test]
+    fn survey_clip_has_a_click_on_every_beat_and_silence_between_them() {
+        let sr = 180u32;
+        let bar_frames = 240.0;
+        let end_frame = 3_000i64;
+        // No source audio at all (frames=0): any non-zero sample in the clip
+        // must have come from a synthesized click, not from the source.
+        let buffer = AudioBuffer { sample_rate: sr, frames: 0, samples: Vec::new() };
+        let clip =
+            build_survey_clip_on_grid(&buffer, bar_frames, end_frame, &ClickOptions::default());
+
+        let window_frames = (bar_frames * f64::from(SURVEY_WINDOW_BARS)).round() as usize;
+        assert_eq!(clip.len(), window_frames * 2);
+
+        let is_active = |offset: usize| {
+            let hi = (offset + 15).min(clip.len() / 2);
+            (offset..hi).any(|f| clip[f * 2] != 0.0)
+        };
+        let offsets = survey_click_offsets(bar_frames);
+        for &offset in &offsets {
+            assert!(is_active(offset as usize), "expected a click at beat offset {offset}");
+        }
+        // Halfway between the first two beats: no source audio, no click.
+        assert!(!is_active(30), "expected silence between beat clicks");
+    }
+
+    #[test]
+    fn survey_clip_via_click_grid_matches_the_on_grid_call() {
+        // With an empty buffer, `music_end_bar` bails out immediately
+        // (total <= first_downbeat) and `click_grid` falls back to the
+        // nominal outro grid -- exercised here to confirm the public
+        // `build_survey_clip` wiring (click_grid -> build_survey_clip_on_grid)
+        // matches calling the two halves directly.
+        let sr = 180u32;
+        let analysis = sample_analysis(sr, 180.0, 180.0, 0, 5_000);
+        let buffer = AudioBuffer { sample_rate: sr, frames: 0, samples: Vec::new() };
+        let opts = ClickOptions::default();
+
+        let via_wrapper = build_survey_clip(&buffer, &analysis, &opts);
+        let grid = ClickGrid::nominal(&analysis, Side::Outro);
+        let direct = build_survey_clip_on_grid(&buffer, grid.bar_frames, grid.outro_anchor, &opts);
+        assert_eq!(via_wrapper, direct);
     }
 }

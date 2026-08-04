@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, StreamConfig, SupportedBufferSize};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -32,6 +32,14 @@ use log::warn;
     version,
     arg_required_else_help = true
 )]
+// The two modes that synthesize a click track, as one group so `--click-db`
+// and `--click-duck-db` can `requires` it. Without the group each would have
+// to name a single mode, and dropping the requirement outright (the obvious
+// way to share them) makes a `--click-db` passed to plain playback silently
+// do nothing -- exactly the failure that wastes an evening on "I turned the
+// clicks up and nothing got louder". `multiple = false` also keeps the two
+// modes mutually exclusive, which is why neither carries a `conflicts_with`.
+#[command(group(ArgGroup::new("click_modes").args(["label_sections", "survey"]).multiple(false)))]
 struct Args {
     /// Audio files in play order
     files: Vec<PathBuf>,
@@ -154,18 +162,45 @@ struct Args {
     #[arg(long, value_name = "DIR", requires = "label_sections")]
     render_clips: Option<PathBuf>,
 
-    /// `--label-sections` click peak level, in dB above the clip's own RMS
-    /// loudness (not a fixed absolute amplitude — real Funkot masters run
-    /// hot enough that a fixed number either got lost or clipped). Raise
-    /// this if clicks are still hard to hear on a given track.
-    #[arg(long, default_value_t = label_session::ClickOptions::default().click_db_above_rms, requires = "label_sections")]
+    /// Interactive outro-grid survey: for each track, play a window over the
+    /// last `label_session::SURVEY_WINDOW_BARS` bars of the outro (clicking
+    /// every beat, not just every bar head) and record a one-key judgement of
+    /// whether the click grid sits on the beat, then move to the next track.
+    /// Tracks come from `-l/--list` or the positional FILES, same as normal
+    /// playback. Does not read or write `--labels`; verdicts go to
+    /// `--survey-out` instead. See `funkot_cli::label_session` for the clip
+    /// synthesis this plays.
+    #[arg(long = "survey", requires = "survey_out")]
+    survey: bool,
+
+    /// Verdict TSV path for `--survey` (required with that flag). A track
+    /// already judged there (matched by content hash, the same key
+    /// `--labels` uses) is skipped on the next run.
+    #[arg(long = "survey-out", value_name = "FILE")]
+    survey_out: Option<PathBuf>,
+
+    /// Click peak level, in dB above the clip's own RMS loudness (not a
+    /// fixed absolute amplitude — real Funkot masters run hot enough that a
+    /// fixed number either got lost or clipped), for `--label-sections` and
+    /// `--survey` alike. Raise this if clicks are still hard to hear on a
+    /// given track.
+    #[arg(
+        long,
+        default_value_t = label_session::ClickOptions::default().click_db_above_rms,
+        requires = "click_modes"
+    )]
     click_db: f32,
 
-    /// `--label-sections`: how many dB to duck the music under each bar-head
-    /// click (sidechain-style, so the click cuts through dense/loud
-    /// material). The boundary click ducks deeper and longer automatically
-    /// on top of this, so it stays distinguishable from a normal bar head.
-    #[arg(long, default_value_t = label_session::ClickOptions::default().duck_db, requires = "label_sections")]
+    /// How many dB to duck the music under each click (sidechain-style, so
+    /// the click cuts through dense/loud material), for `--label-sections`
+    /// and `--survey` alike. `--label-sections`' boundary click ducks deeper
+    /// and longer automatically on top of this, so it stays distinguishable
+    /// from a normal bar head.
+    #[arg(
+        long,
+        default_value_t = label_session::ClickOptions::default().duck_db,
+        requires = "click_modes"
+    )]
     click_duck_db: f32,
 }
 
@@ -212,6 +247,30 @@ fn run() -> Result<()> {
             &labels_path,
             &args.cache_dir,
             args.render_clips.as_deref(),
+            &click_opts,
+            args.rate,
+            pitch_mode,
+        );
+    }
+
+    if args.survey {
+        validate_rate(args.rate)?;
+        // clap's `requires` guarantees this is Some.
+        let survey_out = args.survey_out.clone().expect("--survey-out required by clap");
+        let playlist = resolve_playlist(&args)?;
+        let click_opts = label_session::ClickOptions {
+            click_db_above_rms: args.click_db,
+            duck_db: args.click_duck_db,
+        };
+        let pitch_mode = if args.pitch_shift {
+            PitchMode::Shift
+        } else {
+            PitchMode::Preserve
+        };
+        return run_survey(
+            &playlist,
+            &survey_out,
+            &args.cache_dir,
             &click_opts,
             args.rate,
             pitch_mode,
@@ -2735,6 +2794,509 @@ fn run_label_sections_interactive(
                         intro.best,
                         outro.best
                     );
+                    continue 'tracks;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `--survey`: one-window-per-track outro-grid survey. Reuses the raw-mode
+// key loop / `ClipPlayer` / `prepare_clip_for_playback` machinery above,
+// but is otherwise independent of `--label-sections`: a different (much
+// simpler) key vocabulary, a different verdict TSV that is never
+// `funkot_core::labels`, and a fixed one-shot clip per track instead of
+// candidate navigation. See `label_session::build_survey_clip` for the
+// clip itself.
+// ---------------------------------------------------------------------
+
+/// One judged row in a `--survey-out` file: the survey's equivalent of
+/// `funkot_core::labels::SectionLabel`, but deliberately a separate, simpler
+/// type -- `--survey` never reads or writes `labels.tsv`.
+///
+/// On-disk format: tab-separated, header `content_hash\tfile_name\tverdict`,
+/// one row per judgement. Appended to, never rewritten in place: judging the
+/// same track twice leaves two rows, and the later one is what a summarizer
+/// reading the file should treat as authoritative. [`load_survey_judged`]
+/// only needs *whether* a hash has a row at all, so nothing here needs to
+/// resolve that itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurveyRow {
+    hash: String,
+    file_name: String,
+    verdict: String,
+}
+
+const SURVEY_HEADER: &str = "content_hash\tfile_name\tverdict";
+
+/// Parse `--survey-out` TSV text (split out from [`load_survey_judged`] for
+/// testing without a file). Comment (`#`) and blank lines are ignored
+/// wherever they occur, and the first remaining line is treated as the
+/// header and skipped, the same conventions as
+/// `funkot_core::labels::parse_labels` -- independently implemented here
+/// since this is a different, simpler (3-column) format. A malformed data
+/// row (wrong column count, or an empty hash) is silently dropped rather
+/// than failing the whole load: a partially-written row from a killed
+/// process should not make every other verdict in the file unreadable.
+fn parse_survey_rows(contents: &str) -> Vec<SurveyRow> {
+    let mut rows = Vec::new();
+    for raw_line in contents.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Match the header by its text rather than "whatever the first row
+        // happens to be": a content hash can never spell `content_hash`, so
+        // this cannot eat a verdict, and a file that somehow lost its header
+        // still parses in full instead of silently dropping its first track
+        // (which would re-ask that track on every later run).
+        if trimmed == SURVEY_HEADER {
+            continue;
+        }
+        let fields: Vec<&str> = raw_line.splitn(3, '\t').collect();
+        if fields.len() != 3 {
+            continue;
+        }
+        let hash = fields[0].trim().to_string();
+        if hash.is_empty() {
+            continue;
+        }
+        rows.push(SurveyRow {
+            hash,
+            file_name: fields[1].trim().to_string(),
+            verdict: fields[2].trim().to_string(),
+        });
+    }
+    rows
+}
+
+/// Hashes already judged in `path` (i.e. that have at least one row), so
+/// [`run_survey`] can skip them on this run. Empty (not an error) if `path`
+/// doesn't exist yet -- a fresh survey has nothing to skip.
+fn load_survey_judged(path: &Path) -> Result<std::collections::HashSet<String>> {
+    if !path.exists() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read survey file '{}'", path.display()))?;
+    Ok(parse_survey_rows(&contents).into_iter().map(|r| r.hash).collect())
+}
+
+fn sanitize_survey_field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+/// Append one judged row to `path`, writing the header first if the file is
+/// new (and creating the parent directory if needed, same as
+/// `funkot_core::labels::save_labels`). Never truncates or rewrites existing
+/// rows -- see [`SurveyRow`]'s doc on why appending (not upserting) is the
+/// point.
+fn append_survey_verdict(path: &Path, hash: &str, file_name: &str, verdict: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+    }
+    // Size, not existence: an existing but empty file (a `touch`, or a
+    // crash between create and first write) still needs the header. Keying
+    // off `exists()` alone would leave a headerless file behind.
+    let need_header = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("cannot open survey file '{}'", path.display()))?;
+    if need_header {
+        writeln!(f, "{SURVEY_HEADER}")?;
+    }
+    writeln!(
+        f,
+        "{}\t{}\t{}",
+        sanitize_survey_field(hash),
+        sanitize_survey_field(file_name),
+        sanitize_survey_field(verdict)
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod survey_tsv_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    /// Process-unique scratch file path under the system temp dir, cleaned
+    /// up on drop -- same pattern as `funkot_core::labels`'s test `TempFile`.
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "funkot-survey-test-{tag}-{}-{n}.tsv",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn load_survey_judged_on_a_missing_file_is_empty_not_an_error() {
+        let f = TempFile::new("missing");
+        assert!(load_survey_judged(&f.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_then_load_judged_finds_the_hash() {
+        let f = TempFile::new("append-load");
+        assert!(load_survey_judged(&f.0).unwrap().is_empty());
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "ok").unwrap();
+        let judged = load_survey_judged(&f.0).unwrap();
+        assert_eq!(judged.len(), 1);
+        assert!(judged.contains("aaaa1111"));
+    }
+
+    #[test]
+    fn append_writes_the_header_only_once() {
+        let f = TempFile::new("header-once");
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "ok").unwrap();
+        append_survey_verdict(&f.0, "bbbb2222", "track-b.flac", "half").unwrap();
+        let contents = std::fs::read_to_string(&f.0).unwrap();
+        assert_eq!(contents.matches(SURVEY_HEADER).count(), 1);
+        assert_eq!(parse_survey_rows(&contents).len(), 2);
+    }
+
+    #[test]
+    fn a_second_verdict_for_the_same_hash_is_appended_not_overwritten() {
+        // "同じ曲を2回判定したら後の行が勝つ形でよい" -- the file just grows;
+        // this asserts that a summarizer taking the last matching row would
+        // in fact see the later verdict, and that the row count reflects
+        // both judgements rather than one replacing the other on disk.
+        let f = TempFile::new("second-verdict");
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "half").unwrap();
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "ok").unwrap();
+        let contents = std::fs::read_to_string(&f.0).unwrap();
+        let rows = parse_survey_rows(&contents);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.last().unwrap().verdict, "ok");
+        assert!(load_survey_judged(&f.0).unwrap().contains("aaaa1111"));
+    }
+
+    #[test]
+    fn parse_survey_rows_skips_comments_and_blank_lines() {
+        let text = "\
+# comment
+content_hash\tfile_name\tverdict
+
+aaaa1111\ttrack-a.flac\tok
+# another comment
+bbbb2222\ttrack-b.flac\thalf
+";
+        let rows = parse_survey_rows(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].hash, "aaaa1111");
+        assert_eq!(rows[0].verdict, "ok");
+        assert_eq!(rows[1].hash, "bbbb2222");
+        assert_eq!(rows[1].verdict, "half");
+    }
+
+    #[test]
+    fn append_to_an_existing_but_empty_file_still_writes_the_header() {
+        // A `touch`ed (or crash-truncated) file used to satisfy `exists()`
+        // and so never got a header, after which `parse_survey_rows` ate its
+        // first verdict as the header and re-asked that track every run.
+        let f = TempFile::new("empty-existing");
+        std::fs::write(&f.0, "").unwrap();
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "half").unwrap();
+        let contents = std::fs::read_to_string(&f.0).unwrap();
+        assert_eq!(contents.matches(SURVEY_HEADER).count(), 1);
+        assert!(load_survey_judged(&f.0).unwrap().contains("aaaa1111"));
+    }
+
+    #[test]
+    fn parse_survey_rows_keeps_every_row_when_the_header_is_missing() {
+        let text = "aaaa1111\ttrack-a.flac\tok\nbbbb2222\ttrack-b.flac\thalf\n";
+        let rows = parse_survey_rows(text);
+        assert_eq!(rows.len(), 2, "a headerless file must not lose its first row");
+        assert_eq!(rows[0].hash, "aaaa1111");
+    }
+
+    #[test]
+    fn parse_survey_rows_drops_a_malformed_row_but_keeps_the_rest() {
+        let text = "content_hash\tfile_name\tverdict\naaaa1111\tonly-two-fields\nbbbb2222\ttrack-b.flac\thalf\n";
+        let rows = parse_survey_rows(text);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "bbbb2222");
+    }
+}
+
+/// One user keystroke for `--survey`, already decoded from the terminal.
+/// Deliberately a separate, smaller vocabulary than [`LabelKey`]: `--survey`
+/// is a single fixed window per track judged with one keypress, not
+/// `--label-sections`' two-sided candidate navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurveyKey {
+    /// `o`: the click grid sits on the beat.
+    Ok,
+    /// `h`: the click grid sits half a beat off (clicks land on the offbeat).
+    Half,
+    /// `?`: can't tell (too thin, can't lock onto the beat by ear, etc).
+    Unknown,
+    /// `r`: replay the same window.
+    Replay,
+    /// `s`: skip this track without judging it (offered again next run).
+    Skip,
+    Quit,
+}
+
+const SURVEY_KEY_HELP: &str =
+    "keys: o=on the beat  h=half a beat off  ?=can't tell  r=replay  s=skip  q=quit";
+
+fn print_survey_key_help() {
+    println!("\r{SURVEY_KEY_HELP}\r");
+}
+
+/// Decode one crossterm key press into a [`SurveyKey`], or `None` for a key
+/// with no meaning here.
+fn map_survey_key(key: KeyEvent) -> Option<SurveyKey> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        return Some(SurveyKey::Quit);
+    }
+    match key.code {
+        KeyCode::Char('o') | KeyCode::Char('O') => Some(SurveyKey::Ok),
+        KeyCode::Char('h') | KeyCode::Char('H') => Some(SurveyKey::Half),
+        KeyCode::Char('?') => Some(SurveyKey::Unknown),
+        KeyCode::Char('r') | KeyCode::Char('R') => Some(SurveyKey::Replay),
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(SurveyKey::Skip),
+        KeyCode::Char('q') | KeyCode::Char('Q') => Some(SurveyKey::Quit),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod survey_cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_arg_definitions_are_internally_consistent() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn click_flags_need_one_of_the_two_click_modes() {
+        // Sharing `--click-db` between `--label-sections` and `--survey` must
+        // not turn it into a flag that plain playback silently ignores.
+        assert!(Args::try_parse_from(["funkot-autodj", "--click-db", "12", "a.flac"]).is_err());
+        assert!(
+            Args::try_parse_from(["funkot-autodj", "--click-duck-db", "6", "a.flac"]).is_err()
+        );
+        assert!(Args::try_parse_from([
+            "funkot-autodj",
+            "--survey",
+            "--survey-out",
+            "s.tsv",
+            "--click-db",
+            "12",
+            "a.flac",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn the_two_click_modes_are_mutually_exclusive() {
+        assert!(Args::try_parse_from([
+            "funkot-autodj",
+            "--survey",
+            "--survey-out",
+            "s.tsv",
+            "--label-sections",
+            "--labels",
+            "l.tsv",
+            "a.flac",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn survey_requires_its_output_path() {
+        assert!(Args::try_parse_from(["funkot-autodj", "--survey", "a.flac"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod map_survey_key_tests {
+    use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn maps_the_documented_keys() {
+        assert_eq!(map_survey_key(press(KeyCode::Char('o'))), Some(SurveyKey::Ok));
+        assert_eq!(map_survey_key(press(KeyCode::Char('O'))), Some(SurveyKey::Ok));
+        assert_eq!(map_survey_key(press(KeyCode::Char('h'))), Some(SurveyKey::Half));
+        assert_eq!(map_survey_key(press(KeyCode::Char('?'))), Some(SurveyKey::Unknown));
+        assert_eq!(map_survey_key(press(KeyCode::Char('r'))), Some(SurveyKey::Replay));
+        assert_eq!(map_survey_key(press(KeyCode::Char('s'))), Some(SurveyKey::Skip));
+        assert_eq!(map_survey_key(press(KeyCode::Char('q'))), Some(SurveyKey::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_is_quit_and_unrecognised_keys_are_none() {
+        assert_eq!(
+            map_survey_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(SurveyKey::Quit)
+        );
+        assert_eq!(map_survey_key(press(KeyCode::Char('x'))), None);
+        assert_eq!(map_survey_key(press(KeyCode::Left)), None);
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let key = KeyEvent::new_with_kind(
+            KeyCode::Char('o'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(map_survey_key(key), None);
+    }
+}
+
+/// `--survey`'s per-track loop: decode + analyze, build the one fixed
+/// listening clip ([`label_session::build_survey_clip`]), and wait for a
+/// single judgement keystroke before moving to the next track. Reuses
+/// [`ClipPlayer`] / [`prepare_clip_for_playback`] / [`pick_output_config`]
+/// verbatim from `--label-sections`'s interactive loop; the only new piece
+/// is the smaller [`SurveyKey`] vocabulary and [`append_survey_verdict`]
+/// instead of `labels.tsv`.
+fn run_survey(
+    playlist: &[PathBuf],
+    survey_out: &Path,
+    cache_dir: &Path,
+    click_opts: &label_session::ClickOptions,
+    rate: f64,
+    pitch_mode: PitchMode,
+) -> Result<()> {
+    let judged = load_survey_judged(survey_out)?;
+
+    let mut hashes = Vec::with_capacity(playlist.len());
+    let mut skipped = 0usize;
+    for path in playlist {
+        let hash = cache::content_hash(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if judged.contains(&hash) {
+            skipped += 1;
+        }
+        hashes.push(hash);
+    }
+    eprintln!(
+        "survey: {skipped} of {} already judged (skipped), {} to do",
+        playlist.len(),
+        playlist.len() - skipped
+    );
+
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .context("no default audio output device available")?;
+    let (config, channels) = pick_output_config(&device, None)?;
+    let device_rate = config.sample_rate;
+    let mut player = ClipPlayer::new(device, config, channels)?;
+
+    enable_raw_mode().context("failed to enable raw mode (needed for --survey)")?;
+    let _raw_guard = RawModeGuard;
+
+    print_survey_key_help();
+    // Same reasoning as `--label-sections`: playback runs at production
+    // speed (see `prepare_clip_for_playback`), so say so up front.
+    let pitch_note = match pitch_mode {
+        PitchMode::Preserve => "pitch preserved",
+        PitchMode::Shift => "pitch shifted",
+    };
+    println!("\rplayback {rate:.2}x ({pitch_note})\r");
+
+    let total = playlist.len();
+    'tracks: for (i, path) in playlist.iter().enumerate() {
+        let hash = &hashes[i];
+        if judged.contains(hash) {
+            continue;
+        }
+        let progress = format!("[{}/{total}]", i + 1);
+
+        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let analysis =
+            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Decode + analyze can run for a while with no key polling; check the
+        // stream now so a device that died meanwhile is torn down here
+        // rather than spinning until the next keystroke.
+        print_label_audio(&player.poll());
+        if buf.sample_rate != device_rate {
+            eprintln!(
+                "note: {} is {} Hz, output device is {device_rate} Hz; resampling the clip for playback",
+                file_name(path),
+                buf.sample_rate
+            );
+        }
+
+        let raw_clip = label_session::build_survey_clip(&buf, &analysis, click_opts);
+        let clip =
+            prepare_clip_for_playback(raw_clip, buf.sample_rate, device_rate, rate, pitch_mode);
+
+        println!("\r{progress} {}\r", file_name(path));
+        player.play(clip.clone());
+
+        loop {
+            let waiting = !event::poll(Duration::from_millis(100)).unwrap_or(false);
+            print_label_audio(&player.poll());
+            if waiting {
+                continue;
+            }
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(_) => break 'tracks,
+            };
+            let Event::Key(key) = ev else { continue };
+            let Some(survey_key) = map_survey_key(key) else {
+                continue;
+            };
+            match survey_key {
+                SurveyKey::Replay => {
+                    player.play(clip.clone());
+                }
+                SurveyKey::Skip => {
+                    player.stop();
+                    println!("\r  skipped {}\r", file_name(path));
+                    continue 'tracks;
+                }
+                SurveyKey::Quit => {
+                    player.stop();
+                    println!("\rquit\r");
+                    break 'tracks;
+                }
+                SurveyKey::Ok | SurveyKey::Half | SurveyKey::Unknown => {
+                    player.stop();
+                    let verdict = match survey_key {
+                        SurveyKey::Ok => "ok",
+                        SurveyKey::Half => "half",
+                        SurveyKey::Unknown => "?",
+                        SurveyKey::Replay | SurveyKey::Skip | SurveyKey::Quit => unreachable!(),
+                    };
+                    append_survey_verdict(survey_out, hash, &file_name(path), verdict)?;
+                    println!("\r  {verdict} {}\r", file_name(path));
                     continue 'tracks;
                 }
             }
