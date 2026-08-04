@@ -27,7 +27,10 @@
 //!   need to split on them); [`save_labels`] replaces any tabs/newlines it
 //!   finds with spaces before writing, so a note is not guaranteed to round
 //!   -trip byte-for-byte through a save — only its tab/newline-free reading
-//!   is preserved.
+//!   is preserved. `note` may additionally carry whitespace-separated
+//!   `KEY:VALUE` tags mixed in with free text (see [`SectionLabel::note_tags`]
+//!   for the exact grammar and [`SectionLabel::dup_group`] for the one tag
+//!   this module itself interprets).
 //! - Lines that are empty or start with `#` (after trimming) are ignored
 //!   wherever they occur.
 //!
@@ -81,6 +84,68 @@ impl SectionLabel {
     pub fn outro_ok_set(&self) -> Vec<u32> {
         ok_set(self.outro_best, &self.outro_ok)
     }
+
+    /// Extracts `KEY:VALUE` tags from [`Self::note`], in the order they
+    /// appear, duplicate keys allowed.
+    ///
+    /// `note` is split on whitespace; a token is a tag only if its part
+    /// before the first ASCII `:` is a valid key (see below) and the part
+    /// after is non-empty. Tokens that don't match (including a `KEY:` with
+    /// nothing after the colon) are silently treated as free text — a note
+    /// may freely mix tags and prose, e.g. `"PH:half ズレている"` yields one
+    /// `PH` tag plus the trailing words being ignored here (they remain part
+    /// of `note` itself; this method only extracts tags).
+    ///
+    /// A valid key starts with an ASCII uppercase letter and has at least
+    /// one more character from `[A-Z0-9_]` (so at least two characters
+    /// total). This is deliberately strict so that ordinary Japanese or
+    /// English free text — and incidental colon-bearing strings like a
+    /// `http://` URL, whose scheme is lowercase — never accidentally parses
+    /// as a tag. Do not loosen it.
+    ///
+    /// The tag vocabulary itself (`PH:`, `GRID:`, `DUP:`, ...) is an
+    /// operational convention among people writing labels, not something
+    /// this parser knows about or validates — it only recognizes the
+    /// `KEY:VALUE` shape. Of that vocabulary, only `DUP:` is currently read
+    /// by code, via [`Self::dup_group`].
+    pub fn note_tags(&self) -> Vec<(String, String)> {
+        let mut tags = Vec::new();
+        for token in self.note.split_whitespace() {
+            let Some(colon) = token.find(':') else {
+                continue;
+            };
+            let (key, rest) = token.split_at(colon);
+            let value = &rest[1..];
+            if is_tag_key(key) && !value.is_empty() {
+                tags.push((key.to_string(), value.to_string()));
+            }
+        }
+        tags
+    }
+
+    /// The `DUP:` tag value from [`Self::note`], if present (first match
+    /// wins if there happen to be several). Used by `eval_sections.rs` to
+    /// group re-releases/edits of the same underlying track so a fold split
+    /// never puts one version in training and another in test.
+    pub fn dup_group(&self) -> Option<String> {
+        self.note_tags()
+            .into_iter()
+            .find(|(k, _)| k == "DUP")
+            .map(|(_, v)| v)
+    }
+}
+
+/// Whether `key` is a valid [`SectionLabel::note_tags`] key: an ASCII
+/// uppercase letter followed by one or more of `[A-Z0-9_]` (two characters
+/// minimum total).
+fn is_tag_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    let rest: Vec<char> = chars.collect();
+    !rest.is_empty() && rest.iter().all(|&c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn ok_set(best: Option<u32>, extra: &[u32]) -> Vec<u32> {
@@ -527,5 +592,71 @@ bbbb2222\ttrack-b.flac\t16\t\t48\t32|64\t
         assert_eq!(labels[0].outro_best, Some(32));
         assert_eq!(labels[1].intro_best, Some(16));
         assert_eq!(labels[1].outro_best, Some(48));
+    }
+
+    fn label_with_note(note: &str) -> SectionLabel {
+        SectionLabel {
+            hash: "aaaa1111".to_string(),
+            file_name: "track-a.flac".to_string(),
+            intro_best: Some(32),
+            intro_ok: vec![],
+            outro_best: Some(32),
+            outro_ok: vec![],
+            note: note.to_string(),
+        }
+    }
+
+    #[test]
+    fn note_tags_japanese_free_text_only_yields_no_tags() {
+        let label = label_with_note("4拍めにクリックがある");
+        assert_eq!(label.note_tags(), Vec::new());
+        assert_eq!(label.dup_group(), None);
+    }
+
+    #[test]
+    fn note_tags_mixed_with_free_text() {
+        let label = label_with_note("PH:half クリックが4拍めで鳴る DUP:ivy-remix");
+        assert_eq!(
+            label.note_tags(),
+            vec![
+                ("PH".to_string(), "half".to_string()),
+                ("DUP".to_string(), "ivy-remix".to_string()),
+            ]
+        );
+        assert_eq!(label.dup_group(), Some("ivy-remix".to_string()));
+    }
+
+    #[test]
+    fn note_tags_rejects_lowercase_key_and_url_like_tokens() {
+        let label = label_with_note("ph:half http://example.com/x GRID:ok");
+        assert_eq!(
+            label.note_tags(),
+            vec![("GRID".to_string(), "ok".to_string())]
+        );
+    }
+
+    #[test]
+    fn note_tags_rejects_single_char_key_and_empty_value() {
+        let label = label_with_note("X:5 PH: GRID:ok");
+        assert_eq!(
+            label.note_tags(),
+            vec![("GRID".to_string(), "ok".to_string())]
+        );
+    }
+
+    #[test]
+    fn note_tags_extracts_dup_group() {
+        let label = label_with_note("DUP:eternal-light-v2");
+        assert_eq!(label.dup_group(), Some("eternal-light-v2".to_string()));
+    }
+
+    #[test]
+    fn existing_tsv_with_tagged_note_round_trips() {
+        let f = TempFile::new("roundtrip-tagged-note");
+        let labels = vec![label_with_note("PH:half DUP:group-a note text")];
+        save_labels(f.path(), &labels).unwrap();
+        let loaded = load_labels(f.path()).unwrap();
+        assert_eq!(loaded, labels);
+        assert_eq!(loaded[0].dup_group(), Some("group-a".to_string()));
     }
 }

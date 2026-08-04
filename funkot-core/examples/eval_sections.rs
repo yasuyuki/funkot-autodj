@@ -218,6 +218,17 @@ struct TrackEval {
     intro_bpm: f64,
     outro_bpm: f64,
     grid_suspect: bool,
+    /// `true` if the cached `TrackAnalysis` has any hand-edited section
+    /// length (`intro_bars_manual`, `outro_bars_manual`, or
+    /// `outro_structure_bars_manual`). Only possible when `--cache-dir` is
+    /// given and points at a cache populated by `--label-sections` (which
+    /// overwrites the analyzer's own bar count with the label value via
+    /// `cache::set_manual_bars`/`set_manual_structure_bars`). `analyze()`
+    /// itself never sets these flags, so this is always `false` without
+    /// `--cache-dir`.
+    manual_override: bool,
+    /// `label.dup_group()` — see `fold_hash` for why this is tracked here.
+    dup_group: Option<String>,
 }
 
 fn run(opts: &Opts) -> Result<(), String> {
@@ -308,6 +319,8 @@ fn run(opts: &Opts) -> Result<(), String> {
         let intro_ok = label.intro_ok_set();
         let outro_ok = label.outro_ok_set();
         let outro_pred = a.outro_structure_bars;
+        let manual_override =
+            a.intro_bars_manual || a.outro_bars_manual || a.outro_structure_bars_manual;
         let grid_suspect = !(GRID_BPM_MIN..=GRID_BPM_MAX).contains(&a.intro_bpm)
             || !(GRID_BPM_MIN..=GRID_BPM_MAX).contains(&a.outro_bpm)
             || (a.intro_bpm - a.outro_bpm).abs() >= GRID_BPM_DRIFT_MAX;
@@ -343,6 +356,8 @@ fn run(opts: &Opts) -> Result<(), String> {
             intro_bpm: a.intro_bpm,
             outro_bpm: a.outro_bpm,
             grid_suspect,
+            manual_override,
+            dup_group: label.dup_group(),
         });
     }
 
@@ -368,7 +383,56 @@ fn run(opts: &Opts) -> Result<(), String> {
     println!("hash errors:      {hash_errors}");
     println!("decode errors:    {decode_errors}");
     println!("analyze errors:   {analyze_errors}");
+
+    // Cache-contamination self-check (see `TrackEval::manual_override`).
+    // `analyze()` never sets these flags, so without `--cache-dir` this
+    // block computes to zero and, per the requirement that a no-cache-dir
+    // run's output not change by even one character, is skipped entirely
+    // rather than printed as a zero count.
+    let manual_overrides: Vec<&TrackEval> = records.iter().filter(|r| r.manual_override).collect();
+    if opts.cache_dir.is_some() {
+        println!(
+            "manual overrides: {} (intro/outro/outro_structure hand-edited in cache; not real estimator predictions)",
+            manual_overrides.len()
+        );
+    }
+    if !manual_overrides.is_empty() {
+        eprintln!();
+        eprintln!(
+            "!!! WARNING: {} track(s) have a hand-edited (manual) intro/outro/outro_structure bar count in --cache-dir !!!",
+            manual_overrides.len()
+        );
+        eprintln!(
+            "    --label-sections overwrites intro_bars (and/or outro_bars / outro_structure_bars)"
+        );
+        eprintln!(
+            "    with the label value itself once a track is labeled, so for these tracks the"
+        );
+        eprintln!(
+            "    analyzer's \"prediction\" already equals the ground truth -- INTRO accuracy in"
+        );
+        eprintln!(
+            "    this run is inflated and this run's numbers cannot be trusted."
+        );
+        eprintln!("    Re-run WITHOUT --cache-dir to see the estimator's real predictions.");
+        let shown = manual_overrides.len().min(10);
+        for r in manual_overrides.iter().take(shown) {
+            eprintln!("      - {}", r.file_name);
+        }
+        if manual_overrides.len() > shown {
+            eprintln!("      ... and {} more", manual_overrides.len() - shown);
+        }
+        eprintln!();
+    }
+
     println!();
+
+    // Looks at all loaded labels (not just `records`/evaluated tracks), per
+    // the requirement that a note on a partial or audio-less row still gets
+    // reported. Prints nothing at all when no label has any tag, so today's
+    // tag-free labels.tsv produces byte-identical output to before this
+    // existed.
+    print_note_tag_summary(&labels);
 
     if records.is_empty() {
         println!("no evaluated tracks; nothing to report.");
@@ -619,10 +683,44 @@ fn fold_of(hash: &str, folds: u32) -> u32 {
     n % folds
 }
 
+/// For every `DUP:` group, the `content_hash` of whichever member appears
+/// first in `records` order (i.e. the order tracks were given on the
+/// command line / in the playlist). That first-seen hash is arbitrary --
+/// it depends on input order, not on any property of the track -- but it is
+/// deterministic for a fixed `records` slice, which is all `fold_hash`
+/// needs: every member of the group must land in the same fold, and this
+/// is a stable way to pick which member's hash decides that fold.
+fn dup_fold_representatives(records: &[TrackEval]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for r in records {
+        if let Some(g) = &r.dup_group {
+            map.entry(g.clone()).or_insert_with(|| r.hash.clone());
+        }
+    }
+    map
+}
+
+/// The hash `fold_of` should use for `r`: its own `content_hash`, unless it
+/// carries a `DUP:` tag, in which case its whole group shares the
+/// representative hash from `dup_representatives` (see
+/// `dup_fold_representatives`). This is what keeps re-releases/edits of the
+/// same underlying track from splitting across folds, without changing the
+/// fold assignment of any track that has no `DUP:` tag.
+fn fold_hash<'a>(dup_representatives: &'a HashMap<String, String>, r: &'a TrackEval) -> &'a str {
+    match &r.dup_group {
+        Some(g) => dup_representatives.get(g).map(|s| s.as_str()).unwrap_or(r.hash.as_str()),
+        None => r.hash.as_str(),
+    }
+}
+
 fn print_folds(records: &[TrackEval], folds: u32) {
+    let dup_rep = dup_fold_representatives(records);
     println!("---- {folds}-fold breakdown (hash-stable split, no training) ----");
     for fold in 0..folds {
-        let subset: Vec<&TrackEval> = records.iter().filter(|r| fold_of(&r.hash, folds) == fold).collect();
+        let subset: Vec<&TrackEval> = records
+            .iter()
+            .filter(|r| fold_of(fold_hash(&dup_rep, r), folds) == fold)
+            .collect();
         print!("  fold {fold}: ");
         if subset.is_empty() {
             println!("n=0");
@@ -641,6 +739,65 @@ fn print_folds(records: &[TrackEval], folds: u32) {
             subset.len(), intro_m.exact_accuracy, intro_m.tolerant_accuracy, outro_m.exact_accuracy, outro_m.tolerant_accuracy
         );
     }
+}
+
+/// Reports every `KEY:VALUE` tag found in any loaded label's `note` (see
+/// `labels::SectionLabel::note_tags`) — deliberately over *all* `labels`,
+/// not just `records` (evaluated tracks), so a note on a partially-labeled
+/// or audio-less row is still visible instead of silently dropped. Prints
+/// nothing at all when no label has any tag, so a labels file with no tags
+/// (today's baseline) produces byte-identical output to before this
+/// section existed.
+fn print_note_tag_summary(labels: &[SectionLabel]) {
+    let mut by_key: std::collections::BTreeMap<String, HashMap<String, u32>> =
+        std::collections::BTreeMap::new();
+    for label in labels {
+        for (key, value) in label.note_tags() {
+            *by_key.entry(key).or_default().entry(value).or_insert(0) += 1;
+        }
+    }
+    if by_key.is_empty() {
+        return;
+    }
+
+    println!("---- note tags ----");
+    for (key, values) in &by_key {
+        let mut parts: Vec<(&String, &u32)> = values.iter().collect();
+        parts.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let joined: Vec<String> = parts.iter().map(|(v, n)| format!("{v}={n}")).collect();
+        println!("  {key}: {}", joined.join(" "));
+    }
+
+    let mut dup_groups: std::collections::BTreeMap<String, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for label in labels {
+        if let Some(group) = label.dup_group() {
+            dup_groups.entry(group).or_default().push(label.file_name.as_str());
+        }
+    }
+    if !dup_groups.is_empty() {
+        println!("  DUP groups:");
+        for (group, members) in &dup_groups {
+            println!("    {group}: {} member(s)", members.len());
+            for m in members {
+                println!("      - {m}");
+            }
+        }
+    }
+
+    // Notes carrying free text but zero recognized tags -- flagged so a
+    // labeler's prose doesn't just vanish from this summary.
+    let untagged: Vec<&SectionLabel> = labels
+        .iter()
+        .filter(|l| !l.note.trim().is_empty() && l.note_tags().is_empty())
+        .collect();
+    if !untagged.is_empty() {
+        println!("  untagged notes ({}):", untagged.len());
+        for l in &untagged {
+            println!("    - {}: {}", l.file_name, l.note);
+        }
+    }
+    println!();
 }
 
 // ---------------------------------------------------------------------
@@ -796,6 +953,10 @@ struct CountsJson {
     hash_errors: usize,
     decode_errors: usize,
     analyze_errors: usize,
+    /// Evaluated tracks whose cached analysis has a hand-edited
+    /// intro/outro/outro_structure bar count (see
+    /// `TrackEval::manual_override`). Always 0 without `--cache-dir`.
+    manual_overrides: usize,
 }
 
 #[derive(Serialize)]
@@ -835,11 +996,14 @@ fn write_json_if_requested(
         .map(|r| r.file_name.clone())
         .collect();
 
+    let dup_rep = dup_fold_representatives(records);
     let folds = if opts.folds > 1 {
         (0..opts.folds)
             .map(|fold| {
-                let subset: Vec<&TrackEval> =
-                    records.iter().filter(|r| fold_of(&r.hash, opts.folds) == fold).collect();
+                let subset: Vec<&TrackEval> = records
+                    .iter()
+                    .filter(|r| fold_of(fold_hash(&dup_rep, r), opts.folds) == fold)
+                    .collect();
                 let intro_points = side_points(&subset, |r| {
                     (r.intro_true, r.intro_pred, r.intro_ok.as_slice(), r.intro_cost, r.intro_low_conf)
                 });
@@ -869,6 +1033,7 @@ fn write_json_if_requested(
             hash_errors,
             decode_errors,
             analyze_errors,
+            manual_overrides: records.iter().filter(|r| r.manual_override).count(),
         },
         missing_audio: missing_audio.iter().map(|l| l.file_name.clone()).collect(),
         grid_suspects,
