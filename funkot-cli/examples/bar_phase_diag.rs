@@ -102,9 +102,21 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
     let intro = phase_of(&mono, fd, bar_frames, 4, 4 + WIN);
     let outro = phase_of(&mono, fd, bar_frames, end_bar - 4 - WIN, end_bar - 4);
     let verdict = match (intro, outro) {
-        (Some((qi, _)), Some((qo, _))) => {
+        (Some((qi, _)), Some((qo, _))) if qi == 3 => {
             let shift = (qo + 4 - qi) % 4;
             format!("shift {shift:+} beat")
+        }
+        (Some((qi, _)), Some((qo, _))) => {
+            // Same gate as `outro_beat_phase_shift`: the intro window's
+            // quietest slot isn't 3, so its own relative shift can't be
+            // trusted as evidence the grid moved (see that function's doc,
+            // `Andai Tak Berpisah`) -- abstain, but still show what the
+            // relative form would have said.
+            let shift = (qo + 4 - qi) % 4;
+            format!(
+                "shift +0 beat (intro window {qi}, not 3 -- abstained; \
+                 relative form would say {shift:+})"
+            )
         }
         _ => "no verdict".to_string(),
     };

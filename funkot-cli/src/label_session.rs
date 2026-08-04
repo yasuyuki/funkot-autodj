@@ -588,10 +588,35 @@ const PHASE_CLEAR_DB: f64 = 0.8;
 /// too short to hold two disjoint windows — i.e. leaves the propagated grid
 /// alone unless there is evidence against it.
 ///
+/// Also returns 0 — abstains — whenever the intro window's quietest slot is
+/// anything other than 3, even though it and the outro window's slot are both
+/// read cleanly. The relative form above assumes the intro window's quiet
+/// slot is *some* fixed reference and measures the outro's distance from it,
+/// but that assumption was checked by ear (2026-08-04) and found wrong on
+/// `YSR - … - 01 Andai Tak Berpisah`: its intro window reads quiet slot 0, not
+/// 3, and the relative form reports "+3 beats", which the ear says is a false
+/// correction — the true answer there is 0. The intro material's own
+/// arrangement, not a slipped bar grid, put the lift somewhere other than
+/// beat 4; nothing about that says the *outro* has moved. Confirmed the other
+/// way too on `DimsR - … - 04 Kamurogiku`: there the *absolute* form
+/// `(qo + 1) mod 4` would report +1, and the ear says that is also a false
+/// correction (the real issue there is a half-beat slip this function cannot
+/// see at all, and is not this function's job to fix). So neither reading the
+/// outro slot relative to the intro's nor relative to a fixed constant is
+/// safe once the intro window itself is off; the only sound move is to
+/// decline. This does not need a separate branch for the two forms: when
+/// `qi == 3` (`BEATS_PER_BAR - 1`), `(qo - qi) mod 4` and `(qo + 1) mod 4` are
+/// the same value, so gating on `qi == 3` makes the choice between them moot
+/// everywhere this function still answers at all — the expression below stays
+/// in the relative form for that reason, not because the two were compared
+/// and one won.
+///
 /// Ear-verified on all four masters put in front of a listener as A/B clips
-/// (`examples/outro_phase_ab`): `03. KazuyaP - Monitoring Db` +2 beats,
+/// (`examples/phase_ab`): `03. KazuyaP - Monitoring Db` +2 beats,
 /// `… - 04 Eternal Light` +3, `… - 06 Love & Joy` +1, and
-/// `… - 05 Kimi to Semi Blue` unshifted, each matching this measurement.
+/// `… - 05 Kimi to Semi Blue` unshifted, each matching this measurement. All
+/// four have an intro window that reads quiet slot 3, so none of them are
+/// affected by the gate above.
 pub fn outro_beat_phase_shift(
     buffer: &AudioBuffer,
     analysis: &TrackAnalysis,
@@ -613,7 +638,9 @@ pub fn outro_beat_phase_shift(
     let intro = quietest_beat_slot(&mono, fd, bar_frames, edge, edge + win);
     let outro = quietest_beat_slot(&mono, fd, bar_frames, end_bar - edge - win, end_bar - edge);
     match (intro, outro) {
-        (Some(qi), Some(qo)) => (qo + BEATS_PER_BAR - qi) % BEATS_PER_BAR,
+        (Some(qi), Some(qo)) if qi == BEATS_PER_BAR - 1 => {
+            (qo + BEATS_PER_BAR - qi) % BEATS_PER_BAR
+        }
         _ => 0,
     }
 }
@@ -1165,7 +1192,7 @@ pub fn locked_boundary_frame(
 /// verbatim rather than being snapped onto the consensus exactly -- measured,
 /// the two differ by about 0.05 beat, and forcing that would move candidates
 /// that are already clicking correctly.
-fn locked_boundary_on_grid(
+pub fn locked_boundary_on_grid(
     buffer: &AudioBuffer,
     analysis: &TrackAnalysis,
     side: Side,
@@ -2361,10 +2388,21 @@ mod tests {
     /// A master whose own bars have slipped `shift` beats against the
     /// `first_downbeat` grid by the time the outro arrives. The lift before
     /// the downbeat -- the level taken out of the bar's last beat, which is
-    /// what the fold reads -- sits in grid slot 3 for the first half and in
-    /// slot `(3 + shift) % 4` for the second, which is how a section spliced
-    /// a beat short looks from the grid's side. Nothing else about the track
-    /// changes: the tempo is exact and every beat still carries a kick.
+    /// what the fold reads -- sits in grid slot `intro_slot` for the first
+    /// half and in slot `(3 + shift) % 4` for the second, which is how a
+    /// section spliced a beat short looks from the grid's side. Nothing else
+    /// about the track changes: the tempo is exact and every beat still
+    /// carries a kick.
+    ///
+    /// `intro_slot` is normally 3 (every existing caller passes that): the
+    /// ordinary "lift before the downbeat" shape, unmoved from the second
+    /// half's own baseline. It exists as a parameter only for
+    /// `outro_beat_phase_shift_abstains_when_the_intro_window_is_not_slot_three`,
+    /// which needs the *intro* window's quietest slot to disagree with 3 while
+    /// the outro side (`shift`, and therefore the truncation below) stays
+    /// exactly as it would with a steady grid -- the `Andai Tak Berpisah`
+    /// signature, where the intro material's own arrangement puts the quiet
+    /// slot somewhere else without the bars themselves having slipped.
     ///
     /// The music itself has to end on its *own* slipped bar line, `shift`
     /// beats past the propagated grid's line at `music_bars`, with a terminal
@@ -2375,12 +2413,16 @@ mod tests {
     /// is not a shape any real master has: a track whose own bars have moved
     /// still ends on its own bars, not on the grid that has drifted away from
     /// them.
-    fn phase_slip_fixture(music_bars: u32, shift: u32) -> (AudioBuffer, TrackAnalysis) {
+    fn phase_slip_fixture(
+        music_bars: u32,
+        shift: u32,
+        intro_slot: u32,
+    ) -> (AudioBuffer, TrackAnalysis) {
         let (mut samples, sr, first_downbeat, beat_true, analysis) =
             end_fixture(music_bars + 1, 0.0);
         let quiet_from = |bar: u32| {
             let slot = if bar < music_bars / 2 {
-                3
+                intro_slot
             } else {
                 (3 + shift) % BEATS_PER_BAR
             };
@@ -2419,7 +2461,7 @@ mod tests {
     #[test]
     fn outro_beat_phase_shift_reads_bars_that_slipped_mid_track() {
         for shift in 1..BEATS_PER_BAR {
-            let (buffer, analysis) = phase_slip_fixture(120, shift);
+            let (buffer, analysis) = phase_slip_fixture(120, shift, 3);
             let bar_frames = bar_frames_for(&analysis, Side::Outro);
             let end_bar = music_end_bar(&buffer, &analysis, bar_frames, 0).expect("has an end");
             assert_eq!(
@@ -2432,12 +2474,62 @@ mod tests {
 
     #[test]
     fn outro_beat_phase_shift_leaves_a_steady_grid_alone() {
-        let (buffer, analysis) = phase_slip_fixture(120, 0);
+        let (buffer, analysis) = phase_slip_fixture(120, 0, 3);
         let bar_frames = bar_frames_for(&analysis, Side::Outro);
         let end_bar = music_end_bar(&buffer, &analysis, bar_frames, 0).expect("has an end");
         assert_eq!(
             outro_beat_phase_shift(&buffer, &analysis, bar_frames, end_bar),
             0
+        );
+    }
+
+    /// The intro window's quietest slot is the reference the relative form
+    /// above measures the outro against; when it isn't 3, that reference
+    /// itself is unreliable (see `outro_beat_phase_shift`'s own doc for the
+    /// ear-verified evidence -- `Andai Tak Berpisah` -- behind this gate), so
+    /// the function must abstain rather than apply a shift. This is the
+    /// `Andai` signature: the outro window still reads a clean, ordinary
+    /// quiet slot of 3 (`shift = 0` leaves the second half, and the
+    /// truncation below, exactly as a steady grid would), but the intro
+    /// window's own material puts its quiet slot at 0, not 3.
+    #[test]
+    fn outro_beat_phase_shift_abstains_when_the_intro_window_is_not_slot_three() {
+        let (buffer, analysis) = phase_slip_fixture(120, 0, 0);
+        let bar_frames = bar_frames_for(&analysis, Side::Outro);
+        let end_bar = music_end_bar(&buffer, &analysis, bar_frames, 0).expect("has an end");
+
+        // Both windows must be *readable* first, or this would pass for the
+        // pre-existing "a window is a wash" reason and stop testing the gate
+        // the moment the fixture's dynamics changed.
+        let mono: Vec<f32> = buffer
+            .samples
+            .chunks_exact(2)
+            .map(|f| (f[0] + f[1]) * 0.5)
+            .collect();
+        let fd = analysis.first_downbeat as f64;
+        let edge = PHASE_EDGE_BARS;
+        let win = PHASE_WINDOW_BARS;
+        assert_eq!(
+            quietest_beat_slot(&mono, fd, bar_frames, edge, edge + win),
+            Some(0),
+            "the intro window has to read cleanly, and read something other than 3"
+        );
+        assert_eq!(
+            quietest_beat_slot(
+                &mono,
+                fd,
+                bar_frames,
+                end_bar - edge - win,
+                end_bar - edge
+            ),
+            Some(3),
+            "the outro window has to read cleanly, so only the gate can explain the 0"
+        );
+
+        assert_eq!(
+            outro_beat_phase_shift(&buffer, &analysis, bar_frames, end_bar),
+            0,
+            "intro window's quietest slot is 0, not 3 -- abstain instead of guessing"
         );
     }
 
@@ -2468,7 +2560,7 @@ mod tests {
     /// an unmeasurable track must not be moved.
     #[test]
     fn outro_beat_phase_shift_declines_on_a_track_too_short_to_measure() {
-        let (buffer, analysis) = phase_slip_fixture(60, 2);
+        let (buffer, analysis) = phase_slip_fixture(60, 2, 3);
         let bar_frames = bar_frames_for(&analysis, Side::Outro);
         assert_eq!(
             outro_beat_phase_shift(&buffer, &analysis, bar_frames, 60),
@@ -2491,7 +2583,7 @@ mod tests {
     #[test]
     fn outro_candidates_follow_the_slipped_bar_phase() {
         for shift in 1..BEATS_PER_BAR {
-            let (buffer, analysis) = phase_slip_fixture(120, shift);
+            let (buffer, analysis) = phase_slip_fixture(120, shift, 3);
             let grid = click_grid(&buffer, &analysis, Side::Outro);
             let beat = grid.bar_frames / f64::from(BEATS_PER_BAR);
             let anchor_beats = (grid.outro_anchor as f64 - analysis.first_downbeat as f64) / beat;
