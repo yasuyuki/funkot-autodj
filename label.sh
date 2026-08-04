@@ -28,7 +28,11 @@ usage() {
 }
 
 BUILD=1
-ARGS=""
+# Pass-through args are re-collected into "$@" rather than a string, so an
+# argument containing a space (a path, say) survives instead of being word
+# -split at the exec below. "$@" is expanded once, before the loop starts,
+# so rewriting it with `set --` from inside the loop is safe.
+collected=0
 for arg in "$@"; do
     case "$arg" in
         -h|--help)
@@ -39,10 +43,18 @@ for arg in "$@"; do
             BUILD=0
             ;;
         *)
-            ARGS="$ARGS $arg"
+            if [ "$collected" -eq 0 ]; then
+                set -- "$arg"
+                collected=1
+            else
+                set -- "$@" "$arg"
+            fi
             ;;
     esac
 done
+if [ "$collected" -eq 0 ]; then
+    set --
+fi
 
 if [ ! -f testdata/file_list.txt ]; then
     echo "error: testdata/file_list.txt not found (see docs/labeling.md for how to build it)" >&2
@@ -55,7 +67,6 @@ if [ "$BUILD" -eq 1 ]; then
         cargo build -p funkot-cli --release
 fi
 
-# shellcheck disable=SC2086
 exec ./target-host/release/funkot-autodj --label-sections \
     -l testdata/file_list.txt --labels testdata/labels.tsv --cache-dir funkot-cache \
-    $ARGS
+    "$@"
