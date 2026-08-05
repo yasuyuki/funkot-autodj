@@ -12,7 +12,7 @@
 //! load. Realtime automatic transitions fall back to the nominal entry when the
 //! worker is late (no in-callback align); offline render still computes sync.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -899,6 +899,57 @@ impl Engine {
     /// transition start from a multi-frame render chunk.
     pub fn transition_frames_into(&self) -> Option<u64> {
         self.transition.as_ref().map(|t| t.frames_into)
+    }
+
+    /// Path of the track prepared to follow the active one, if any.
+    ///
+    /// `None` covers two distinct situations a host can't tell apart from this
+    /// call alone: the loader hasn't finished preparing a replacement yet, or
+    /// the prepared track has already been consumed by a transition. Use
+    /// [`Self::frames_until_transition`] alongside this if the distinction
+    /// matters (e.g. `Some(0)` with `next_track_path() == None` means "already
+    /// mixing in").
+    pub fn next_track_path(&self) -> Option<&Path> {
+        self.next_track.as_ref().map(|t| t.path.as_path())
+    }
+
+    /// Frames remaining on the active deck before it reaches its own outro
+    /// (i.e. before a transition to `next_track` may begin).
+    ///
+    /// `Some(0)` means "no more runway": a transition is already in progress,
+    /// or the active deck is past its outro start and just waiting on a
+    /// prepared next track. A plain `None` means "unknown" (no active deck at
+    /// all) — hosts should not treat it the same as `Some(0)`.
+    pub fn frames_until_transition(&self) -> Option<u64> {
+        let active = self.active.as_ref()?;
+        if self.transition.is_some() || self.awaiting_next_at_outro {
+            return Some(0);
+        }
+        Some(active.track.outro_start_out.saturating_sub(active.playhead))
+    }
+
+    /// Discard the prepared `next_track` and hand its path back to the caller.
+    ///
+    /// Lets a host reorder its own queue (e.g. the user picked a different
+    /// track to play next) without waiting for the current transition trigger.
+    /// Releases the loader permit the discarded track was holding, so the
+    /// loader should ask [`TrackSource::next`] for a replacement right away —
+    /// callers must not sit on the returned path expecting the slot to stay
+    /// empty. Also drops any in-flight phase-align result: that computation is
+    /// keyed to the (active, next_track) pair, and applying it to whatever
+    /// track fills the slot next would sync against the wrong track.
+    ///
+    /// Returns `None` when there is nothing to revoke — either the loader
+    /// hasn't prepared a next track yet, or one was already taken into a
+    /// transition. Either way there is nothing for the host to hand back to
+    /// its queue.
+    pub fn revoke_next(&mut self) -> Option<PathBuf> {
+        let track = self.next_track.take()?;
+        let path = track.path.clone();
+        self.clear_phase_align();
+        retire_prepared(track);
+        self.release_permit();
+        Some(path)
     }
 
     /// Cloneable sender for live hosts (audio callback owns the engine).

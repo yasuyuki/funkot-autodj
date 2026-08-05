@@ -754,3 +754,201 @@ fn loader_does_not_spin_decode_before_history() {
     engine.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Minimal host-owned queue [`TrackSource`]: a shared `VecDeque` a test can
+/// mutate between polls, unlike the fixed-`Vec` [`PlaylistSource`] wired into
+/// [`Engine::new`] (which offers no way to replace an already-queued track).
+struct QueueSource {
+    queue: std::sync::Arc<Mutex<std::collections::VecDeque<PathBuf>>>,
+    next_index: usize,
+}
+
+impl funkot_core::engine::TrackSource for QueueSource {
+    fn next(&mut self) -> Option<(usize, PathBuf)> {
+        let path = self
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()?;
+        let idx = self.next_index;
+        self.next_index += 1;
+        Some((idx, path))
+    }
+}
+
+#[test]
+fn revoke_next_hands_back_the_prepared_track_and_the_loader_prepares_a_replacement() {
+    let _lock = engine_test_lock();
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    let dir = temp_dir("revoke_next_replace");
+    let cache = dir.join("cache");
+    let sr = 44_100u32;
+    let path_first = dir.join("first.wav");
+    let path_a = dir.join("a.wav");
+    let path_b = dir.join("b.wav");
+    // Long main/outro so no natural transition races the revoke within the
+    // paced polling window below.
+    write_wav(&path_first, &synth_track(180.0, 16, 64, 16, sr)).unwrap();
+    write_wav(&path_a, &synth_track(180.0, 16, 64, 16, sr)).unwrap();
+    write_wav(&path_b, &synth_track(180.0, 16, 64, 16, sr)).unwrap();
+
+    // Only `first` and `a` are queued up front: the loader consumes both to
+    // fill active + next_track and then blocks on the (exhausted) permit pool,
+    // so it never observes an empty queue as end-of-playlist.
+    let queue = Arc::new(Mutex::new(VecDeque::from([
+        path_first.clone(),
+        path_a.clone(),
+    ])));
+    let options = engine_opts(cache);
+    let mut engine = Engine::new_with_source(
+        options,
+        Box::new(QueueSource {
+            queue: Arc::clone(&queue),
+            next_index: 0,
+        }),
+    )
+    .expect("engine");
+    render_until_playing(&mut engine, 2048);
+
+    let mut buf = vec![0.0f32; 2048 * 2];
+    // Paced like `loader_does_not_spin_decode_before_history`: render + sleep
+    // per poll (not a tight spin) so the unthrottled engine can't race past
+    // `first`'s 64-bar main/outro before the loader finishes preparing `a`.
+    let mut got_a = false;
+    for _ in 0..400 {
+        let _ = engine.render(&mut buf);
+        if engine.next_track_path() == Some(path_a.as_path()) {
+            got_a = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(got_a, "timed out waiting for next_track_path() == a");
+
+    queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(path_b.clone());
+
+    let revoked = engine.revoke_next();
+    assert_eq!(
+        revoked.as_deref(),
+        Some(path_a.as_path()),
+        "revoke_next() should hand back the prepared track a"
+    );
+    assert_eq!(
+        engine.next_track_path(),
+        None,
+        "next_track slot should be empty right after revoke"
+    );
+
+    let mut got_b = false;
+    for _ in 0..400 {
+        let _ = engine.render(&mut buf);
+        if engine.next_track_path() == Some(path_b.as_path()) {
+            got_b = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        got_b,
+        "timed out waiting for the loader to prepare b as the replacement"
+    );
+
+    engine.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn revoke_next_is_none_when_nothing_is_prepared() {
+    let _lock = engine_test_lock();
+
+    let dir = temp_dir("revoke_next_empty");
+    let cache = dir.join("cache");
+    let sr = 44_100u32;
+    let path = dir.join("solo.wav");
+    write_wav(&path, &synth_track(180.0, 16, 32, 16, sr)).unwrap();
+
+    let options = engine_opts(cache);
+    let mut engine = Engine::new(options, vec![path]).expect("engine");
+
+    // Nothing has been drained from the loader yet: revoke must be a no-op.
+    assert_eq!(engine.revoke_next(), None);
+
+    // Solo playlist never fills next_track (loader hits Exhausted right after
+    // the first track), so revoke stays None after playback starts too.
+    render_until_playing(&mut engine, 2048);
+    assert_eq!(engine.revoke_next(), None);
+
+    engine.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: revoke_next() must release exactly the one permit `next_track`
+/// was holding — releasing zero starves the loader, releasing more than one
+/// reproduces the pre-existing permit-spin bug covered by
+/// `loader_does_not_spin_decode_before_history`.
+#[test]
+fn revoking_the_next_track_does_not_leak_a_permit() {
+    let _lock = engine_test_lock();
+    use funkot_core::decode;
+
+    let dir = temp_dir("revoke_permit_leak");
+    let cache = dir.join("cache");
+    let sr = 44_100u32;
+    let mut paths = Vec::new();
+    for i in 0..6 {
+        let p = dir.join(format!("t{i}.wav"));
+        write_wav(&p, &synth_track(180.0, 16, 64, 16, sr)).unwrap();
+        paths.push(p);
+    }
+
+    decode::reset_decode_file_calls();
+    let mut options = engine_opts(cache);
+    options.loop_playlist = true;
+    let mut engine = Engine::new(options, paths).expect("engine");
+    render_until_playing(&mut engine, 2048);
+
+    let mut buf = vec![0.0f32; 2048 * 2];
+    let mut revoked = false;
+    // Paced (render + sleep per poll, not a tight spin) so the unthrottled
+    // engine can't race past a 64-bar main/outro while waiting for the loader.
+    for _ in 0..400 {
+        let _ = engine.render(&mut buf);
+        let _ = engine.poll_events();
+        if !revoked && engine.next_track_path().is_some() {
+            let got = engine.revoke_next();
+            assert!(got.is_some(), "expected a prepared next track to revoke");
+            revoked = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(revoked, "timed out waiting for a next track to revoke");
+
+    // ~2s more, well before a 64-bar main outro would trigger a natural
+    // transition on its own.
+    for _ in 0..50 {
+        let _ = engine.render(&mut buf);
+        let _ = engine.poll_events();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let calls = decode::decode_file_calls();
+    // Baseline (no revoke) is <=3, see loader_does_not_spin_decode_before_history:
+    // first-live + one next prefetch, occasionally +1 for an Upgrade re-touch.
+    // One revoke frees exactly one permit, which the loader spends preparing
+    // exactly one replacement (+1). A leaked permit (releasing more than one)
+    // would let the loader keep spinning through the 6-track playlist instead
+    // of blocking again, which this bound catches; measured actual was <=4.
+    assert!(
+        calls <= 4,
+        "expected ≤4 decode_file calls after one revoke, got {calls}"
+    );
+
+    engine.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
