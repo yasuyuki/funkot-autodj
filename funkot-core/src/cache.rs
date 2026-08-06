@@ -18,7 +18,7 @@ use crate::{
 /// from the old conditional rule, which collapsed onto the structural
 /// boundary on tracks whose outro starts 64 bars from the end — the
 /// transition ran inside the outro there.
-pub const CACHE_VERSION: u32 = 10;
+pub const CACHE_VERSION: u32 = 11;
 
 const HASH_CHUNK: u64 = 64 * 1024;
 
