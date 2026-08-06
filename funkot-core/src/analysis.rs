@@ -640,6 +640,53 @@ pub fn onset_flux_envelope(mono: &[f32]) -> Vec<f64> {
     out
 }
 
+/// Score every phase candidate the [`lock_beat_phase`] comb considers: for
+/// each `delta` in `-steps..=steps` (`step` = [`FLUX_HOP`], `steps =
+/// radius / step`), the sum over `n_beats` beats of the `flux` value
+/// nearest `approx_local + delta + k * beat_frames` (±1 hop of slack, taking
+/// the max, to absorb quantization — same as [`lock_beat_phase`] always did
+/// inline here before this was pulled out). `delta == 0` is always one of
+/// the `k` steps, so callers can rely on it being present without a special
+/// case.
+///
+/// Pulled out of [`lock_beat_phase`] so [`beat_phase_comb_scores`] can expose
+/// the exact same scores as a diagnostic, instead of a reimplementation that
+/// could quietly drift from what `lock_beat_phase` actually does.
+fn score_beat_phase_candidates(
+    flux: &[f64],
+    approx_local: f64,
+    beat_frames: f64,
+    n_beats: u32,
+    radius: i64,
+) -> Vec<(i64, f64)> {
+    let centre = FLUX_WIN as f64 / 2.0;
+    let at = |pos: f64| -> f64 {
+        let h = ((pos - centre) / FLUX_HOP as f64).round() as i64;
+        let mut best = 0.0f64;
+        for d in -1..=1 {
+            let i = h + d;
+            if i >= 0 && (i as usize) < flux.len() {
+                best = best.max(flux[i as usize]);
+            }
+        }
+        best
+    };
+    let step = FLUX_HOP as i64;
+    let steps = radius / step;
+    let score_at = |delta: i64| -> f64 {
+        let base = approx_local + delta as f64;
+        (0..n_beats)
+            .map(|k| at(base + f64::from(k) * beat_frames))
+            .sum()
+    };
+    (-steps..=steps)
+        .map(|k| {
+            let delta = k * step;
+            (delta, score_at(delta))
+        })
+        .collect()
+}
+
 /// Lock a marker onto the music's beat phase, searching a **full** beat period.
 ///
 /// [`refine_groove_phase`] and [`refine_periodic_phase`] both search only
@@ -693,36 +740,19 @@ pub fn lock_beat_phase(
         return approx;
     }
 
-    let centre = FLUX_WIN as f64 / 2.0;
-    let at = |pos: f64| -> f64 {
-        let h = ((pos - centre) / FLUX_HOP as f64).round() as i64;
-        let mut best = 0.0f64;
-        for d in -1..=1 {
-            let i = h + d;
-            if i >= 0 && (i as usize) < flux.len() {
-                best = best.max(flux[i as usize]);
-            }
-        }
-        best
-    };
-
     let approx_local = (approx as i64 - lo as i64) as f64;
-    let step = FLUX_HOP as i64;
-    let steps = radius / step;
-    let score_at = |delta: i64| -> f64 {
-        let base = approx_local + delta as f64;
-        (0..n_beats)
-            .map(|k| at(base + f64::from(k) * beat_frames))
-            .sum()
-    };
-    // `delta == 0` is scored explicitly (and is one of the `k` steps below),
-    // so the "don't move" option is always in the comparison set exactly.
-    let zero_score = score_at(0);
+    let candidates = score_beat_phase_candidates(&flux, approx_local, beat_frames, n_beats, radius);
+    // `delta == 0` is always among `candidates` (see the doc on
+    // `score_beat_phase_candidates`), so the "don't move" option is always in
+    // the comparison set exactly.
+    let zero_score = candidates
+        .iter()
+        .find(|&&(delta, _)| delta == 0)
+        .map(|&(_, score)| score)
+        .unwrap_or(0.0);
     let mut best_delta = 0i64;
     let mut best_score = zero_score;
-    for k in -steps..=steps {
-        let delta = k * step;
-        let score = score_at(delta);
+    for &(delta, score) in &candidates {
         if score > best_score {
             best_score = score;
             best_delta = delta;
@@ -750,6 +780,124 @@ pub fn lock_beat_phase(
         coarse,
         KICK_REFINE_RADIUS_MS,
     )
+}
+
+/// One candidate phase the comb in [`lock_beat_phase`] scores.
+///
+/// `flux` is the value [`lock_beat_phase`] actually maximizes. `kick` is not:
+/// the comb has a period of one beat, so by construction it cannot tell beat
+/// from offbeat, and on some real masters it locks onto the offbeat because
+/// the two look alike to broadband flux over that window. `kick` exists to
+/// test one *unverified* hypothesis about that — that the low band (i.e. the
+/// kick drum, not hats/percussion) might break the tie the broadband comb
+/// cannot see — without changing what `lock_beat_phase` does while that
+/// hypothesis is still being checked.
+pub struct BeatPhaseScore {
+    /// Offset from `approx_frame`, in frames.
+    pub delta: i64,
+    /// Broadband spectral-flux comb score — what `lock_beat_phase` maximizes.
+    pub flux: f64,
+    /// The same comb over the low band, i.e. how much *kick* sits on this
+    /// phase. `lock_beat_phase` does not look at this; it is measured so a
+    /// diagnostic can ask whether the low band breaks the beat/offbeat tie
+    /// the broadband comb cannot see.
+    pub kick: f64,
+}
+
+/// Diagnostic twin of [`lock_beat_phase`]: scores every phase candidate the
+/// same way (mirroring its window selection exactly, and reusing
+/// [`score_beat_phase_candidates`] so `flux` is not a reimplementation that
+/// could drift from what `lock_beat_phase` sees), and additionally scores the
+/// same comb over low-band onset novelty as `kick` — see
+/// [`BeatPhaseScore::kick`] for why that is not part of `lock_beat_phase`
+/// itself. Computing the low band is this function's own extra cost;
+/// `lock_beat_phase` never touches it, so this must not be called from its
+/// hot path.
+///
+/// Returns an empty `Vec` in exactly the situations where `lock_beat_phase`
+/// falls back to `approx_frame` unmoved (window too short, no onsets, etc.).
+pub fn beat_phase_comb_scores(
+    interleaved_stereo: &[f32],
+    sample_rate: u32,
+    approx_frame: u64,
+    beat_frames: f64,
+    n_bars: u32,
+) -> Vec<BeatPhaseScore> {
+    let frames = interleaved_stereo.len() / 2;
+    if frames == 0 || sample_rate == 0 || !(beat_frames.is_finite() && beat_frames > 1.0) {
+        return Vec::new();
+    }
+    let approx = approx_frame.min(frames as u64 - 1);
+    let n_beats = n_bars.saturating_mul(BEATS_PER_BAR).clamp(4, 128);
+    let radius = (beat_frames / 2.0).round().max(1.0) as i64;
+    let span = (f64::from(n_beats) * beat_frames).ceil() as i64 + radius;
+    let lo = (approx as i64 - radius).max(0) as usize;
+    let hi = ((approx as i64 + span) as usize).min(frames);
+    if hi <= lo + FLUX_WIN + FLUX_HOP {
+        return Vec::new();
+    }
+
+    let mut mono = Vec::with_capacity(hi - lo);
+    for i in lo..hi {
+        mono.push(0.5 * (interleaved_stereo[i * 2] + interleaved_stereo[i * 2 + 1]));
+    }
+    let flux = broadband_onset_flux(&mono);
+    if flux.is_empty() {
+        return Vec::new();
+    }
+
+    let approx_local = (approx as i64 - lo as i64) as f64;
+    let candidates =
+        score_beat_phase_candidates(&flux, approx_local, beat_frames, n_beats, radius);
+
+    // Low-band novelty for the same window, at the same hop as the broadband
+    // flux so the two combs line up in time. Unlike `broadband_onset_flux`,
+    // `onset_envelope` can fail on a window with too little signal below the
+    // LPF cutoff to find onsets in (or that is simply too short); when it
+    // does, `kick` reports 0.0 for every delta rather than propagating the
+    // error, since this is a diagnostic and "no low-band onsets here" is
+    // itself a valid (if uninteresting) answer to "does the low band break
+    // the tie".
+    let kick_novelty = onset_envelope(&mono, sample_rate, FLUX_HOP)
+        .ok()
+        .map(|d| d.novelty);
+    // `onset_envelope`'s hop `i` covers samples `[i*hop, (i+1)*hop)`, unlike
+    // `broadband_onset_flux`'s FFT-windowed value `i` (centred on
+    // `i*hop + FLUX_WIN/2`), so the nearest-hop lookup below uses its own
+    // centre rather than reusing `score_beat_phase_candidates`'s.
+    let kick_centre = FLUX_HOP as f64 / 2.0;
+    let kick_hop = FLUX_HOP as i64;
+    let at_kick = |novelty: &[f64], pos: f64| -> f64 {
+        let h = ((pos - kick_centre) / kick_hop as f64).round() as i64;
+        let mut best = 0.0f64;
+        for d in -1..=1 {
+            let i = h + d;
+            if i >= 0 && (i as usize) < novelty.len() {
+                best = best.max(novelty[i as usize]);
+            }
+        }
+        best
+    };
+
+    candidates
+        .into_iter()
+        .map(|(delta, flux_score)| {
+            let kick = match &kick_novelty {
+                Some(novelty) => {
+                    let base = approx_local + delta as f64;
+                    (0..n_beats)
+                        .map(|k| at_kick(novelty, base + f64::from(k) * beat_frames))
+                        .sum()
+                }
+                None => 0.0,
+            };
+            BeatPhaseScore {
+                delta,
+                flux: flux_score,
+                kick,
+            }
+        })
+        .collect()
 }
 
 /// Refine a downbeat by scoring low-band onset energy across several following beats.
@@ -2313,6 +2461,14 @@ pub struct SectionDiag {
     /// intro-prefix-model / novelty computation as `intro_structure`, not a
     /// separately time-reversed variant.
     pub outro_structure: Option<crate::structure::StructureSignals>,
+    /// Number of leading bars (of `intro`) that fall entirely inside the
+    /// analysis scan window and were actually fed to `intro_structure`.
+    /// `features::bar_features` zero-fills bars outside its window (see its
+    /// doc), and those zero-filled bars must never reach `structure::compute`
+    /// — see [`bar_diag_rows`]. `0` unless `with_new_features` was set.
+    pub intro_covered: usize,
+    /// Same as [`Self::intro_covered`], for `outro` / `outro_structure`.
+    pub outro_covered: usize,
 }
 
 /// Compute per-bar features for intro (forward) and outro (backward) scan
@@ -2362,14 +2518,14 @@ pub fn diagnose_section_bars_ext(
     let head_window = with_new_features.then_some((head.as_slice(), 0u64));
     let tail_window = with_new_features.then_some((tail.as_slice(), tail_start));
 
-    let (intro, intro_new_feats) = bar_diag_rows(
+    let (intro, intro_new_feats, intro_covered) = bar_diag_rows(
         buffer,
         first_downbeat,
         intro_bar_len,
         SectionDir::Forward,
         head_window,
     )?;
-    let (outro, outro_new_feats) = bar_diag_rows(
+    let (outro, outro_new_feats, outro_covered) = bar_diag_rows(
         buffer,
         buffer.frames,
         outro_bar_len,
@@ -2377,34 +2533,75 @@ pub fn diagnose_section_bars_ext(
         tail_window,
     )?;
 
-    let intro_structure = intro_new_feats
-        .as_deref()
-        .map(|f| crate::structure::compute(f, crate::structure::DEFAULT_PREFIX_BARS));
-    let outro_structure = outro_new_feats
-        .as_deref()
-        .map(|f| crate::structure::compute(f, crate::structure::DEFAULT_PREFIX_BARS));
+    // Only the leading `*_covered` bars are real window audio; the rest are
+    // `BarFeatures::default()` zero-fill and must not reach `structure::compute`
+    // (see `bar_diag_rows`).
+    let intro_structure = intro_new_feats.as_deref().and_then(|f| {
+        (intro_covered > 0).then(|| {
+            crate::structure::compute(&f[..intro_covered], crate::structure::DEFAULT_PREFIX_BARS)
+        })
+    });
+    let outro_structure = outro_new_feats.as_deref().and_then(|f| {
+        (outro_covered > 0).then(|| {
+            crate::structure::compute(&f[..outro_covered], crate::structure::DEFAULT_PREFIX_BARS)
+        })
+    });
 
     Ok(SectionDiag {
         intro,
         outro,
         intro_structure,
         outro_structure,
+        intro_covered,
+        outro_covered,
     })
 }
 
+/// Per-bar diagnostics for one side (intro or outro), plus the Stage 2
+/// feature vectors and how many leading bars of them are safe to feed to
+/// [`crate::structure::compute`].
+///
+/// `window` bounds the audio [`crate::features::bar_features`] actually has
+/// samples for; bars whose `[start, start + bar_len_frames)` span is not
+/// fully inside it come back as `BarFeatures::default()` (all-zero — see that
+/// function's doc), which would otherwise contaminate the SSM/novelty/
+/// prefix-Mahalanobis signals with fake structure. `covered` is the number of
+/// leading bars (bar 0 first, matching `starts`' anchor-nearest-first order
+/// on both the forward intro side and the backward outro side) that are
+/// fully inside the window, determined purely from bar position vs window
+/// bounds — never from whether a bar's features happen to be zero, which
+/// would also drop genuinely silent bars. Scanned front-to-back and stopped
+/// at the first bar that falls outside the window, since both scan
+/// directions lay bars out contiguously from the window's near edge.
 fn bar_diag_rows(
     buffer: &AudioBuffer,
     anchor: u64,
     bar_len: f64,
     dir: SectionDir,
     window: Option<(&[f32], u64)>,
-) -> Result<(Vec<BarDiag>, Option<Vec<crate::features::BarFeatures>>)> {
+) -> Result<(Vec<BarDiag>, Option<Vec<crate::features::BarFeatures>>, usize)> {
     let bar_len_frames = bar_len.round().max(1.0) as u64;
     let starts = section_bar_starts(buffer, anchor, bar_len_frames, dir);
     let feats = bar_features(buffer, &starts, bar_len_frames);
     let new_feats = window.map(|(mono, offset)| {
         crate::features::bar_features(mono, offset, buffer.sample_rate, &starts, bar_len_frames)
     });
+    let covered = match window {
+        Some((mono, offset)) => {
+            let win_end = offset.saturating_add(mono.len() as u64);
+            let mut c = 0usize;
+            for &start in &starts {
+                let end = start.saturating_add(bar_len_frames);
+                if start >= offset && end <= win_end {
+                    c += 1;
+                } else {
+                    break;
+                }
+            }
+            c
+        }
+        None => 0,
+    };
     let rows = feats
         .into_iter()
         .enumerate()
@@ -2425,7 +2622,7 @@ fn bar_diag_rows(
             new_features: new_feats.as_ref().and_then(|v| v.get(i).copied()),
         })
         .collect();
-    Ok((rows, new_feats))
+    Ok((rows, new_feats, covered))
 }
 
 #[derive(Clone, Copy)]

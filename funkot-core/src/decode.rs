@@ -128,13 +128,9 @@ fn probe_format<'s>(
         })
 }
 
-/// Decode an entire audio file to stereo f32 at native sample rate.
-///
-/// Supported: MP3, AAC (m4a), ALAC (m4a), FLAC, Ogg Vorbis, WAV.
-pub fn decode_file(path: &Path) -> Result<AudioBuffer> {
-    #[cfg(any(test, feature = "testutil"))]
-    DECODE_FILE_CALLS.fetch_add(1, Ordering::SeqCst);
-
+/// Decode an entire audio file to stereo f32 at native sample rate, using
+/// symphonia directly (no ffmpeg fallback). See [`decode_file`].
+fn decode_native(path: &Path) -> Result<AudioBuffer> {
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -172,7 +168,11 @@ pub fn decode_file(path: &Path) -> Result<AudioBuffer> {
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(audio_params, &dec_opts)
         .map_err(|e| {
-            Error::Decode(format!(
+            // The container was recognized but no decoder exists for its
+            // codec (e.g. Opus inside Ogg) — this is the ffmpeg fallback's
+            // entry point in `decode_file`, so it must be `UnsupportedFormat`
+            // and not `Decode`.
+            Error::UnsupportedFormat(format!(
                 "cannot create decoder for '{}': {}",
                 path.display(),
                 e
@@ -250,6 +250,55 @@ pub fn decode_file(path: &Path) -> Result<AudioBuffer> {
         frames,
         samples,
     })
+}
+
+/// Decode an entire audio file to stereo f32 at native sample rate.
+///
+/// Supported natively: MP3, AAC (m4a), ALAC (m4a), FLAC, Ogg Vorbis, WAV.
+///
+/// When ffmpeg is available on `PATH`, formats symphonia can't decode
+/// directly (Opus, WMA, AIFF, APE, …) are transparently converted to FLAC
+/// first and decoded from there; the converted file is cached under
+/// [`crate::convert::cache_dir`] and reused on later calls. The track's
+/// identity is always the original file at `path`: content hashing
+/// ([`crate::cache::content_hash`]) and everything keyed by it
+/// (`funkot-cache`, `labels.tsv`) never sees the converted file, only this
+/// one. Without ffmpeg on `PATH`, such formats fail with
+/// [`Error::UnsupportedFormat`].
+pub fn decode_file(path: &Path) -> Result<AudioBuffer> {
+    #[cfg(any(test, feature = "testutil"))]
+    DECODE_FILE_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    match decode_native(path) {
+        Err(Error::UnsupportedFormat(why)) => {
+            let converted = crate::convert::to_flac_cached(path)
+                .map_err(|e| with_native_failure_context(e, &why))?;
+            decode_native(&converted).map_err(|e| {
+                Error::Decode(format!(
+                    "'{}': native decode failed ({why}); ffmpeg conversion to '{}' \
+                     succeeded but decoding the converted file also failed: {e}",
+                    path.display(),
+                    converted.display()
+                ))
+            })
+        }
+        other => other,
+    }
+}
+
+/// Append the original `decode_native` failure reason to a conversion error,
+/// keeping the error's variant (so an ffmpeg-not-found error, for example,
+/// stays [`Error::UnsupportedFormat`]).
+fn with_native_failure_context(e: Error, native_why: &str) -> Error {
+    match e {
+        Error::UnsupportedFormat(m) => {
+            Error::UnsupportedFormat(format!("{m} (native decode also failed: {native_why})"))
+        }
+        Error::Decode(m) => {
+            Error::Decode(format!("{m} (native decode also failed: {native_why})"))
+        }
+        other => other,
+    }
 }
 
 /// Convert interleaved multi-channel samples to interleaved stereo.
@@ -407,12 +456,17 @@ mod tests {
         std::fs::write(&path, b"not an audio file at all").expect("write bogus");
         let err = decode_file(&path).expect_err("should fail");
         let _ = std::fs::remove_file(&path);
-        match err {
-            Error::UnsupportedFormat(msg) => {
-                assert!(msg.contains("bogus") || msg.contains("extension"));
-            }
-            other => panic!("expected UnsupportedFormat, got {other}"),
-        }
+        // Without ffmpeg on PATH this is `UnsupportedFormat` straight from
+        // decode_native's probe failure. With ffmpeg present, decode_file
+        // also tries the conversion fallback; ffmpeg can't make sense of
+        // this file either and fails, so the error becomes `Decode` — but
+        // either way the original probe failure has to still be in the
+        // message (see `with_native_failure_context`).
+        let msg = match &err {
+            Error::UnsupportedFormat(msg) | Error::Decode(msg) => msg,
+            other => panic!("expected UnsupportedFormat or Decode, got {other}"),
+        };
+        assert!(msg.contains("bogus") || msg.contains("extension"));
     }
 
     #[test]

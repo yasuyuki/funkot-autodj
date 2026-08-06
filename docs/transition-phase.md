@@ -25,6 +25,18 @@
 （疎な intro head 対策）。手動で `outro_bars` を直すときは `outro_start` も合わせる
 （ロード時は再計算しない）。
 
+### ガイドクリックの位相補正はミックス側に要らない
+
+`funkot-cli` の `outro_beat_phase_shift`（→ docs/guide-clicks.md）は、曲自身の小節が
+`first_downbeat` 格子からずれる曲のために 0〜3拍の補正を入れる。**これはミックス側には
+不要**。エンジンの `outro_start_out` は fd 伝播ではなくファイル終端から逆算し、
+Stage 2 の mod-4 groove bar identity が同じずれを実音から解決するため。
+
+`testdata/verify_mix_phase_transitions/` の4遷移を聴いて確認済み。統計上 +2 / +3 / +1拍
+ずれる3曲のアウトロと、補正が効かない対照（Kimi to Semi Blue → Boom Boom Pow）の
+いずれもダウンビート・mod-4 とも一致していた。よって `outro_beat_phase_shift` を
+`funkot-core` / `TrackAnalysis` へ移す必要はない。
+
 ## 禁止事項（v10 の失敗）
 
 **±1/±2拍の coarse kick-only xcorr は使わない。** 拍は合うが小節がずれる。
@@ -87,5 +99,7 @@
 
 ## 既知の未解決（低優先）
 
-- ミックスピークが +3 dBFS 程度になることがある（リミッター未実装）
+- ミックスピークが +3 dBFS 程度になることがある（リミッター未実装）。
+  `verify_mix_phase_transitions` 生成時は peak 1.6232（+4.21 dBFS）、`|x|>1` が
+  3197サンプル。f32 出力なのでファイル上はクリップしない
 - ハイパス重なり中は設計上ハットが両デッキから聞こえる（300Hz HPF）

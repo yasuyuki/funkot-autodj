@@ -19,7 +19,8 @@ use std::time::Instant;
 use funkot_core::analysis::{analyze, diagnose_section_bars_ext, BarDiag};
 use funkot_core::cache;
 use funkot_core::decode;
-use funkot_core::structure::StructureSignals;
+use funkot_core::features::BarFeatures;
+use funkot_core::structure::{self, StructureSignals, DEFAULT_PREFIX_BARS};
 
 fn main() {
     let mut cache_dir: Option<PathBuf> = None;
@@ -108,11 +109,25 @@ fn main() {
                     );
                     print_side("INTRO (forward from first downbeat)", &diag.intro, new_features);
                     if let Some(s) = &diag.intro_structure {
+                        println!(
+                            "  structure signals cover only the {} window-covered bars (legacy columns: {} bars)",
+                            diag.intro_covered,
+                            diag.intro.len(),
+                        );
                         print_structure("INTRO", s);
+                        let feats = covered_features(&diag.intro, diag.intro_covered);
+                        print_dim_breakdown("INTRO", &structure::combined_vectors(&feats));
                     }
                     print_side("OUTRO (backward from end)", &diag.outro, new_features);
                     if let Some(s) = &diag.outro_structure {
+                        println!(
+                            "  structure signals cover only the {} window-covered bars (legacy columns: {} bars)",
+                            diag.outro_covered,
+                            diag.outro.len(),
+                        );
                         print_structure("OUTRO", s);
+                        let feats = covered_features(&diag.outro, diag.outro_covered);
+                        print_dim_breakdown("OUTRO", &structure::combined_vectors(&feats));
                     }
                 }
                 Err(e) => eprintln!("  diagnose failed: {e}"),
@@ -164,6 +179,120 @@ fn print_side(label: &str, rows: &[BarDiag], new_features: bool) {
                 row.bar_index, row.midhigh_ratio, row.rms_db, row.hf_db, row.centroid_hz
             );
         }
+    }
+}
+
+/// Leading `covered` bars' Stage 2 features, in the same order `structure::compute`
+/// consumed them.
+fn covered_features(rows: &[BarDiag], covered: usize) -> Vec<BarFeatures> {
+    rows.iter()
+        .take(covered)
+        .filter_map(|r| r.new_features)
+        .collect()
+}
+
+/// Per-dimension breakdown of the [`structure::mahalanobis_from_prefix`] model
+/// over `combined` (same 21-dim vectors, same prefix bars, same variance
+/// floor). `prefix_mean`/`prefix_var` are the population mean/variance over
+/// the first `DEFAULT_PREFIX_BARS` bars; `floored` marks dimensions where the
+/// raw variance was below the `1e-6` floor `mahalanobis_from_prefix` applies;
+/// `mean_share` is each dimension's average share of `diff^2/var` across all
+/// covered bars (each bar's 21 shares sum to 1, then averaged over bars — so
+/// the printed column also sums to ~1.0). Sorted by `mean_share` descending.
+fn print_dim_breakdown(label: &str, combined: &[Vec<f64>]) {
+    const DIM_NAMES: [&str; 21] = [
+        "band_db[0]",
+        "band_db[1]",
+        "band_db[2]",
+        "band_db[3]",
+        "band_db[4]",
+        "band_db[5]",
+        "band_db[6]",
+        "chroma[0]",
+        "chroma[1]",
+        "chroma[2]",
+        "chroma[3]",
+        "chroma[4]",
+        "chroma[5]",
+        "chroma[6]",
+        "chroma[7]",
+        "chroma[8]",
+        "chroma[9]",
+        "chroma[10]",
+        "chroma[11]",
+        "tonality",
+        "voiced",
+    ];
+
+    let n = combined.len();
+    if n == 0 {
+        return;
+    }
+    let dim = combined[0].len();
+    let p = DEFAULT_PREFIX_BARS.clamp(1, n);
+
+    let mut mean = vec![0.0f64; dim];
+    for f in &combined[..p] {
+        for d in 0..dim {
+            mean[d] += f[d];
+        }
+    }
+    for m in &mut mean {
+        *m /= p as f64;
+    }
+
+    let mut raw_var = vec![0.0f64; dim];
+    for f in &combined[..p] {
+        for d in 0..dim {
+            let diff = f[d] - mean[d];
+            raw_var[d] += diff * diff;
+        }
+    }
+    for v in &mut raw_var {
+        *v /= p as f64;
+    }
+    let var: Vec<f64> = raw_var.iter().map(|v| v.max(1e-6)).collect();
+
+    // mean_share: per-bar diff^2/var normalized to sum 1 across dims, then
+    // averaged over all covered bars — same `s = diff^2 / var` term
+    // `mahalanobis_from_prefix` sums before its final `/dim` + `sqrt`.
+    let mut share_sum = vec![0.0f64; dim];
+    for f in combined {
+        let mut terms = vec![0.0f64; dim];
+        let mut total = 0.0f64;
+        for d in 0..dim {
+            let diff = f[d] - mean[d];
+            let s = diff * diff / var[d];
+            terms[d] = s;
+            total += s;
+        }
+        if total > 0.0 {
+            for d in 0..dim {
+                share_sum[d] += terms[d] / total;
+            }
+        }
+    }
+    let mean_share: Vec<f64> = share_sum.iter().map(|s| s / n as f64).collect();
+
+    println!(
+        "  -- {label} prefix-model dimension breakdown (prefix={p} bars, covered={n} bars) --"
+    );
+    println!("  dim            prefix_mean  prefix_var  floored  mean_share");
+    let mut order: Vec<usize> = (0..dim).collect();
+    order.sort_by(|&a, &b| {
+        mean_share[b]
+            .partial_cmp(&mean_share[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for d in order {
+        println!(
+            "  {:<14} {:>11.4} {:>11.7} {:>8} {:>11.3}",
+            DIM_NAMES.get(d).copied().unwrap_or("?"),
+            mean[d],
+            raw_var[d],
+            if raw_var[d] < 1e-6 { "YES" } else { "-" },
+            mean_share[d],
+        );
     }
 }
 

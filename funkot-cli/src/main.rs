@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, StreamConfig, SupportedBufferSize};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -32,11 +32,21 @@ use log::warn;
     version,
     arg_required_else_help = true
 )]
+// The two modes that synthesize a click track, as one group so `--click-db`
+// and `--click-duck-db` can `requires` it. Without the group each would have
+// to name a single mode, and dropping the requirement outright (the obvious
+// way to share them) makes a `--click-db` passed to plain playback silently
+// do nothing -- exactly the failure that wastes an evening on "I turned the
+// clicks up and nothing got louder". `multiple = false` also keeps the two
+// modes mutually exclusive, which is why neither carries a `conflicts_with`.
+#[command(group(ArgGroup::new("click_modes").args(["label_sections", "survey"]).multiple(false)))]
 struct Args {
     /// Audio files in play order
     files: Vec<PathBuf>,
 
-    /// Playlist file: one path per line (# comments / blank lines ignored)
+    /// Playlist file: one path per line (# comments / blank lines ignored;
+    /// absolute paths used as-is, relative ones resolved against the list
+    /// file's own directory, not the working directory)
     #[arg(short = 'l', long = "list", value_name = "FILE")]
     list: Option<PathBuf>,
 
@@ -152,18 +162,45 @@ struct Args {
     #[arg(long, value_name = "DIR", requires = "label_sections")]
     render_clips: Option<PathBuf>,
 
-    /// `--label-sections` click peak level, in dB above the clip's own RMS
-    /// loudness (not a fixed absolute amplitude — real Funkot masters run
-    /// hot enough that a fixed number either got lost or clipped). Raise
-    /// this if clicks are still hard to hear on a given track.
-    #[arg(long, default_value_t = label_session::ClickOptions::default().click_db_above_rms, requires = "label_sections")]
+    /// Interactive outro-grid survey: for each track, play a window over the
+    /// last `label_session::SURVEY_WINDOW_BARS` bars of the outro (clicking
+    /// every beat, not just every bar head) and record a one-key judgement of
+    /// whether the click grid sits on the beat, then move to the next track.
+    /// Tracks come from `-l/--list` or the positional FILES, same as normal
+    /// playback. Does not read or write `--labels`; verdicts go to
+    /// `--survey-out` instead. See `funkot_cli::label_session` for the clip
+    /// synthesis this plays.
+    #[arg(long = "survey", requires = "survey_out")]
+    survey: bool,
+
+    /// Verdict TSV path for `--survey` (required with that flag). A track
+    /// already judged there (matched by content hash, the same key
+    /// `--labels` uses) is skipped on the next run.
+    #[arg(long = "survey-out", value_name = "FILE")]
+    survey_out: Option<PathBuf>,
+
+    /// Click peak level, in dB above the clip's own RMS loudness (not a
+    /// fixed absolute amplitude — real Funkot masters run hot enough that a
+    /// fixed number either got lost or clipped), for `--label-sections` and
+    /// `--survey` alike. Raise this if clicks are still hard to hear on a
+    /// given track.
+    #[arg(
+        long,
+        default_value_t = label_session::ClickOptions::default().click_db_above_rms,
+        requires = "click_modes"
+    )]
     click_db: f32,
 
-    /// `--label-sections`: how many dB to duck the music under each bar-head
-    /// click (sidechain-style, so the click cuts through dense/loud
-    /// material). The boundary click ducks deeper and longer automatically
-    /// on top of this, so it stays distinguishable from a normal bar head.
-    #[arg(long, default_value_t = label_session::ClickOptions::default().duck_db, requires = "label_sections")]
+    /// How many dB to duck the music under each click (sidechain-style, so
+    /// the click cuts through dense/loud material), for `--label-sections`
+    /// and `--survey` alike. `--label-sections`' boundary click ducks deeper
+    /// and longer automatically on top of this, so it stays distinguishable
+    /// from a normal bar head.
+    #[arg(
+        long,
+        default_value_t = label_session::ClickOptions::default().duck_db,
+        requires = "click_modes"
+    )]
     click_duck_db: f32,
 }
 
@@ -192,6 +229,7 @@ fn run() -> Result<()> {
     }
 
     if args.label_sections {
+        validate_rate(args.rate)?;
         // clap's `requires` guarantees this is Some.
         let labels_path = args.labels.clone().expect("--labels required by clap");
         let playlist = resolve_playlist(&args)?;
@@ -199,12 +237,43 @@ fn run() -> Result<()> {
             click_db_above_rms: args.click_db,
             duck_db: args.click_duck_db,
         };
+        let pitch_mode = if args.pitch_shift {
+            PitchMode::Shift
+        } else {
+            PitchMode::Preserve
+        };
         return run_label_sections(
             &playlist,
             &labels_path,
             &args.cache_dir,
             args.render_clips.as_deref(),
             &click_opts,
+            args.rate,
+            pitch_mode,
+        );
+    }
+
+    if args.survey {
+        validate_rate(args.rate)?;
+        // clap's `requires` guarantees this is Some.
+        let survey_out = args.survey_out.clone().expect("--survey-out required by clap");
+        let playlist = resolve_playlist(&args)?;
+        let click_opts = label_session::ClickOptions {
+            click_db_above_rms: args.click_db,
+            duck_db: args.click_duck_db,
+        };
+        let pitch_mode = if args.pitch_shift {
+            PitchMode::Shift
+        } else {
+            PitchMode::Preserve
+        };
+        return run_survey(
+            &playlist,
+            &survey_out,
+            &args.cache_dir,
+            &click_opts,
+            args.rate,
+            pitch_mode,
         );
     }
 
@@ -295,10 +364,18 @@ fn resolve_playlist(args: &Args) -> Result<Vec<PathBuf>> {
     }
 }
 
-fn build_options(args: &Args) -> Result<EngineOptions> {
-    if !args.rate.is_finite() || !(0.5..=2.0).contains(&args.rate) {
-        bail!("--rate must be finite and in [0.5, 2.0], got {}", args.rate);
+/// Shared by `build_options` (normal playback) and the `--label-sections`
+/// branch of `run()`, which never calls `build_options` and so previously
+/// left `--rate` unvalidated on that path.
+fn validate_rate(rate: f64) -> Result<()> {
+    if !rate.is_finite() || !(0.5..=2.0).contains(&rate) {
+        bail!("--rate must be finite and in [0.5, 2.0], got {}", rate);
     }
+    Ok(())
+}
+
+fn build_options(args: &Args) -> Result<EngineOptions> {
+    validate_rate(args.rate)?;
     if !(1..=16).contains(&args.fade_bars) {
         bail!("--fade-bars must be in 1..=16, got {}", args.fade_bars);
     }
@@ -1477,14 +1554,23 @@ fn run_label_sections(
     cache_dir: &Path,
     render_clips_dir: Option<&Path>,
     click_opts: &label_session::ClickOptions,
+    rate: f64,
+    pitch_mode: PitchMode,
 ) -> Result<()> {
     let existing = if labels_path.exists() {
         funkot_core::labels::load_labels(labels_path).map_err(|e| anyhow::anyhow!("{e}"))?
     } else {
         Vec::new()
     };
-    let labeled: std::collections::HashSet<String> =
-        existing.into_iter().map(|l| l.hash).collect();
+    // A row only counts as "labeled" (and so gets skipped on the next run)
+    // once both sides are confirmed. A row with only a note and/or one side
+    // set (see `save_pending_note` / `save_label_and_cache`) is still missing
+    // information, so the track must be offered again.
+    let labeled: std::collections::HashSet<String> = existing
+        .into_iter()
+        .filter(|l| l.intro_best.is_some() && l.outro_best.is_some())
+        .map(|l| l.hash)
+        .collect();
 
     let mut hashes = Vec::with_capacity(playlist.len());
     let mut skipped = 0usize;
@@ -1511,7 +1597,16 @@ fn run_label_sections(
         return render_label_clips(&todo, cache_dir, dir, click_opts);
     }
 
-    run_label_sections_interactive(playlist, &hashes, &labeled, labels_path, cache_dir, click_opts)
+    run_label_sections_interactive(
+        playlist,
+        &hashes,
+        &labeled,
+        labels_path,
+        cache_dir,
+        click_opts,
+        rate,
+        pitch_mode,
+    )
 }
 
 /// `--render-clips DIR`: for every candidate on both sides of every track in
@@ -1536,15 +1631,18 @@ fn render_label_clips(
             .unwrap_or("track");
 
         let mut n = 0usize;
+        let mut side_grids = label_session::SideGrids::default();
         for side in [Side::Intro, Side::Outro] {
             for &bars in side.candidates() {
-                let clip = label_session::build_candidate_clip(
+                let grid = side_grids.get(&buf, &analysis, side);
+                let clip = label_session::build_candidate_clip_on_grid(
                     &buf,
                     &analysis,
                     side,
                     bars,
                     label_session::NORMAL_HALF_WIDTH_BARS,
                     click_opts,
+                    grid,
                 );
                 let clip_path =
                     out_dir.join(format!("{stem}_{}_{bars:03}bars.wav", side.label()));
@@ -1559,28 +1657,97 @@ fn render_label_clips(
     Ok(())
 }
 
-/// Resample a `--label-sections` click clip from the source file's own
-/// sample rate to the output device's rate. [`ClipPlayer`] streams whatever
-/// buffer it's handed straight into the device callback with no rate
-/// conversion of its own, so without this, a device default that differs
-/// from the file's rate (e.g. a 48 kHz device against 44.1 kHz Funkot
-/// masters) played every clip audibly fast/sharp or slow/flat. `speed` is
-/// pinned to `1.0` and [`PitchMode::Shift`] used deliberately: this needs an
-/// exact sample-rate match for correct playback speed, not a tempo change,
-/// so the plain-resample path (reused from the loader's existing
-/// [`funkot_core::stretch`]) is the right one, not the pitch-preserving
-/// stretch.
-fn resample_clip_for_device(clip: Vec<f32>, source_rate: u32, device_rate: u32) -> Vec<f32> {
-    if source_rate == device_rate {
+/// Highest instantaneous sample magnitude label-sections playback is allowed
+/// to reach after speed/pitch/rate conversion. Same value and same reasoning
+/// as `label_session::CLIP_SAFETY_CEILING` (slightly below 1.0 for float
+/// rounding margin, not because 1.0 itself is a problem) -- that constant
+/// caps what the click-track synthesis in `label_session.rs` produces before
+/// this stage ever sees it; this one caps what `render_track` can do to a
+/// clip that came in under that ceiling.
+const PLAYBACK_PEAK_CEILING: f32 = 0.97;
+
+/// Scale `samples` down by a single factor if their peak magnitude exceeds
+/// [`PLAYBACK_PEAK_CEILING`]; a no-op otherwise.
+///
+/// Needed because `PitchMode::Preserve` at `--rate` 1.10 measurably pushes
+/// hot Funkot masters over full scale: on a real clip (`03. KazuyaP -
+/// Monitoring Db.flac`, intro 16 bars, source peak 0.991) `Preserve` at 1.10
+/// came out at peak 1.749 with 0.1255% of samples over 1.0, i.e. audibly
+/// clipped at the device. Production mixing never sees this because the
+/// engine applies `analysis.gain_db` (RMS-normalizing gain toward
+/// `TARGET_RMS_DBFS`, see `gain_linear` in `funkot-core/src/engine.rs`)
+/// before the mix bus reaches the device; label clips are built straight
+/// from the source material and never go through that gain stage, so
+/// nothing else in this path stops the peak from exceeding full scale.
+///
+/// Scales the whole clip by one scalar rather than per-sample limiting, so
+/// the click/music balance `label_session`'s synthesis decided (via
+/// `click_db_above_rms` and the sidechain ducking) is preserved exactly --
+/// only the overall level moves.
+fn clamp_playback_peak(samples: &mut [f32]) {
+    let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak <= PLAYBACK_PEAK_CEILING {
+        return;
+    }
+    let scale = PLAYBACK_PEAK_CEILING / peak;
+    for s in samples.iter_mut() {
+        *s *= scale;
+    }
+}
+
+/// Prepare a `--label-sections` click clip for playback: apply the `--rate`
+/// playback speed and, in the same pass, match the output device's sample
+/// rate. [`ClipPlayer`] streams whatever buffer it's handed straight into
+/// the device callback with no rate conversion of its own, so both of these
+/// have to happen here or not at all.
+///
+/// Playback runs at `speed` (normally `--rate`, default 1.10) rather than
+/// 1.0 because production DJ playback is always sped up by that factor, and
+/// labeling by ear at the production speed is more representative than
+/// labeling at the source tempo. This is a fixed multiplier on the
+/// material's own tempo, deliberately *not* the engine's 198 BPM
+/// normalization (`180 * rate / intro_bpm`, see `EngineOptions`/loader):
+/// tying the labeling speed to BPM estimation would mean a track whose BPM
+/// was mis-detected at half or double time gets labeled at 2x speed by
+/// accident. The label clips are built from the source material, which is
+/// nominally 180 BPM, so in practice this comes out to the same multiplier
+/// as the engine's normalization anyway.
+///
+/// Device sample-rate matching is unconditional whenever `source_rate !=
+/// device_rate` (e.g. a 48 kHz device against 44.1 kHz Funkot masters);
+/// without it every clip played audibly fast/sharp or slow/flat. It rides
+/// along in the same [`funkot_core::stretch::render_track`] call as the
+/// speed change rather than a separate resample step.
+///
+/// Measured cost (106 s clip, 44.1 kHz → 48 kHz, release build, this dev
+/// environment): `PitchMode::Preserve` 1.67 s, `PitchMode::Shift` 0.46 s,
+/// vs. 0.54 s for the old speed-1.0 resample-only path. So the default
+/// (pitch preserved, matching production) adds roughly 1.2 s of wait per
+/// keystroke; `--pitch-shift` does not.
+///
+/// Runs the result through [`clamp_playback_peak`] before returning: see
+/// that function for why a speed change alone can drive a clip over full
+/// scale here even though nothing else in this path does.
+fn prepare_clip_for_playback(
+    clip: Vec<f32>,
+    source_rate: u32,
+    device_rate: u32,
+    speed: f64,
+    pitch_mode: PitchMode,
+) -> Vec<f32> {
+    if source_rate == device_rate && speed == 1.0 {
         return clip;
     }
-    match funkot_core::stretch::render_track(&clip, source_rate, device_rate, 1.0, PitchMode::Shift)
-    {
-        Ok(resampled) => resampled,
+    match funkot_core::stretch::render_track(&clip, source_rate, device_rate, speed, pitch_mode) {
+        Ok(mut rendered) => {
+            clamp_playback_peak(&mut rendered);
+            rendered
+        }
         Err(e) => {
             eprintln!(
-                "warn: could not resample label-sections clip {source_rate} Hz -> \
-                 {device_rate} Hz ({e}); playing at source rate (pitch/tempo will be off)"
+                "warn: could not prepare label-sections clip for playback ({source_rate} Hz -> \
+                 {device_rate} Hz, speed {speed}, {e}); playing at source rate and speed \
+                 (pitch/tempo will be off)"
             );
             clip
         }
@@ -1588,14 +1755,14 @@ fn resample_clip_for_device(clip: Vec<f32>, source_rate: u32, device_rate: u32) 
 }
 
 #[cfg(test)]
-mod resample_clip_for_device_tests {
+mod prepare_clip_for_playback_tests {
     use super::*;
 
-    fn stereo_sine(frames: usize, freq: f32, sr: u32) -> Vec<f32> {
+    fn stereo_sine(frames: usize, freq: f32, sr: u32, amp: f32) -> Vec<f32> {
         let mut out = vec![0.0f32; frames * 2];
         for i in 0..frames {
             let t = i as f32 / sr as f32;
-            let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.5;
+            let s = (2.0 * std::f32::consts::PI * freq * t).sin() * amp;
             out[i * 2] = s;
             out[i * 2 + 1] = s;
         }
@@ -1603,10 +1770,11 @@ mod resample_clip_for_device_tests {
     }
 
     #[test]
-    fn matching_rates_pass_through_unchanged() {
-        let clip = stereo_sine(2_000, 440.0, 44_100);
-        let out = resample_clip_for_device(clip.clone(), 44_100, 44_100);
-        assert_eq!(out, clip, "same source/device rate must be a no-op");
+    fn matching_rates_and_unit_speed_pass_through_unchanged() {
+        let clip = stereo_sine(2_000, 440.0, 44_100, 0.5);
+        let out =
+            prepare_clip_for_playback(clip.clone(), 44_100, 44_100, 1.0, PitchMode::Preserve);
+        assert_eq!(out, clip, "same source/device rate and speed 1.0 must be a no-op");
     }
 
     #[test]
@@ -1616,8 +1784,9 @@ mod resample_clip_for_device_tests {
         // with no rate conversion at all.
         let source_rate = 44_100;
         let device_rate = 48_000;
-        let clip = stereo_sine(4_410, 440.0, source_rate); // 100 ms
-        let out = resample_clip_for_device(clip, source_rate, device_rate);
+        let clip = stereo_sine(4_410, 440.0, source_rate, 0.5); // 100 ms
+        let out =
+            prepare_clip_for_playback(clip, source_rate, device_rate, 1.0, PitchMode::Preserve);
 
         let expected_frames = 4_410 * device_rate as usize / source_rate as usize;
         let out_frames = out.len() / 2;
@@ -1626,6 +1795,108 @@ mod resample_clip_for_device_tests {
             "out_frames={out_frames} expected≈{expected_frames}"
         );
         assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn same_rate_speed_1_10_preserve_shortens_by_the_rate() {
+        // Amplitude 0.95, not 0.5: the stretch overshoots its input peak by
+        // about 1.35x (measured), so 0.5 comes out at ~0.676 and never reaches
+        // the ceiling -- the peak assertion below would then hold even if
+        // `prepare_clip_for_playback` stopped clamping at all.
+        let sr = 44_100;
+        let clip = stereo_sine(sr as usize, 440.0, sr, 0.95); // 1s
+        let out = prepare_clip_for_playback(clip.clone(), sr, sr, 1.10, PitchMode::Preserve);
+
+        let in_frames = clip.len() / 2;
+        let expected_frames = (in_frames as f64 / 1.10).round() as usize;
+        let out_frames = out.len() / 2;
+        assert!(
+            out_frames.abs_diff(expected_frames) <= expected_frames / 50 + 8,
+            "out_frames={out_frames} expected≈{expected_frames}"
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            (peak - PLAYBACK_PEAK_CEILING).abs() < 1e-6,
+            "peak {peak} must equal the ceiling (clamped)"
+        );
+    }
+
+    #[test]
+    fn mismatched_rates_and_speed_1_10_combine_both_effects() {
+        // Amplitude 0.95 for the same reason as the same-rate case above: at
+        // 0.5 the stretch's ~1.35x overshoot stops short of the ceiling and the
+        // peak assertion stops testing anything.
+        let source_rate = 44_100;
+        let device_rate = 48_000;
+        let clip = stereo_sine(source_rate as usize, 440.0, source_rate, 0.95); // 1s
+        let out = prepare_clip_for_playback(
+            clip.clone(),
+            source_rate,
+            device_rate,
+            1.10,
+            PitchMode::Preserve,
+        );
+
+        let in_frames = clip.len() / 2;
+        let expected_frames =
+            (in_frames as f64 * device_rate as f64 / source_rate as f64 / 1.10).round() as usize;
+        let out_frames = out.len() / 2;
+        assert!(
+            out_frames.abs_diff(expected_frames) <= expected_frames / 50 + 8,
+            "out_frames={out_frames} expected≈{expected_frames}"
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            (peak - PLAYBACK_PEAK_CEILING).abs() < 1e-6,
+            "peak {peak} must equal the ceiling (clamped)"
+        );
+    }
+
+    #[test]
+    fn preserve_and_shift_agree_on_output_length() {
+        let sr = 44_100;
+        let clip = stereo_sine(sr as usize, 440.0, sr, 0.5); // 1s
+        let preserve =
+            prepare_clip_for_playback(clip.clone(), sr, sr, 1.10, PitchMode::Preserve);
+        let shift = prepare_clip_for_playback(clip, sr, sr, 1.10, PitchMode::Shift);
+
+        let preserve_frames = preserve.len() / 2;
+        let shift_frames = shift.len() / 2;
+        assert!(
+            preserve_frames.abs_diff(shift_frames) <= shift_frames / 50 + 8,
+            "preserve={preserve_frames} shift={shift_frames}"
+        );
+    }
+
+    #[test]
+    fn clamp_playback_peak_scales_an_over_ceiling_clip_down_and_keeps_ratios() {
+        // Mirrors the measured `Preserve` 1.10 overshoot (peak 1.749).
+        let mut samples = vec![1.75f32, -0.875, 0.0, -1.75];
+        clamp_playback_peak(&mut samples);
+
+        let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            peak <= PLAYBACK_PEAK_CEILING + 1e-6,
+            "peak {peak} must not exceed the ceiling"
+        );
+        // Relative balance within the clip (music vs. click) must be untouched:
+        // the second sample was exactly half the first in magnitude before,
+        // and must still be after a single uniform scale.
+        assert!(
+            (samples[0].abs() / samples[1].abs() - 2.0).abs() < 1e-4,
+            "a single scalar must preserve inter-sample ratios"
+        );
+        assert!((samples[0] - samples[3].abs()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn clamp_playback_peak_leaves_a_below_ceiling_clip_untouched() {
+        let mut samples = vec![0.5f32, -0.3, 0.1, -0.5];
+        let before = samples.clone();
+        clamp_playback_peak(&mut samples);
+        assert_eq!(samples, before, "peak 0.5 is under the ceiling; must be a no-op");
     }
 }
 
@@ -2016,44 +2287,333 @@ fn map_label_key(key: KeyEvent) -> Result<Option<LabelKey>> {
     })
 }
 
-/// Persist one finished track: append/replace its row in `labels.tsv`, then
-/// reflect the intro side onto the analysis cache.
+/// Existing row for `hash` in `labels.tsv`, or `None` if the file doesn't
+/// exist yet, can't be read, or has no row for this track -- any of those
+/// just means there is nothing to merge into, not a fatal error.
+fn existing_label(labels_path: &Path, hash: &str) -> Option<SectionLabel> {
+    if !labels_path.exists() {
+        return None;
+    }
+    funkot_core::labels::load_labels(labels_path)
+        .ok()?
+        .into_iter()
+        .find(|l| l.hash == hash)
+}
+
+/// Persist one track's current state to `labels.tsv`, then (only if the
+/// intro side was confirmed this session) reflect it onto the analysis
+/// cache.
+///
+/// `intro` / `outro` are `None` when that side hasn't been decided in this
+/// session -- e.g. a `note`-only save from `s`/`q` before either side (or
+/// only the intro side) was accepted. Each side is written independently:
+/// a side present here overwrites the stored row; a side absent here keeps
+/// whatever was already on disk for that hash (or stays unset if there was
+/// no prior row), so labeling one side now and the other side in a later
+/// session doesn't clobber the first. `note` is always taken from this
+/// call, since notes are meant to be edited/replaced by the labeler.
+///
+/// Returns the row as written, so callers can report what actually ended up
+/// on disk (which may include a side merged in from an earlier session, not
+/// just what was decided just now).
 fn save_label_and_cache(
     labels_path: &Path,
     cache_dir: &Path,
     hash: &str,
     path: &Path,
-    intro: &label_session::LabelChoice,
-    outro: &label_session::LabelChoice,
+    intro: Option<&label_session::LabelChoice>,
+    outro: Option<&label_session::LabelChoice>,
     note: &str,
-) -> Result<()> {
+) -> Result<SectionLabel> {
+    let existing = existing_label(labels_path, hash);
+    let (intro_best, intro_ok) = match intro {
+        Some(choice) => (Some(choice.best), choice.ok.clone()),
+        None => existing
+            .as_ref()
+            .map(|l| (l.intro_best, l.intro_ok.clone()))
+            .unwrap_or((None, Vec::new())),
+    };
+    let (outro_best, outro_ok) = match outro {
+        Some(choice) => (Some(choice.best), choice.ok.clone()),
+        None => existing
+            .as_ref()
+            .map(|l| (l.outro_best, l.outro_ok.clone()))
+            .unwrap_or((None, Vec::new())),
+    };
+
     let label = SectionLabel {
         hash: hash.to_string(),
         file_name: file_name(path),
-        intro_best: intro.best,
-        intro_ok: intro.ok.clone(),
-        outro_best: outro.best,
-        outro_ok: outro.ok.clone(),
+        intro_best,
+        intro_ok,
+        outro_best,
+        outro_ok,
         note: note.to_string(),
     };
-    upsert_label(labels_path, label).map_err(|e| anyhow::anyhow!("{e}"))?;
+    upsert_label(labels_path, label.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Reflect the intro side onto the cache immediately (so live/render
-    // playback picks it up, and `--purge-auto-cache` keeps it). The outro
-    // side is deliberately *not* written here: `cache::set_manual_bars`'s
-    // `outro` argument sets `TrackAnalysis::outro_bars`, the DJ mix-trigger,
-    // which is *not* a fixed offset from the structural boundary this tool
-    // collects (see `funkot_core::labels` module docs and the
-    // `outro_structure_bars` doc comment in `funkot-core/src/lib.rs`).
-    // Synthesizing a lead-in here to convert one into the other would plant
-    // a guessed value in the cache that the analyzer itself doesn't stand
-    // behind -- the exact outro_bars/outro_structure_bars conflation Stage 0
-    // introduced `outro_structure_bars` to avoid. The cached outro stays
-    // whatever `analysis::analyze` computed; only the label file records the
+    // playback picks it up, and `--purge-auto-cache` keeps it). Only when
+    // this session actually confirmed it: a side merged in from an earlier
+    // row was already reflected to the cache when it was first accepted, so
+    // re-writing it here would be redundant, and skipping it means a
+    // note-only save never touches the cache as a side effect of *reading*
+    // an old row. The outro side is deliberately *not* written here:
+    // `cache::set_manual_bars`'s `outro` argument sets
+    // `TrackAnalysis::outro_bars`, the DJ mix-trigger, which is *not* a
+    // fixed offset from the structural boundary this tool collects (see
+    // `funkot_core::labels` module docs and the `outro_structure_bars` doc
+    // comment in `funkot-core/src/lib.rs`). Synthesizing a lead-in here to
+    // convert one into the other would plant a guessed value in the cache
+    // that the analyzer itself doesn't stand behind -- the exact
+    // outro_bars/outro_structure_bars conflation Stage 0 introduced
+    // `outro_structure_bars` to avoid. The cached outro stays whatever
+    // `analysis::analyze` computed; only the label file records the
     // structural ground truth, for Stage 2+ to use.
-    cache::set_manual_bars(cache_dir, hash, Some(intro.best), None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(intro) = intro {
+        cache::set_manual_bars(cache_dir, hash, Some(intro.best), None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(label)
+}
+
+/// Save whatever note the user typed for the track being abandoned by `s`
+/// (skip) or `q` (quit), so it survives even though the labeling itself
+/// isn't finished. A no-op when no note was typed, so `s`'s "write nothing"
+/// behavior is unchanged for the common case. The intro side is included if
+/// this session confirmed it (`y` on the intro candidate before `s`/`q`);
+/// the outro side is left for `save_label_and_cache` to merge in from any
+/// prior row, since this session never confirmed it -- reaching `Skip`/
+/// `Quit` from the outro side means outro was *not* accepted.
+fn save_pending_note(
+    labels_path: &Path,
+    cache_dir: &Path,
+    hash: &str,
+    path: &Path,
+    session: &TrackSession,
+) -> Result<()> {
+    if session.note().is_empty() {
+        return Ok(());
+    }
+    let label = save_label_and_cache(
+        labels_path,
+        cache_dir,
+        hash,
+        path,
+        session.intro_choice(),
+        None,
+        session.note(),
+    )?;
+    let fmt =
+        |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_else(|| "unlabeled".to_string());
+    println!(
+        "\r  note saved for {} (intro={}, outro={})\r",
+        file_name(path),
+        fmt(label.intro_best),
+        fmt(label.outro_best)
+    );
     Ok(())
+}
+
+/// Identifies one candidate clip already prepared for playback: which side,
+/// which candidate bar count on that side, and the listening window's
+/// half-width in bars (`±8`/`±16`, toggled by `+`). Doesn't carry the
+/// [`label_session::ClickGrid`] used to build it -- that's memoized per
+/// track/side by `SideGrids` and is therefore identical for every entry that
+/// shares a `Side`.
+type ClipKey = (Side, u32, u32);
+
+/// How many already-built clips [`ClipCache`] keeps at once.
+///
+/// A cached clip is what `prepare_clip_for_playback` returned, so it is the
+/// *played* length at the device rate: at `±8` bars the clip spans
+/// `2 * 8 + CONTINUE_AFTER_WINDOW_BARS` = 80 bars ~= 107 s of 180 BPM
+/// source, which `--rate` 1.10 shortens to ~97 s, and at 48 kHz stereo
+/// `f32` that is ~37 MB. `+` widens the window to `±16` bars, i.e. 96 bars
+/// ~= 116 s played and ~45 MB. So 4 entries costs ~150 MB normally and
+/// ~180 MB with the wide window held throughout.
+///
+/// Only 3 are normally alive at a time (the current candidate plus its two
+/// neighbours); the 4th is headroom so stepping back after having stepped
+/// forward still hits the cache.
+const CLIP_CACHE_CAPACITY: usize = 4;
+
+/// Insertion-order cache of already-prepared candidate clips for the
+/// *current* track only. A fresh one is built per track in
+/// [`run_label_sections_interactive`], since `buf`/`analysis` change with
+/// the track and this cache must not be reused across them. Evicts the
+/// oldest *insertion* once full, not the least-recently-used entry: the goal
+/// is a small bounded window of candidates around the cursor, not a general
+/// LRU.
+struct ClipCache {
+    entries: Vec<(ClipKey, Vec<f32>)>,
+}
+
+impl ClipCache {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// A clone of the cached clip for `key`, or `None` if it isn't cached
+    /// yet. Clones rather than borrowing: the caller hands the clip straight
+    /// to `ClipPlayer::play`, which takes ownership, and cloning ~41 MB is
+    /// cheap next to the stretch it would otherwise replace.
+    fn get(&self, key: &ClipKey) -> Option<Vec<f32>> {
+        self.entries.iter().find(|(k, _)| k == key).map(|(_, clip)| clip.clone())
+    }
+
+    fn contains(&self, key: &ClipKey) -> bool {
+        self.entries.iter().any(|(k, _)| k == key)
+    }
+
+    /// No-op if `key` is already cached: the prefetch worker and the
+    /// foreground path can race to build the same candidate, and whichever
+    /// inserts first wins -- the other's (identical, see
+    /// [`build_and_prepare_clip`]) result is simply discarded.
+    fn insert(&mut self, key: ClipKey, clip: Vec<f32>) {
+        if self.contains(&key) {
+            return;
+        }
+        if self.entries.len() >= CLIP_CACHE_CAPACITY {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, clip));
+    }
+}
+
+#[cfg(test)]
+mod clip_cache_tests {
+    use super::*;
+
+    fn clip(tag: f32) -> Vec<f32> {
+        vec![tag]
+    }
+
+    #[test]
+    fn insert_then_get_returns_a_clone_of_the_same_clip() {
+        let mut cache = ClipCache::new();
+        let key: ClipKey = (Side::Intro, 32, 8);
+        cache.insert(key, clip(1.0));
+        assert_eq!(cache.get(&key), Some(clip(1.0)));
+        assert!(cache.contains(&key));
+    }
+
+    #[test]
+    fn get_on_a_missing_key_is_none() {
+        let cache = ClipCache::new();
+        assert_eq!(cache.get(&(Side::Intro, 32, 8)), None);
+    }
+
+    #[test]
+    fn insert_on_an_already_cached_key_keeps_the_original() {
+        let mut cache = ClipCache::new();
+        let key: ClipKey = (Side::Outro, 16, 8);
+        cache.insert(key, clip(1.0));
+        cache.insert(key, clip(2.0));
+        assert_eq!(cache.get(&key), Some(clip(1.0)));
+    }
+
+    #[test]
+    fn capacity_four_evicts_the_oldest_insertion() {
+        let mut cache = ClipCache::new();
+        let keys: [ClipKey; 5] = [
+            (Side::Intro, 8, 8),
+            (Side::Intro, 16, 8),
+            (Side::Intro, 32, 8),
+            (Side::Intro, 48, 8),
+            (Side::Intro, 64, 8),
+        ];
+        for (i, &key) in keys.iter().enumerate() {
+            cache.insert(key, clip(i as f32));
+        }
+        assert_eq!(
+            cache.get(&keys[0]),
+            None,
+            "the first insertion must have been evicted once the 5th arrived"
+        );
+        for &key in &keys[1..] {
+            assert!(cache.contains(&key), "{key:?} should still be cached");
+        }
+    }
+}
+
+/// One candidate clip to build in the background: `key` names it, `grid` is
+/// the already-measured [`label_session::ClickGrid`] for its side (`Copy`,
+/// cheap to send across the channel).
+struct PrefetchRequest {
+    key: ClipKey,
+    grid: label_session::ClickGrid,
+}
+
+/// Builds and playback-prepares one candidate clip: the same call sequence
+/// on both the synchronous (foreground) and prefetch (background) paths, so
+/// a cache hit is guaranteed to be the bytes a fresh build would have
+/// produced.
+#[allow(clippy::too_many_arguments)]
+fn build_and_prepare_clip(
+    buf: &funkot_core::decode::AudioBuffer,
+    analysis: &funkot_core::TrackAnalysis,
+    key: ClipKey,
+    grid: label_session::ClickGrid,
+    click_opts: &label_session::ClickOptions,
+    device_rate: u32,
+    rate: f64,
+    pitch_mode: PitchMode,
+) -> Vec<f32> {
+    let (side, bars, half_width) = key;
+    let clip = label_session::build_candidate_clip_on_grid(
+        buf, analysis, side, bars, half_width, click_opts, grid,
+    );
+    prepare_clip_for_playback(clip, buf.sample_rate, device_rate, rate, pitch_mode)
+}
+
+/// The clip for `session`'s current side/candidate/width: a cache hit if the
+/// prefetch worker (or an earlier visit) already built it, otherwise built
+/// synchronously here -- same as before prefetching existed -- and cached
+/// for next time.
+#[allow(clippy::too_many_arguments)]
+fn build_or_cached_clip(
+    session: &TrackSession,
+    buf: &funkot_core::decode::AudioBuffer,
+    analysis: &funkot_core::TrackAnalysis,
+    side_grids: &mut label_session::SideGrids,
+    cache: &Mutex<ClipCache>,
+    click_opts: &label_session::ClickOptions,
+    device_rate: u32,
+    rate: f64,
+    pitch_mode: PitchMode,
+) -> Vec<f32> {
+    let side = session.current_side();
+    let key: ClipKey = (side, session.current_bars(), session.context_half_width_bars());
+    if let Some(clip) = cache.lock().unwrap().get(&key) {
+        return clip;
+    }
+    let grid = side_grids.get(buf, analysis, side);
+    let clip =
+        build_and_prepare_clip(buf, analysis, key, grid, click_opts, device_rate, rate, pitch_mode);
+    cache.lock().unwrap().insert(key, clip.clone());
+    clip
+}
+
+/// Kicks off background builds, via `tx`, for the candidates a single
+/// `Left`/`Right` press from `session`'s current position would land on
+/// ([`TrackSession::neighbour_bars`]) -- so that by the time the user
+/// actually presses it, [`build_or_cached_clip`] hits the cache instead of
+/// re-stretching. Best-effort: a `send` failure (the worker already exited)
+/// is silently ignored, same as the plan calls for.
+fn send_prefetch_requests(
+    session: &TrackSession,
+    buf: &funkot_core::decode::AudioBuffer,
+    analysis: &funkot_core::TrackAnalysis,
+    side_grids: &mut label_session::SideGrids,
+    tx: &mpsc::Sender<PrefetchRequest>,
+) {
+    let side = session.current_side();
+    let half_width = session.context_half_width_bars();
+    let grid = side_grids.get(buf, analysis, side);
+    for bars in session.neighbour_bars() {
+        let _ = tx.send(PrefetchRequest { key: (side, bars, half_width), grid });
+    }
 }
 
 fn run_label_sections_interactive(
@@ -2063,6 +2623,8 @@ fn run_label_sections_interactive(
     labels_path: &Path,
     cache_dir: &Path,
     click_opts: &label_session::ClickOptions,
+    rate: f64,
+    pitch_mode: PitchMode,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = host
@@ -2076,6 +2638,14 @@ fn run_label_sections_interactive(
     let _raw_guard = RawModeGuard;
 
     print_label_key_help();
+    // Playback runs at production speed (see `prepare_clip_for_playback`), so
+    // say so up front — otherwise a labeler who doesn't know that can mistake
+    // a sped-up track for one whose BPM was mis-detected.
+    let pitch_note = match pitch_mode {
+        PitchMode::Preserve => "pitch preserved",
+        PitchMode::Shift => "pitch shifted",
+    };
+    println!("\rplayback {rate:.2}x ({pitch_note})\r");
 
     let total = playlist.len();
     'tracks: for (i, path) in playlist.iter().enumerate() {
@@ -2085,9 +2655,10 @@ fn run_label_sections_interactive(
         }
         let progress = format!("[{}/{total}]", i + 1);
 
-        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let analysis =
-            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let buf = Arc::new(decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?);
+        let analysis = Arc::new(
+            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
         // Decode + analyze can run for a minute with no key polling; check the
         // stream now so a device that died meanwhile is torn down here rather
         // than spinning until the next keystroke.
@@ -2101,20 +2672,64 @@ fn run_label_sections_interactive(
         }
 
         let mut session = TrackSession::new(analysis.intro_bars, analysis.outro_structure_bars);
-        let build_clip = |session: &TrackSession| -> Vec<f32> {
-            let clip = label_session::build_candidate_clip(
-                &buf,
-                &analysis,
-                session.current_side(),
-                session.current_bars(),
-                session.context_half_width_bars(),
-                click_opts,
-            );
-            resample_clip_for_device(clip, buf.sample_rate, device_rate)
-        };
+        let mut side_grids = label_session::SideGrids::default();
+
+        // Speculative prefetch: while the user listens to the current
+        // candidate (tens of seconds), a single background worker builds the
+        // clip(s) a `Left`/`Right` press would land on next, so consecutive
+        // arrow presses hit `cache` instead of paying for
+        // `prepare_clip_for_playback`'s stretch again. Both `cache` and the
+        // worker are scoped to this track: they close over this track's
+        // `buf`/`analysis` (via `Arc` clones) and must not survive into the
+        // next one. `prefetch_tx` is a plain `let` inside this loop body, so
+        // it -- and with it the worker's only sender -- is dropped whenever
+        // this iteration ends, however it ends (`continue 'tracks`,
+        // `break 'tracks`, or falling off the end); the worker is not
+        // joined, it simply finishes once `recv` starts returning `Err`.
+        let cache: Arc<Mutex<ClipCache>> = Arc::new(Mutex::new(ClipCache::new()));
+        let (prefetch_tx, prefetch_rx) = mpsc::channel::<PrefetchRequest>();
+        {
+            let worker_buf = Arc::clone(&buf);
+            let worker_analysis = Arc::clone(&analysis);
+            let worker_cache = Arc::clone(&cache);
+            let worker_click_opts = *click_opts;
+            thread::spawn(move || {
+                for req in prefetch_rx {
+                    // Lock only to check, never held across the stretch
+                    // below.
+                    if worker_cache.lock().unwrap().contains(&req.key) {
+                        continue;
+                    }
+                    let clip = build_and_prepare_clip(
+                        &worker_buf,
+                        &worker_analysis,
+                        req.key,
+                        req.grid,
+                        &worker_click_opts,
+                        device_rate,
+                        rate,
+                        pitch_mode,
+                    );
+                    // Lock again only to insert, again never held across the
+                    // stretch that built `clip`.
+                    worker_cache.lock().unwrap().insert(req.key, clip);
+                }
+            });
+        }
 
         print_label_track_header(&progress, path);
-        player.play(build_clip(&session));
+        player.play(build_or_cached_clip(
+            &session,
+            &buf,
+            &analysis,
+            &mut side_grids,
+            &cache,
+            click_opts,
+            device_rate,
+            rate,
+            pitch_mode,
+        ));
+        send_prefetch_requests(&session, &buf, &analysis, &mut side_grids, &prefetch_tx);
         print_label_status(&session);
 
         loop {
@@ -2136,16 +2751,29 @@ fn run_label_sections_interactive(
             match session.apply_key(label_key) {
                 LabelOutcome::Continue => print_label_status(&session),
                 LabelOutcome::Replay => {
-                    player.play(build_clip(&session));
+                    player.play(build_or_cached_clip(
+                        &session,
+                        &buf,
+                        &analysis,
+                        &mut side_grids,
+                        &cache,
+                        click_opts,
+                        device_rate,
+                        rate,
+                        pitch_mode,
+                    ));
+                    send_prefetch_requests(&session, &buf, &analysis, &mut side_grids, &prefetch_tx);
                     print_label_status(&session);
                 }
                 LabelOutcome::Skip => {
                     player.stop();
+                    save_pending_note(labels_path, cache_dir, hash, path, &session)?;
                     println!("\r  skipped {}\r", file_name(path));
                     continue 'tracks;
                 }
                 LabelOutcome::Quit => {
                     player.stop();
+                    save_pending_note(labels_path, cache_dir, hash, path, &session)?;
                     println!("\rsaved & quit\r");
                     break 'tracks;
                 }
@@ -2156,8 +2784,8 @@ fn run_label_sections_interactive(
                         cache_dir,
                         hash,
                         path,
-                        &intro,
-                        &outro,
+                        Some(&intro),
+                        Some(&outro),
                         session.note(),
                     )?;
                     println!(
@@ -2166,6 +2794,509 @@ fn run_label_sections_interactive(
                         intro.best,
                         outro.best
                     );
+                    continue 'tracks;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `--survey`: one-window-per-track outro-grid survey. Reuses the raw-mode
+// key loop / `ClipPlayer` / `prepare_clip_for_playback` machinery above,
+// but is otherwise independent of `--label-sections`: a different (much
+// simpler) key vocabulary, a different verdict TSV that is never
+// `funkot_core::labels`, and a fixed one-shot clip per track instead of
+// candidate navigation. See `label_session::build_survey_clip` for the
+// clip itself.
+// ---------------------------------------------------------------------
+
+/// One judged row in a `--survey-out` file: the survey's equivalent of
+/// `funkot_core::labels::SectionLabel`, but deliberately a separate, simpler
+/// type -- `--survey` never reads or writes `labels.tsv`.
+///
+/// On-disk format: tab-separated, header `content_hash\tfile_name\tverdict`,
+/// one row per judgement. Appended to, never rewritten in place: judging the
+/// same track twice leaves two rows, and the later one is what a summarizer
+/// reading the file should treat as authoritative. [`load_survey_judged`]
+/// only needs *whether* a hash has a row at all, so nothing here needs to
+/// resolve that itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurveyRow {
+    hash: String,
+    file_name: String,
+    verdict: String,
+}
+
+const SURVEY_HEADER: &str = "content_hash\tfile_name\tverdict";
+
+/// Parse `--survey-out` TSV text (split out from [`load_survey_judged`] for
+/// testing without a file). Comment (`#`) and blank lines are ignored
+/// wherever they occur, and the first remaining line is treated as the
+/// header and skipped, the same conventions as
+/// `funkot_core::labels::parse_labels` -- independently implemented here
+/// since this is a different, simpler (3-column) format. A malformed data
+/// row (wrong column count, or an empty hash) is silently dropped rather
+/// than failing the whole load: a partially-written row from a killed
+/// process should not make every other verdict in the file unreadable.
+fn parse_survey_rows(contents: &str) -> Vec<SurveyRow> {
+    let mut rows = Vec::new();
+    for raw_line in contents.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Match the header by its text rather than "whatever the first row
+        // happens to be": a content hash can never spell `content_hash`, so
+        // this cannot eat a verdict, and a file that somehow lost its header
+        // still parses in full instead of silently dropping its first track
+        // (which would re-ask that track on every later run).
+        if trimmed == SURVEY_HEADER {
+            continue;
+        }
+        let fields: Vec<&str> = raw_line.splitn(3, '\t').collect();
+        if fields.len() != 3 {
+            continue;
+        }
+        let hash = fields[0].trim().to_string();
+        if hash.is_empty() {
+            continue;
+        }
+        rows.push(SurveyRow {
+            hash,
+            file_name: fields[1].trim().to_string(),
+            verdict: fields[2].trim().to_string(),
+        });
+    }
+    rows
+}
+
+/// Hashes already judged in `path` (i.e. that have at least one row), so
+/// [`run_survey`] can skip them on this run. Empty (not an error) if `path`
+/// doesn't exist yet -- a fresh survey has nothing to skip.
+fn load_survey_judged(path: &Path) -> Result<std::collections::HashSet<String>> {
+    if !path.exists() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read survey file '{}'", path.display()))?;
+    Ok(parse_survey_rows(&contents).into_iter().map(|r| r.hash).collect())
+}
+
+fn sanitize_survey_field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+/// Append one judged row to `path`, writing the header first if the file is
+/// new (and creating the parent directory if needed, same as
+/// `funkot_core::labels::save_labels`). Never truncates or rewrites existing
+/// rows -- see [`SurveyRow`]'s doc on why appending (not upserting) is the
+/// point.
+fn append_survey_verdict(path: &Path, hash: &str, file_name: &str, verdict: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+    }
+    // Size, not existence: an existing but empty file (a `touch`, or a
+    // crash between create and first write) still needs the header. Keying
+    // off `exists()` alone would leave a headerless file behind.
+    let need_header = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("cannot open survey file '{}'", path.display()))?;
+    if need_header {
+        writeln!(f, "{SURVEY_HEADER}")?;
+    }
+    writeln!(
+        f,
+        "{}\t{}\t{}",
+        sanitize_survey_field(hash),
+        sanitize_survey_field(file_name),
+        sanitize_survey_field(verdict)
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod survey_tsv_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    /// Process-unique scratch file path under the system temp dir, cleaned
+    /// up on drop -- same pattern as `funkot_core::labels`'s test `TempFile`.
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "funkot-survey-test-{tag}-{}-{n}.tsv",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn load_survey_judged_on_a_missing_file_is_empty_not_an_error() {
+        let f = TempFile::new("missing");
+        assert!(load_survey_judged(&f.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_then_load_judged_finds_the_hash() {
+        let f = TempFile::new("append-load");
+        assert!(load_survey_judged(&f.0).unwrap().is_empty());
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "ok").unwrap();
+        let judged = load_survey_judged(&f.0).unwrap();
+        assert_eq!(judged.len(), 1);
+        assert!(judged.contains("aaaa1111"));
+    }
+
+    #[test]
+    fn append_writes_the_header_only_once() {
+        let f = TempFile::new("header-once");
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "ok").unwrap();
+        append_survey_verdict(&f.0, "bbbb2222", "track-b.flac", "half").unwrap();
+        let contents = std::fs::read_to_string(&f.0).unwrap();
+        assert_eq!(contents.matches(SURVEY_HEADER).count(), 1);
+        assert_eq!(parse_survey_rows(&contents).len(), 2);
+    }
+
+    #[test]
+    fn a_second_verdict_for_the_same_hash_is_appended_not_overwritten() {
+        // "同じ曲を2回判定したら後の行が勝つ形でよい" -- the file just grows;
+        // this asserts that a summarizer taking the last matching row would
+        // in fact see the later verdict, and that the row count reflects
+        // both judgements rather than one replacing the other on disk.
+        let f = TempFile::new("second-verdict");
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "half").unwrap();
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "ok").unwrap();
+        let contents = std::fs::read_to_string(&f.0).unwrap();
+        let rows = parse_survey_rows(&contents);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.last().unwrap().verdict, "ok");
+        assert!(load_survey_judged(&f.0).unwrap().contains("aaaa1111"));
+    }
+
+    #[test]
+    fn parse_survey_rows_skips_comments_and_blank_lines() {
+        let text = "\
+# comment
+content_hash\tfile_name\tverdict
+
+aaaa1111\ttrack-a.flac\tok
+# another comment
+bbbb2222\ttrack-b.flac\thalf
+";
+        let rows = parse_survey_rows(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].hash, "aaaa1111");
+        assert_eq!(rows[0].verdict, "ok");
+        assert_eq!(rows[1].hash, "bbbb2222");
+        assert_eq!(rows[1].verdict, "half");
+    }
+
+    #[test]
+    fn append_to_an_existing_but_empty_file_still_writes_the_header() {
+        // A `touch`ed (or crash-truncated) file used to satisfy `exists()`
+        // and so never got a header, after which `parse_survey_rows` ate its
+        // first verdict as the header and re-asked that track every run.
+        let f = TempFile::new("empty-existing");
+        std::fs::write(&f.0, "").unwrap();
+        append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "half").unwrap();
+        let contents = std::fs::read_to_string(&f.0).unwrap();
+        assert_eq!(contents.matches(SURVEY_HEADER).count(), 1);
+        assert!(load_survey_judged(&f.0).unwrap().contains("aaaa1111"));
+    }
+
+    #[test]
+    fn parse_survey_rows_keeps_every_row_when_the_header_is_missing() {
+        let text = "aaaa1111\ttrack-a.flac\tok\nbbbb2222\ttrack-b.flac\thalf\n";
+        let rows = parse_survey_rows(text);
+        assert_eq!(rows.len(), 2, "a headerless file must not lose its first row");
+        assert_eq!(rows[0].hash, "aaaa1111");
+    }
+
+    #[test]
+    fn parse_survey_rows_drops_a_malformed_row_but_keeps_the_rest() {
+        let text = "content_hash\tfile_name\tverdict\naaaa1111\tonly-two-fields\nbbbb2222\ttrack-b.flac\thalf\n";
+        let rows = parse_survey_rows(text);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "bbbb2222");
+    }
+}
+
+/// One user keystroke for `--survey`, already decoded from the terminal.
+/// Deliberately a separate, smaller vocabulary than [`LabelKey`]: `--survey`
+/// is a single fixed window per track judged with one keypress, not
+/// `--label-sections`' two-sided candidate navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurveyKey {
+    /// `o`: the click grid sits on the beat.
+    Ok,
+    /// `h`: the click grid sits half a beat off (clicks land on the offbeat).
+    Half,
+    /// `?`: can't tell (too thin, can't lock onto the beat by ear, etc).
+    Unknown,
+    /// `r`: replay the same window.
+    Replay,
+    /// `s`: skip this track without judging it (offered again next run).
+    Skip,
+    Quit,
+}
+
+const SURVEY_KEY_HELP: &str =
+    "keys: o=on the beat  h=half a beat off  ?=can't tell  r=replay  s=skip  q=quit";
+
+fn print_survey_key_help() {
+    println!("\r{SURVEY_KEY_HELP}\r");
+}
+
+/// Decode one crossterm key press into a [`SurveyKey`], or `None` for a key
+/// with no meaning here.
+fn map_survey_key(key: KeyEvent) -> Option<SurveyKey> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        return Some(SurveyKey::Quit);
+    }
+    match key.code {
+        KeyCode::Char('o') | KeyCode::Char('O') => Some(SurveyKey::Ok),
+        KeyCode::Char('h') | KeyCode::Char('H') => Some(SurveyKey::Half),
+        KeyCode::Char('?') => Some(SurveyKey::Unknown),
+        KeyCode::Char('r') | KeyCode::Char('R') => Some(SurveyKey::Replay),
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(SurveyKey::Skip),
+        KeyCode::Char('q') | KeyCode::Char('Q') => Some(SurveyKey::Quit),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod survey_cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_arg_definitions_are_internally_consistent() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn click_flags_need_one_of_the_two_click_modes() {
+        // Sharing `--click-db` between `--label-sections` and `--survey` must
+        // not turn it into a flag that plain playback silently ignores.
+        assert!(Args::try_parse_from(["funkot-autodj", "--click-db", "12", "a.flac"]).is_err());
+        assert!(
+            Args::try_parse_from(["funkot-autodj", "--click-duck-db", "6", "a.flac"]).is_err()
+        );
+        assert!(Args::try_parse_from([
+            "funkot-autodj",
+            "--survey",
+            "--survey-out",
+            "s.tsv",
+            "--click-db",
+            "12",
+            "a.flac",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn the_two_click_modes_are_mutually_exclusive() {
+        assert!(Args::try_parse_from([
+            "funkot-autodj",
+            "--survey",
+            "--survey-out",
+            "s.tsv",
+            "--label-sections",
+            "--labels",
+            "l.tsv",
+            "a.flac",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn survey_requires_its_output_path() {
+        assert!(Args::try_parse_from(["funkot-autodj", "--survey", "a.flac"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod map_survey_key_tests {
+    use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn maps_the_documented_keys() {
+        assert_eq!(map_survey_key(press(KeyCode::Char('o'))), Some(SurveyKey::Ok));
+        assert_eq!(map_survey_key(press(KeyCode::Char('O'))), Some(SurveyKey::Ok));
+        assert_eq!(map_survey_key(press(KeyCode::Char('h'))), Some(SurveyKey::Half));
+        assert_eq!(map_survey_key(press(KeyCode::Char('?'))), Some(SurveyKey::Unknown));
+        assert_eq!(map_survey_key(press(KeyCode::Char('r'))), Some(SurveyKey::Replay));
+        assert_eq!(map_survey_key(press(KeyCode::Char('s'))), Some(SurveyKey::Skip));
+        assert_eq!(map_survey_key(press(KeyCode::Char('q'))), Some(SurveyKey::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_is_quit_and_unrecognised_keys_are_none() {
+        assert_eq!(
+            map_survey_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(SurveyKey::Quit)
+        );
+        assert_eq!(map_survey_key(press(KeyCode::Char('x'))), None);
+        assert_eq!(map_survey_key(press(KeyCode::Left)), None);
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let key = KeyEvent::new_with_kind(
+            KeyCode::Char('o'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(map_survey_key(key), None);
+    }
+}
+
+/// `--survey`'s per-track loop: decode + analyze, build the one fixed
+/// listening clip ([`label_session::build_survey_clip`]), and wait for a
+/// single judgement keystroke before moving to the next track. Reuses
+/// [`ClipPlayer`] / [`prepare_clip_for_playback`] / [`pick_output_config`]
+/// verbatim from `--label-sections`'s interactive loop; the only new piece
+/// is the smaller [`SurveyKey`] vocabulary and [`append_survey_verdict`]
+/// instead of `labels.tsv`.
+fn run_survey(
+    playlist: &[PathBuf],
+    survey_out: &Path,
+    cache_dir: &Path,
+    click_opts: &label_session::ClickOptions,
+    rate: f64,
+    pitch_mode: PitchMode,
+) -> Result<()> {
+    let judged = load_survey_judged(survey_out)?;
+
+    let mut hashes = Vec::with_capacity(playlist.len());
+    let mut skipped = 0usize;
+    for path in playlist {
+        let hash = cache::content_hash(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if judged.contains(&hash) {
+            skipped += 1;
+        }
+        hashes.push(hash);
+    }
+    eprintln!(
+        "survey: {skipped} of {} already judged (skipped), {} to do",
+        playlist.len(),
+        playlist.len() - skipped
+    );
+
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .context("no default audio output device available")?;
+    let (config, channels) = pick_output_config(&device, None)?;
+    let device_rate = config.sample_rate;
+    let mut player = ClipPlayer::new(device, config, channels)?;
+
+    enable_raw_mode().context("failed to enable raw mode (needed for --survey)")?;
+    let _raw_guard = RawModeGuard;
+
+    print_survey_key_help();
+    // Same reasoning as `--label-sections`: playback runs at production
+    // speed (see `prepare_clip_for_playback`), so say so up front.
+    let pitch_note = match pitch_mode {
+        PitchMode::Preserve => "pitch preserved",
+        PitchMode::Shift => "pitch shifted",
+    };
+    println!("\rplayback {rate:.2}x ({pitch_note})\r");
+
+    let total = playlist.len();
+    'tracks: for (i, path) in playlist.iter().enumerate() {
+        let hash = &hashes[i];
+        if judged.contains(hash) {
+            continue;
+        }
+        let progress = format!("[{}/{total}]", i + 1);
+
+        let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let analysis =
+            cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Decode + analyze can run for a while with no key polling; check the
+        // stream now so a device that died meanwhile is torn down here
+        // rather than spinning until the next keystroke.
+        print_label_audio(&player.poll());
+        if buf.sample_rate != device_rate {
+            eprintln!(
+                "note: {} is {} Hz, output device is {device_rate} Hz; resampling the clip for playback",
+                file_name(path),
+                buf.sample_rate
+            );
+        }
+
+        let raw_clip = label_session::build_survey_clip(&buf, &analysis, click_opts);
+        let clip =
+            prepare_clip_for_playback(raw_clip, buf.sample_rate, device_rate, rate, pitch_mode);
+
+        println!("\r{progress} {}\r", file_name(path));
+        player.play(clip.clone());
+
+        loop {
+            let waiting = !event::poll(Duration::from_millis(100)).unwrap_or(false);
+            print_label_audio(&player.poll());
+            if waiting {
+                continue;
+            }
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(_) => break 'tracks,
+            };
+            let Event::Key(key) = ev else { continue };
+            let Some(survey_key) = map_survey_key(key) else {
+                continue;
+            };
+            match survey_key {
+                SurveyKey::Replay => {
+                    player.play(clip.clone());
+                }
+                SurveyKey::Skip => {
+                    player.stop();
+                    println!("\r  skipped {}\r", file_name(path));
+                    continue 'tracks;
+                }
+                SurveyKey::Quit => {
+                    player.stop();
+                    println!("\rquit\r");
+                    break 'tracks;
+                }
+                SurveyKey::Ok | SurveyKey::Half | SurveyKey::Unknown => {
+                    player.stop();
+                    let verdict = match survey_key {
+                        SurveyKey::Ok => "ok",
+                        SurveyKey::Half => "half",
+                        SurveyKey::Unknown => "?",
+                        SurveyKey::Replay | SurveyKey::Skip | SurveyKey::Quit => unreachable!(),
+                    };
+                    append_survey_verdict(survey_out, hash, &file_name(path), verdict)?;
+                    println!("\r  {verdict} {}\r", file_name(path));
                     continue 'tracks;
                 }
             }

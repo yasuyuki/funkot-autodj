@@ -108,7 +108,10 @@ funkot-autodj -l playlist.txt \
 （元音源換算 172–188 BPM）なら次の小節頭から通常のDJトランジション、
 そうでなければ単純な線形クロスフェード（ハイパス / 位相ロックなし）を使う。
 
-対応形式: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV
+対応形式: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV。`ffmpeg` が PATH に
+あれば、それ以外の形式（Opus / WMA / AIFF / APE 等）もその場で FLAC へ変換して
+読み込む（変換結果はキャッシュされる）。変換物は使い捨てで、曲の正体（content
+hash・キャッシュ・ラベル）は常に元ファイルのまま。
 
 ## 解析キャッシュ
 

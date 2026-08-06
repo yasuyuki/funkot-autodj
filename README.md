@@ -112,7 +112,10 @@ If it falls in the Funkot band (source-equivalent 172–188 BPM), the mix waits
 for the next bar boundary and uses the normal DJ transition; otherwise it uses
 a simple linear crossfade (no high-pass / phase lock).
 
-Supported formats: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV
+Supported formats: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV. If `ffmpeg`
+is on `PATH`, other formats (Opus, WMA, AIFF, APE, …) are converted to FLAC on the
+fly and cached; the converted file is disposable — the track's identity (content
+hash, cache, labels) is always the original file, never the conversion.
 
 ## Analysis cache
 

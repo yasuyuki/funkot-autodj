@@ -105,7 +105,11 @@ Jika dalam pita Funkot (setara sumber 172–188 BPM), mix menunggu batas bar
 berikutnya dan memakai transisi DJ normal; jika tidak, memakai crossfade
 linear sederhana (tanpa high-pass / phase lock).
 
-Format didukung: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV
+Format didukung: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV. Jika `ffmpeg`
+ada di `PATH`, format lain (Opus, WMA, AIFF, APE, …) dikonversi ke FLAC secara
+otomatis dan di-cache; file hasil konversi bisa dibuang kapan saja — identitas
+track (content hash, cache, label) selalu mengacu ke file asli, bukan hasil
+konversi.
 
 ## Cache analisis
 

@@ -486,9 +486,9 @@ fn label_sections_render_clips_skips_already_labeled_tracks() {
         &[SectionLabel {
             hash,
             file_name: "track.wav".to_string(),
-            intro_best: 16,
+            intro_best: Some(16),
             intro_ok: vec![],
-            outro_best: 16,
+            outro_best: Some(16),
             outro_ok: vec![],
             note: String::new(),
         }],
