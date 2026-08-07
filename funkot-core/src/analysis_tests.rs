@@ -55,6 +55,7 @@ fn classic_180_16_32_16() {
     assert!(!a.intro_bars_low_confidence);
     assert!(!a.outro_bars_low_confidence);
     assert!(!a.bars_estimated_low_confidence);
+    assert!(a.is_funkot, "180 BPM synth should classify as Funkot");
 
     let fd_secs = a.first_downbeat as f64 / f64::from(sr);
     assert!(fd_secs.abs() < 0.05, "first_downbeat {fd_secs}s not near 0");
@@ -774,6 +775,7 @@ fn purge_auto_deletes_and_clears_manual() {
         outro_bars_manual: false,
         outro_structure_bars_manual: false,
         needs_reanalysis: false,
+        is_funkot: true,
         rms_dbfs: -14.0,
         gain_db: 0.0,
     };
@@ -793,6 +795,7 @@ fn purge_auto_deletes_and_clears_manual() {
 
     let cleared = cache::load(&cache_dir, "bbb").expect("kept");
     assert!(cleared.needs_reanalysis);
+    assert!(cleared.is_funkot); // stub until reanalysis
     assert_eq!(cleared.intro_bars, 8);
     assert!(cleared.intro_bars_manual);
     assert_eq!(cleared.outro_bars, 0); // not manual → cleared

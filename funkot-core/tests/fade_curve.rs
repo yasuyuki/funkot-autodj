@@ -152,6 +152,7 @@ fn seed_constant_analysis(
         outro_bars_manual: false,
         outro_structure_bars_manual: false,
         needs_reanalysis: false,
+        is_funkot: true,
         rms_dbfs: -6.0,
         gain_db: 0.0,
     };

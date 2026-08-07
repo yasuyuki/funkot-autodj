@@ -18,7 +18,7 @@ use crate::{
 /// from the old conditional rule, which collapsed onto the structural
 /// boundary on tracks whose outro starts 64 bars from the end — the
 /// transition ran inside the outro there.
-pub const CACHE_VERSION: u32 = 11;
+pub const CACHE_VERSION: u32 = 12;
 
 const HASH_CHUNK: u64 = 64 * 1024;
 
@@ -197,6 +197,8 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
         outro_bars_manual: outro_m,
         outro_structure_bars_manual: structure_m,
         needs_reanalysis: true,
+        // Placeholder until reanalysis; overwritten by `analyze`.
+        is_funkot: true,
         rms_dbfs: TARGET_RMS_DBFS,
         gain_db: 0.0,
     };
@@ -464,6 +466,7 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         outro_bars_manual: false,
         outro_structure_bars_manual: false,
         needs_reanalysis: false,
+        is_funkot: true,
         rms_dbfs: TARGET_RMS_DBFS,
         gain_db: 0.0,
     }
@@ -495,6 +498,7 @@ mod tests {
             outro_bars_manual: false,
             outro_structure_bars_manual: false,
             needs_reanalysis: false,
+            is_funkot: true,
             rms_dbfs: TARGET_RMS_DBFS,
             gain_db: 0.0,
         }

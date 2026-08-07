@@ -46,6 +46,10 @@ const SEGMENT_SECS: f64 = 110.0;
 const MIN_DURATION_SECS: f64 = 30.0;
 const BPM_MIN: f64 = 172.0;
 const BPM_MAX: f64 = 188.0;
+/// Wide band used only for Funkot / non-Funkot classification (`is_funkot`).
+/// Grid BPM still uses [`BPM_MIN`]–[`BPM_MAX`].
+const CLASSIFY_BPM_MIN: f64 = 100.0;
+const CLASSIFY_BPM_MAX: f64 = 200.0;
 pub(crate) const HOP: usize = 256;
 const LOWPASS_HZ: f64 = 150.0;
 const HIGHPASS_HZ: f64 = 1500.0;
@@ -261,6 +265,12 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
 
     let intro_bpm = estimate_bpm(&head_onset.novelty, HOP, buffer.sample_rate)?;
     let outro_bpm = estimate_bpm(&tail_onset.novelty, HOP, buffer.sample_rate)?;
+    let is_funkot = classify_is_funkot(
+        &head_onset.novelty,
+        &tail_onset.novelty,
+        HOP,
+        buffer.sample_rate,
+    );
 
     let hop_f = HOP as f64;
     let head_beat_period_hops = bpm_to_period_hops(intro_bpm, hop_f, sr);
@@ -343,6 +353,7 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         outro_bars_manual: false,
         outro_structure_bars_manual: false,
         needs_reanalysis: false,
+        is_funkot,
         rms_dbfs,
         gain_db,
     })
@@ -1315,6 +1326,26 @@ fn estimate_bpm(onset: &[f64], hop: usize, sample_rate: u32) -> Result<f64> {
     estimate_bpm_range(onset, hop, sample_rate, BPM_MIN, BPM_MAX)
 }
 
+/// Funkot / non-Funkot label from a second, wider BPM peak on the same onsets.
+///
+/// Both intro and outro must peak inside [`BPM_MIN`]..=[`BPM_MAX`] when searched
+/// over [`CLASSIFY_BPM_MIN`]–[`CLASSIFY_BPM_MAX`]. A failed estimate on either
+/// side makes the track non-Funkot. No half-tempo / score-ratio heuristics.
+fn classify_is_funkot(
+    head_novelty: &[f64],
+    tail_novelty: &[f64],
+    hop: usize,
+    sample_rate: u32,
+) -> bool {
+    fn side_ok(novelty: &[f64], hop: usize, sample_rate: u32) -> bool {
+        match estimate_bpm_range(novelty, hop, sample_rate, CLASSIFY_BPM_MIN, CLASSIFY_BPM_MAX) {
+            Ok(bpm) => (BPM_MIN..=BPM_MAX).contains(&bpm),
+            Err(_) => false,
+        }
+    }
+    side_ok(head_novelty, hop, sample_rate) && side_ok(tail_novelty, hop, sample_rate)
+}
+
 fn estimate_bpm_range(
     onset: &[f64],
     hop: usize,
@@ -1378,6 +1409,54 @@ fn estimate_bpm_range(
         )));
     }
     Ok(best_bpm.clamp(bpm_min - 0.5, bpm_max + 0.5))
+}
+
+#[cfg(test)]
+mod is_funkot_classify_tests {
+    use super::*;
+
+    fn novelty_impulse_train(bpm: f64, sample_rate: u32, secs: f64) -> Vec<f64> {
+        let hop = HOP as f64;
+        let sr = f64::from(sample_rate);
+        let period = (60.0 / bpm) * sr / hop;
+        let n = ((secs * sr / hop).ceil() as usize).max(1);
+        let mut v = vec![0.0; n];
+        let mut t = 0.0;
+        while (t as usize) < n {
+            v[t as usize] = 1.0;
+            t += period;
+        }
+        v
+    }
+
+    #[test]
+    fn classify_true_when_both_sides_in_band() {
+        let sr = 44_100;
+        let n = novelty_impulse_train(180.0, sr, 40.0);
+        assert!(classify_is_funkot(&n, &n, HOP, sr));
+    }
+
+    #[test]
+    fn classify_false_when_peak_outside_band() {
+        let sr = 44_100;
+        let n = novelty_impulse_train(120.0, sr, 40.0);
+        assert!(!classify_is_funkot(&n, &n, HOP, sr));
+    }
+
+    #[test]
+    fn classify_false_when_estimate_errors() {
+        let short = vec![0.0; 8];
+        assert!(!classify_is_funkot(&short, &short, HOP, 44_100));
+    }
+
+    #[test]
+    fn classify_false_if_only_one_side_in_band() {
+        let sr = 44_100;
+        let in_band = novelty_impulse_train(180.0, sr, 40.0);
+        let out_band = novelty_impulse_train(120.0, sr, 40.0);
+        assert!(!classify_is_funkot(&in_band, &out_band, HOP, sr));
+        assert!(!classify_is_funkot(&out_band, &in_band, HOP, sr));
+    }
 }
 
 /// Max over phase of the mean onset value sampled on a comb with the given period.
