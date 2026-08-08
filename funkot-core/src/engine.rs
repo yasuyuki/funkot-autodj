@@ -1272,7 +1272,7 @@ impl Engine {
             self.poll_phase_align();
             match self.phase_align_ready.take() {
                 Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
-                _ => align_next_entry_with_phase_hypotheses(
+                _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
                     &active.track.samples,
                     active.playhead,
                     &next.samples,
@@ -1282,6 +1282,7 @@ impl Engine {
                     self.options.output_sample_rate,
                     beat_frames,
                 ),
+                _ => (nominal, 0),
             }
         };
         self.clear_phase_align();
@@ -1662,8 +1663,8 @@ impl Engine {
         // Prefer the background align when it matches this trigger playhead.
         // Realtime hosts must not fall back to in-callback kick/hat search —
         // that stalls the audio thread under load (noise / dropouts). Offline
-        // render keeps the sync compute for bit-stable WAVs. Manual nav uses
-        // [`Self::begin_transition_to`] and is unchanged.
+        // render keeps the sync compute for bit-stable WAVs. Manual nav via
+        // [`Self::begin_transition_to`] uses the same realtime/offline policy.
         let (entry, prev_nudge) = match self.phase_align_ready.take() {
             Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
             _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
