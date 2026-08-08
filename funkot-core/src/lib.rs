@@ -153,9 +153,11 @@ pub struct TrackAnalysis {
     /// Auto fields were stripped; next load reanalyzes and merges manual bars.
     #[serde(default)]
     pub needs_reanalysis: bool,
-    /// `true` when both intro and outro peak tempos, searched over a wide
-    /// 100–200 BPM band on the same onset envelopes used for grid BPM, fall
-    /// inside 172..=188. Wide-band peak values themselves are not stored.
+    /// `true` when the low-band onsets lock hard enough onto the 172–188 BPM
+    /// grid on at least one of intro/outro, and neither side looks like a
+    /// half-tempo pulse read as its own double. See
+    /// `analysis::classify_is_funkot` for the three tests and the measured
+    /// thresholds; the scores themselves are not stored.
     pub is_funkot: bool,
     /// Measured RMS loudness of the whole analyzed material, in dBFS.
     pub rms_dbfs: f64,

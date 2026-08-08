@@ -46,10 +46,31 @@ const SEGMENT_SECS: f64 = 110.0;
 const MIN_DURATION_SECS: f64 = 30.0;
 const BPM_MIN: f64 = 172.0;
 const BPM_MAX: f64 = 188.0;
-/// Wide band used only for Funkot / non-Funkot classification (`is_funkot`).
-/// Grid BPM still uses [`BPM_MIN`]–[`BPM_MAX`].
+/// Step of every BPM comb sweep, before parabolic refinement. Shared so the
+/// grid search and `is_funkot`'s wide reference sweep stay commensurable.
+const BPM_SEARCH_STEP: f64 = 0.05;
+/// Wide band swept for the reference peak `is_funkot` measures the grid
+/// against. Grid BPM itself still uses [`BPM_MIN`]–[`BPM_MAX`].
 const CLASSIFY_BPM_MIN: f64 = 100.0;
 const CLASSIFY_BPM_MAX: f64 = 200.0;
+/// How hard the low-band onsets must lock onto the grid period, in standard
+/// errors above the segment's own novelty mean (see [`comb_z`]).
+///
+/// Measured over the labeled corpus: the 69 Funkot tracks of
+/// `testdata/classify_funkot.txt` bottom out at 9.44 on their better side,
+/// while the 261 hand-labeled non-Funkot tracks of
+/// `testdata/classify_not_funkot.txt` sit at a median of 5.8.
+const CLASSIFY_MIN_Z: f64 = 8.5;
+/// Fraction of the best score anywhere in [`CLASSIFY_BPM_MIN`]–
+/// [`CLASSIFY_BPM_MAX`] that the grid period must still reach. Rejects tracks
+/// that lock harder at some unrelated tempo. Corpus positives bottom out at
+/// 0.81, negatives run a median 0.53.
+const CLASSIFY_MIN_Z_RATIO: f64 = 0.75;
+/// Half-tempo veto: reject when the comb one metrical level below the grid
+/// beats the grid itself by more than this. A 90 BPM track whose kicks also
+/// land on a 180 comb passes the two tests above — this is the only thing
+/// that catches it. Corpus positives top out at 1.16.
+const CLASSIFY_MAX_HALF_RATIO: f64 = 1.40;
 pub(crate) const HOP: usize = 256;
 const LOWPASS_HZ: f64 = 150.0;
 const HIGHPASS_HZ: f64 = 1500.0;
@@ -266,8 +287,14 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
     let intro_bpm = estimate_bpm(&head_onset.novelty, HOP, buffer.sample_rate)?;
     let outro_bpm = estimate_bpm(&tail_onset.novelty, HOP, buffer.sample_rate)?;
     let is_funkot = classify_is_funkot(
-        &head_onset.novelty,
-        &tail_onset.novelty,
+        SideLock {
+            novelty: &head_onset.novelty,
+            grid_bpm: intro_bpm,
+        },
+        SideLock {
+            novelty: &tail_onset.novelty,
+            grid_bpm: outro_bpm,
+        },
         HOP,
         buffer.sample_rate,
     );
@@ -1326,24 +1353,235 @@ fn estimate_bpm(onset: &[f64], hop: usize, sample_rate: u32) -> Result<f64> {
     estimate_bpm_range(onset, hop, sample_rate, BPM_MIN, BPM_MAX)
 }
 
-/// Funkot / non-Funkot label from a second, wider BPM peak on the same onsets.
+/// Funkot / non-Funkot label from how hard the low-band onsets lock onto the
+/// already-estimated 172–188 BPM grid.
 ///
-/// Both intro and outro must peak inside [`BPM_MIN`]..=[`BPM_MAX`] when searched
-/// over [`CLASSIFY_BPM_MIN`]–[`CLASSIFY_BPM_MAX`]. A failed estimate on either
-/// side makes the track non-Funkot. No half-tempo / score-ratio heuristics.
+/// Three tests on the normalised comb score (see [`comb_z`] for why the raw
+/// comb mean cannot be compared across periods at all):
+///
+/// 1. absolute lock strength at the grid period >= [`CLASSIFY_MIN_Z`];
+/// 2. that score is at least [`CLASSIFY_MIN_Z_RATIO`] of the best score
+///    anywhere in [`CLASSIFY_BPM_MIN`]–[`CLASSIFY_BPM_MAX`], so a track that
+///    locks harder at an unrelated tempo is rejected;
+/// 3. the comb one metrical level down does not beat the grid period by more
+///    than [`CLASSIFY_MAX_HALF_RATIO`] (half-tempo veto).
+///
+/// Tests 1 and 2 take the better of intro/outro — Funkot tracks routinely
+/// open or close on material that carries no grid at all, and demanding both
+/// sides is what made the previous criterion reject two thirds of a
+/// known-Funkot corpus. Test 3 vetoes from either side.
+///
+/// This replaced "re-run the BPM argmax over 100–200 and require both sides
+/// to land in band". That criterion scored 23/69 on
+/// `testdata/classify_funkot.txt`: with a raw comb mean, longer periods take
+/// fewer samples and so ride higher on noise, which handed the argmax to
+/// metrical-level aliases of 180 — measured landing sites were 135 (3/4),
+/// 120 (2/3) and 112.5 (5/8).
 fn classify_is_funkot(
-    head_novelty: &[f64],
-    tail_novelty: &[f64],
+    head: SideLock,
+    tail: SideLock,
     hop: usize,
     sample_rate: u32,
 ) -> bool {
-    fn side_ok(novelty: &[f64], hop: usize, sample_rate: u32) -> bool {
-        match estimate_bpm_range(novelty, hop, sample_rate, CLASSIFY_BPM_MIN, CLASSIFY_BPM_MAX) {
-            Ok(bpm) => (BPM_MIN..=BPM_MAX).contains(&bpm),
-            Err(_) => false,
+    GridLock::verdict(
+        &head.measure(hop, sample_rate),
+        &tail.measure(hop, sample_rate),
+    )
+}
+
+/// One side's inputs: its onset novelty and the grid BPM `analyze` estimated
+/// from it. Pairing them in a struct keeps the two sides from being swapped
+/// at the call site.
+#[derive(Clone, Copy)]
+struct SideLock<'a> {
+    novelty: &'a [f64],
+    grid_bpm: f64,
+}
+
+struct GridLock {
+    z: f64,
+    z_ratio: f64,
+    half_ratio: f64,
+}
+
+impl GridLock {
+    /// The three threshold tests, split out so `probe_classification` can
+    /// reach the same verdict from measurements it already has.
+    fn verdict(head: &GridLock, tail: &GridLock) -> bool {
+        head.z.max(tail.z) >= CLASSIFY_MIN_Z
+            && head.z_ratio.max(tail.z_ratio) >= CLASSIFY_MIN_Z_RATIO
+            && head.half_ratio.max(tail.half_ratio) < CLASSIFY_MAX_HALF_RATIO
+    }
+}
+
+impl SideLock<'_> {
+    fn measure(self, hop: usize, sample_rate: u32) -> GridLock {
+        let hop_f = hop as f64;
+        let sr = f64::from(sample_rate);
+        let Some((mean, sd)) = novelty_stats(self.novelty) else {
+            return GridLock {
+                z: 0.0,
+                z_ratio: 0.0,
+                half_ratio: f64::INFINITY,
+            };
+        };
+        let period = bpm_to_period_hops(self.grid_bpm, hop_f, sr);
+        let z = comb_z(self.novelty, period, mean, sd);
+
+        // Reference peak: the best normalised score anywhere in the wide band,
+        // swept at `estimate_bpm_range`'s own step so the two are comparable.
+        let mut z_best = z;
+        let mut bpm = CLASSIFY_BPM_MIN;
+        while bpm <= CLASSIFY_BPM_MAX + 1e-9 {
+            let z_here = comb_z(
+                self.novelty,
+                bpm_to_period_hops(bpm, hop_f, sr),
+                mean,
+                sd,
+            );
+            if z_here > z_best {
+                z_best = z_here;
+            }
+            bpm += BPM_SEARCH_STEP;
+        }
+
+        let half = comb_z(self.novelty, period * 2.0, mean, sd);
+        GridLock {
+            z,
+            // `z_best` is seeded with `z`, so it is never below it and the
+            // ratio never exceeds 1.
+            z_ratio: if z_best > 0.0 { z / z_best } else { 0.0 },
+            // A grid that carries no signal at all must not pass the veto by
+            // dividing two near-zero numbers.
+            half_ratio: if z > 0.0 { half / z } else { f64::INFINITY },
         }
     }
-    side_ok(head_novelty, hop, sample_rate) && side_ok(tail_novelty, hop, sample_rate)
+}
+
+/// Mean and standard deviation of a novelty envelope, or `None` when it is
+/// flat enough that normalising by it would be meaningless.
+fn novelty_stats(novelty: &[f64]) -> Option<(f64, f64)> {
+    if novelty.len() < 2 {
+        return None;
+    }
+    let n = novelty.len() as f64;
+    let mean = novelty.iter().sum::<f64>() / n;
+    let sd = (novelty.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n).sqrt();
+    if sd < 1e-18 {
+        return None;
+    }
+    Some((mean, sd))
+}
+
+/// [`best_comb_score`] expressed in standard errors above the novelty's own
+/// mean.
+///
+/// The raw comb score is a mean over `len / period` samples, so its noise
+/// floor grows with the period: over a 2:1 search band the long-period
+/// (low-BPM) end wins on variance alone. Dividing by `σ / √N` removes that,
+/// which is what makes scores at different periods comparable at all.
+fn comb_z(novelty: &[f64], period: f64, mean: f64, sd: f64) -> f64 {
+    if period < 1.0 || novelty.is_empty() {
+        return 0.0;
+    }
+    let count = (novelty.len() as f64 / period).floor().max(1.0);
+    (best_comb_score(novelty, period) - mean) / (sd / count.sqrt())
+}
+
+// ---------------------------------------------------------------------
+// Funkot-classification diagnostics.
+//
+// Read-only view of the three quantities `classify_is_funkot` decides on,
+// for one track. Exists because the thresholds have to be chosen from
+// measurements over a labeled corpus, not from reading the code:
+// `examples/classify_probe` dumps this per file, and re-running it is how a
+// threshold change is checked against the corpus. Nothing here is used by
+// `analyze`.
+//
+// `#[doc(hidden)]` rather than `#[cfg(test)]`: examples link against the
+// normal rlib, so a test-only item would be invisible to them.
+
+/// One side (head or tail) of [`probe_classification`]: the three quantities
+/// `classify_is_funkot` decides on, plus the grid BPM they are measured at.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SideProbe {
+    /// Grid BPM (172–188 argmax) — the value `analyze` stores. `None` when
+    /// the estimate failed; the scores below are then measured at
+    /// [`NOMINAL_BPM`] so the row still says something, but `is_funkot` is
+    /// forced false regardless.
+    pub grid_bpm: Option<f64>,
+    /// Normalised comb score at the grid period. Tested against
+    /// `CLASSIFY_MIN_Z`.
+    pub z: f64,
+    /// `z` as a fraction of the best normalised score anywhere in 100–200.
+    /// Tested against `CLASSIFY_MIN_Z_RATIO`.
+    pub z_ratio: f64,
+    /// Normalised score one metrical level down, over `z`. Tested against
+    /// `CLASSIFY_MAX_HALF_RATIO`.
+    pub half_ratio: f64,
+}
+
+/// Both sides of one track, plus the verdict the classifier reaches.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ClassifyProbe {
+    pub head: SideProbe,
+    pub tail: SideProbe,
+    pub is_funkot: bool,
+}
+
+/// Measure the classification inputs for `buffer`, using the same head/tail
+/// windows, onset envelopes and grid BPMs as [`analyze`].
+#[doc(hidden)]
+pub fn probe_classification(buffer: &AudioBuffer) -> Result<ClassifyProbe> {
+    if buffer.sample_rate == 0 || buffer.frames == 0 {
+        return Err(Error::Analysis("empty audio buffer".into()));
+    }
+    let sr = buffer.sample_rate as f64;
+    let segment_frames = (SEGMENT_SECS * sr).round() as u64;
+    let head_len = segment_frames.min(buffer.frames);
+    let tail_start = buffer.frames.saturating_sub(segment_frames);
+
+    let head = buffer.mono_range(0, head_len);
+    let tail = buffer.mono_range(tail_start, buffer.frames - tail_start);
+    let head_onset = onset_envelope(&head, buffer.sample_rate, HOP)?;
+    let tail_onset = onset_envelope(&tail, buffer.sample_rate, HOP)?;
+    let head_bpm = estimate_bpm(&head_onset.novelty, HOP, buffer.sample_rate);
+    let tail_bpm = estimate_bpm(&tail_onset.novelty, HOP, buffer.sample_rate);
+
+    // `analyze` propagates a failed grid estimate as an error and never
+    // reaches the classifier. The probe measures such a side at the nominal
+    // tempo and reports `grid_bpm: None` instead, so one odd file does not
+    // abort a whole corpus run — but the verdict still counts it as
+    // non-Funkot, matching what `analyze` would have produced.
+    let h = SideLock {
+        novelty: &head_onset.novelty,
+        grid_bpm: *head_bpm.as_ref().unwrap_or(&NOMINAL_BPM),
+    };
+    let t = SideLock {
+        novelty: &tail_onset.novelty,
+        grid_bpm: *tail_bpm.as_ref().unwrap_or(&NOMINAL_BPM),
+    };
+
+    let hm = h.measure(HOP, buffer.sample_rate);
+    let tm = t.measure(HOP, buffer.sample_rate);
+    Ok(ClassifyProbe {
+        is_funkot: head_bpm.is_ok() && tail_bpm.is_ok() && GridLock::verdict(&hm, &tm),
+        head: SideProbe::of(hm, head_bpm.ok()),
+        tail: SideProbe::of(tm, tail_bpm.ok()),
+    })
+}
+
+impl SideProbe {
+    fn of(m: GridLock, grid_bpm: Option<f64>) -> Self {
+        SideProbe {
+            grid_bpm,
+            z: m.z,
+            z_ratio: m.z_ratio,
+            half_ratio: m.half_ratio,
+        }
+    }
 }
 
 fn estimate_bpm_range(
@@ -1369,7 +1607,7 @@ fn estimate_bpm_range(
 
     // Comb-filter tempo: for each BPM, take the best phase of a beat-period comb
     // on the onset novelty. Impulse-train kicks peak sharply at the true tempo.
-    let step = 0.05;
+    let step = BPM_SEARCH_STEP;
     let mut best_bpm = 0.5 * (bpm_min + bpm_max);
     let mut best_score = f64::NEG_INFINITY;
     let mut bpm = bpm_min;
@@ -1415,12 +1653,21 @@ fn estimate_bpm_range(
 mod is_funkot_classify_tests {
     use super::*;
 
+    /// A perfectly periodic low-band novelty at `bpm`, plus a little noise so
+    /// the sample-count normalisation has a non-degenerate `sd` to work with
+    /// (a noiseless train makes every ratio exactly 1 and hides regressions).
     fn novelty_impulse_train(bpm: f64, sample_rate: u32, secs: f64) -> Vec<f64> {
         let hop = HOP as f64;
         let sr = f64::from(sample_rate);
         let period = (60.0 / bpm) * sr / hop;
         let n = ((secs * sr / hop).ceil() as usize).max(1);
-        let mut v = vec![0.0; n];
+        // Deterministic low-amplitude hash noise; no rand dependency.
+        let mut v: Vec<f64> = (0..n)
+            .map(|i| {
+                let h = (i as u64).wrapping_mul(6_364_136_223_846_793_005).rotate_left(17);
+                0.02 * ((h % 1000) as f64 / 1000.0)
+            })
+            .collect();
         let mut t = 0.0;
         while (t as usize) < n {
             v[t as usize] = 1.0;
@@ -1429,33 +1676,59 @@ mod is_funkot_classify_tests {
         v
     }
 
+    fn side(novelty: &[f64], sample_rate: u32) -> SideLock<'_> {
+        let grid_bpm = estimate_bpm(novelty, HOP, sample_rate).unwrap_or(NOMINAL_BPM);
+        SideLock { novelty, grid_bpm }
+    }
+
+    fn classify(head: &[f64], tail: &[f64], sample_rate: u32) -> bool {
+        classify_is_funkot(side(head, sample_rate), side(tail, sample_rate), HOP, sample_rate)
+    }
+
     #[test]
-    fn classify_true_when_both_sides_in_band() {
+    fn classify_true_at_180() {
         let sr = 44_100;
         let n = novelty_impulse_train(180.0, sr, 40.0);
-        assert!(classify_is_funkot(&n, &n, HOP, sr));
+        assert!(classify(&n, &n, sr));
     }
 
     #[test]
-    fn classify_false_when_peak_outside_band() {
+    fn classify_false_at_common_non_funkot_tempos() {
         let sr = 44_100;
-        let n = novelty_impulse_train(120.0, sr, 40.0);
-        assert!(!classify_is_funkot(&n, &n, HOP, sr));
+        for bpm in [120.0, 128.0, 140.0] {
+            let n = novelty_impulse_train(bpm, sr, 40.0);
+            assert!(!classify(&n, &n, sr), "{bpm} BPM classified as Funkot");
+        }
     }
 
+    /// The half-tempo case the previous criterion had no defence against: a 90
+    /// BPM pulse also lands on every other tooth of a 180 comb, so the grid
+    /// lock alone looks convincing. Only [`CLASSIFY_MAX_HALF_RATIO`] rejects it.
     #[test]
-    fn classify_false_when_estimate_errors() {
-        let short = vec![0.0; 8];
-        assert!(!classify_is_funkot(&short, &short, HOP, 44_100));
-    }
-
-    #[test]
-    fn classify_false_if_only_one_side_in_band() {
+    fn classify_false_at_half_tempo() {
         let sr = 44_100;
-        let in_band = novelty_impulse_train(180.0, sr, 40.0);
-        let out_band = novelty_impulse_train(120.0, sr, 40.0);
-        assert!(!classify_is_funkot(&in_band, &out_band, HOP, sr));
-        assert!(!classify_is_funkot(&out_band, &in_band, HOP, sr));
+        let n = novelty_impulse_train(90.0, sr, 40.0);
+        assert!(!classify(&n, &n, sr));
+    }
+
+    /// One dead side must not sink a track: Funkot routinely opens or closes on
+    /// material with no grid at all, and demanding both sides is what made the
+    /// previous criterion reject two thirds of a known-Funkot corpus.
+    #[test]
+    fn classify_true_when_only_one_side_locks() {
+        let sr = 44_100;
+        let locked = novelty_impulse_train(180.0, sr, 40.0);
+        let dead = novelty_impulse_train(120.0, sr, 40.0);
+        assert!(classify(&locked, &dead, sr));
+        assert!(classify(&dead, &locked, sr));
+    }
+
+    #[test]
+    fn classify_false_when_novelty_is_too_short_or_flat() {
+        let sr = 44_100;
+        assert!(!classify(&[0.0; 8], &[0.0; 8], sr));
+        let flat = vec![0.5; 20_000];
+        assert!(!classify(&flat, &flat, sr));
     }
 }
 
