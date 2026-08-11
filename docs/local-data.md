@@ -9,10 +9,10 @@
 | クラス | 対象 | 扱い |
 |---|---|---|
 | A 再生成可能 | `target*/`、`dist/`、`funkot-core/tests/fixtures/*.wav` | 消してよい。下のコマンドで戻る |
-| B 外部から再取得 | `testdata/` の原盤 | リポジトリに置かない。`FUNKOT_TESTDATA_DIR` で音楽ライブラリを指す |
+| B 外部から再取得 | 原盤（実音源） | **リポジトリに置かない。** `FUNKOT_TESTDATA_DIR` で音楽ライブラリを指す |
 | C 高コストな派生 | `testdata/phase_ab/`、`testdata/click_*/`、`testdata/opus_s1/`、`testdata/synth/`、`whitelabel2022fall-b_transitions/` | 消してよい。再生成には原盤が要る |
 | D キャッシュ | `funkot-cache/`、`testdata/cache/`、`testdata/real-cache-v*/` | 消してよい。温め直す |
-| E **再生成不可** | `testdata/labels.tsv`、`testdata/survey.tsv`、`testdata/relabel_*.txt`、実耳評価の `*.md`、サーベイ生出力、`HANDOFF.md` | **公開リポジトリの外の private store が正。** 所在は `HANDOFF.md` |
+| E **再生成不可** | `testdata/labels.tsv`、`testdata/survey.tsv`、`testdata/relabel_*.txt`、実耳評価の `*.md`、サーベイ生出力、`testdata/rekey_result.tsv`、`HANDOFF.md` | **公開リポジトリの外の private store が正。** 所在は `HANDOFF.md` |
 
 ## E がなぜ ignore なのか、どう守るか
 
@@ -27,22 +27,44 @@
 
 ## 原盤の置き場所（`FUNKOT_TESTDATA_DIR`）
 
-実音源を使う省略可能なテストは `funkot_core::testdata` 経由で原盤を探す。
+**原盤はこのリポジトリに1つも無い。** 音楽ライブラリが唯一の所在で、
+実音源を使う省略可能なテストは `funkot_core::testdata` 経由でそこを探す。
 
 - 解決順は `FUNKOT_TESTDATA_DIR` → `<repo>/testdata`
 - 拡張子は問わない（`.flac` / `.m4a` / `.alac` の順に探す）。同じマスターなら
   ロスレス同士でどれでもよい
-- 見つからなければテストは**失敗ではなく skip** する。原盤の無い環境が普通だという前提
+- ディレクトリの形も問わない。直下に無ければ再帰的に探す（音楽ライブラリは
+  アルバム別に切ってある）。走査はプロセスにつき1回で、結果は使い回す
+- 見つからなければテストは**失敗ではなく skip** する。ライブラリの見えない環境が
+  普通だという前提
+- `dev.sh` は設定されていれば `FUNKOT_TESTDATA_DIR` をコンテナへ渡す。リポジトリ外を
+  指すなら `DEV_BIND_SRC` も要る（渡さないとコンテナ内にそのパスが存在しない）
 
 テストが**書く**もの（解析キャッシュ、試聴用クリップ）は `FUNKOT_TESTDATA_DIR` の
 下には置かない。音楽ライブラリは読み取り専用マウントのことがあるため、
 `testdata::local_dir()`（この checkout の `testdata/`）へ書く。
 
-**注意: 原盤の入れ物を変えると `labels.tsv` と `funkot-cache` は全滅する。**
-`cache::content_hash` はファイルのバイト列（長さ＋先頭/末尾 128 KiB）を見るので、
-同じ曲でも FLAC と ALAC では別のキーになる。`testdata/` の FLAC を捨てて
-ライブラリの ALAC に一本化するときは、**両方が揃っている間に** `labels.tsv` の
-`content_hash` を計算し直すこと。順序を逆にすると実耳ラベルが宙に浮く。
+### 原盤の入れ物を変えるとき
+
+**`labels.tsv` と `funkot-cache` は全滅する。** `cache::content_hash` は
+ファイルのバイト列（長さ＋先頭 64 KiB＋末尾 64 KiB）を見るので、同じ曲でも
+FLAC と ALAC では別のキーになる。**両方が揃っている間に**再キーすること。
+順序を逆にすると実耳ラベルが宙に浮く。手順は `examples/master_rekey.rs`:
+
+```sh
+# old_path<TAB>new_path を1行ずつ書いた MAP.tsv を用意して
+DEV_BIND_SRC=<music-dir> ./dev.sh \
+  cargo run -p funkot-core --example master_rekey --release -- MAP.tsv > rekey.tsv
+```
+
+デコード後の PCM がサンプル単位で一致した行だけ `same` になり、旧→新 `content_hash`
+が出る。1行でも `same` でなければ非ゼロ終了する。あとは `labels.tsv` / `survey.tsv` の
+1列目と2列目をこの対応で置き換え、**再キー前後で `eval_sections` の出力が
+（ファイル名の拡張子を除いて）一致することを確認**してから旧ファイルを捨てる。
+
+対応表そのものは旧ファイルを消すと二度と作れないので、再キー前のスナップショットと
+一緒に private store へ残すこと（2026-08-11 の移行では `rekey_result.tsv` と
+`*.bak-0811-preflac`）。
 
 ## 再生成
 

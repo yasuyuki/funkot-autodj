@@ -7,17 +7,25 @@
 //!
 //! Resolution order for [`dir`]: `FUNKOT_TESTDATA_DIR` → `<repo>/testdata`.
 //!
-//! Lookup is extension-agnostic ([`track`]). The same master is FLAC in a
-//! local `testdata/` and ALAC (`.m4a`) in the library, and both are lossless,
-//! so either satisfies these tests. Note that they are *not* interchangeable
-//! as cache or label keys: [`crate::cache::content_hash`] hashes file bytes,
-//! so re-pointing this at a different container invalidates `labels.tsv` and
-//! every `funkot-cache` entry.
+//! Lookup is extension-agnostic and directory-shape-agnostic ([`track`]): a
+//! flat working copy and a music library filed by album both work. The same
+//! master is FLAC in a local `testdata/` and ALAC (`.m4a`) in the library, and
+//! both are lossless, so either satisfies these tests. Note that they are *not*
+//! interchangeable as cache or label keys: [`crate::cache::content_hash`] hashes
+//! file bytes, so re-pointing this at a different container invalidates
+//! `labels.tsv` and every `funkot-cache` entry.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Container extensions probed by [`track`], in order.
 const EXTENSIONS: [&str; 3] = ["flac", "m4a", "alac"];
+
+/// Depth limit for the recursive scan. The library nests one or two levels
+/// (label / album / track); this is slack, not a real constraint. It exists so
+/// pointing `FUNKOT_TESTDATA_DIR` at a wrong, huge root fails fast.
+const MAX_SCAN_DEPTH: usize = 4;
 
 /// Directory holding the real-audio test set. May not exist.
 pub fn dir() -> PathBuf {
@@ -31,15 +39,72 @@ pub fn dir() -> PathBuf {
 
 /// Locate one track by name, with or without a container extension.
 ///
+/// Probes [`dir`] directly first, then falls back to a recursive scan of it —
+/// a music library files tracks under per-album directories, so the direct
+/// probe misses there. The scan runs once per process and is memoized; over a
+/// mounted share it is the difference between one directory walk and one per
+/// lookup.
+///
 /// Returns `None` when the set is not present, which is the signal for the
 /// optional regressions to skip rather than fail.
 pub fn track(name: &str) -> Option<PathBuf> {
     let dir = dir();
     let stem = strip_container_extension(name);
-    EXTENSIONS
+
+    if let Some(path) = EXTENSIONS
         .iter()
         .map(|ext| dir.join(format!("{stem}.{ext}")))
         .find(|path| path.is_file())
+    {
+        return Some(path);
+    }
+
+    let index = index();
+    EXTENSIONS
+        .iter()
+        .find_map(|ext| index.get(&format!("{stem}.{ext}")))
+        .cloned()
+}
+
+/// File name → path for every audio file under [`dir`], built on first use.
+///
+/// Later duplicates lose: with two copies of a master in the library, the one
+/// found first wins and stays the answer for the whole process, so a run cannot
+/// silently key half its work to one copy and half to the other.
+fn index() -> &'static HashMap<String, PathBuf> {
+    static INDEX: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut out = HashMap::new();
+        scan(&dir(), 0, &mut out);
+        out
+    })
+}
+
+fn scan(dir: &Path, depth: usize, out: &mut HashMap<String, PathBuf>) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            scan(&path, depth + 1, out);
+            continue;
+        }
+        let is_audio = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+        if !is_audio {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            out.entry(name.to_string()).or_insert(path);
+        }
+    }
 }
 
 /// This checkout's own `testdata/`, for anything a test *writes*: analysis
@@ -90,5 +155,29 @@ mod tests {
     #[test]
     fn missing_track_is_none_not_a_panic() {
         assert!(track("no such track at all").is_none());
+    }
+
+    #[test]
+    fn scan_finds_tracks_filed_under_album_directories() {
+        let root = std::env::temp_dir().join(format!("funkot-testdata-scan-{}", std::process::id()));
+        let album = root.join("Some Label").join("Some Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("03. Artist - Title.m4a"), b"").unwrap();
+        std::fs::write(album.join("cover.jpg"), b"").unwrap();
+        // Deeper than MAX_SCAN_DEPTH: must not be indexed.
+        let deep = root.join("a").join("b").join("c").join("d").join("e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("Too Deep.m4a"), b"").unwrap();
+
+        let mut index = HashMap::new();
+        scan(&root, 0, &mut index);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(
+            index.get("03. Artist - Title.m4a"),
+            Some(&album.join("03. Artist - Title.m4a"))
+        );
+        assert!(!index.contains_key("cover.jpg"));
+        assert!(!index.contains_key("Too Deep.m4a"));
     }
 }
