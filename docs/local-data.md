@@ -9,7 +9,7 @@
 | クラス | 対象 | 扱い |
 |---|---|---|
 | A 再生成可能 | `target*/`、`dist/`、`funkot-core/tests/fixtures/*.wav` | 消してよい。下のコマンドで戻る |
-| B 外部から再取得 | `testdata/` の原盤 | リポジトリに置かない。音楽ライブラリを指す |
+| B 外部から再取得 | `testdata/` の原盤 | リポジトリに置かない。`FUNKOT_TESTDATA_DIR` で音楽ライブラリを指す |
 | C 高コストな派生 | `testdata/phase_ab/`、`testdata/click_*/`、`testdata/opus_s1/`、`testdata/synth/`、`whitelabel2022fall-b_transitions/` | 消してよい。再生成には原盤が要る |
 | D キャッシュ | `funkot-cache/`、`testdata/cache/`、`testdata/real-cache-v*/` | 消してよい。温め直す |
 | E **再生成不可** | `testdata/labels.tsv`、`testdata/survey.tsv`、`testdata/relabel_*.txt`、実耳評価の `*.md`、サーベイ生出力、`HANDOFF.md` | **公開リポジトリの外の private store が正。** 所在は `HANDOFF.md` |
@@ -24,6 +24,25 @@
 そこから戻す。新しい checkout を作ったら、まずそれを実行すること。手順は `HANDOFF.md`。
 
 `testdata/README.md` の「消してよいもの」節は E を含まない。消す前に本書の表で確認する。
+
+## 原盤の置き場所（`FUNKOT_TESTDATA_DIR`）
+
+実音源を使う省略可能なテストは `funkot_core::testdata` 経由で原盤を探す。
+
+- 解決順は `FUNKOT_TESTDATA_DIR` → `<repo>/testdata`
+- 拡張子は問わない（`.flac` / `.m4a` / `.alac` の順に探す）。同じマスターなら
+  ロスレス同士でどれでもよい
+- 見つからなければテストは**失敗ではなく skip** する。原盤の無い環境が普通だという前提
+
+テストが**書く**もの（解析キャッシュ、試聴用クリップ）は `FUNKOT_TESTDATA_DIR` の
+下には置かない。音楽ライブラリは読み取り専用マウントのことがあるため、
+`testdata::local_dir()`（この checkout の `testdata/`）へ書く。
+
+**注意: 原盤の入れ物を変えると `labels.tsv` と `funkot-cache` は全滅する。**
+`cache::content_hash` はファイルのバイト列（長さ＋先頭/末尾 128 KiB）を見るので、
+同じ曲でも FLAC と ALAC では別のキーになる。`testdata/` の FLAC を捨てて
+ライブラリの ALAC に一本化するときは、**両方が揃っている間に** `labels.tsv` の
+`content_hash` を計算し直すこと。順序を逆にすると実耳ラベルが宙に浮く。
 
 ## 再生成
 
