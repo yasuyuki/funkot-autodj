@@ -173,11 +173,13 @@ funkot_engine_free(e);
 
 ## Development
 
+Setup: [docs/development-setup.md](docs/development-setup.md)
+
 Build and test inside the Docker container.
 
 ```sh
 ./dev.sh cargo build --workspace
-./dev.sh cargo test --workspace
+RUST_TEST_THREADS=1 ./dev.sh cargo test --workspace --release
 ./dev.sh cargo run -p funkot-cli -- -l testdata/playlist.txt --render /work/out.wav
 ```
 
