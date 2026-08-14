@@ -37,7 +37,8 @@ use rustfft::FftPlanner;
 use crate::cache::CACHE_VERSION;
 use crate::decode::AudioBuffer;
 use crate::{
-    Error, Result, TrackAnalysis, BEATS_PER_BAR, FALLBACK_BARS, NOMINAL_BPM, TARGET_RMS_DBFS,
+    ClassifyScores, Error, Result, TrackAnalysis, BEATS_PER_BAR, FALLBACK_BARS, NOMINAL_BPM,
+    TARGET_RMS_DBFS,
 };
 
 /// Head/tail analysis window for BPM/downbeat only (section scan uses the full buffer).
@@ -286,7 +287,7 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
 
     let intro_bpm = estimate_bpm(&head_onset.novelty, HOP, buffer.sample_rate)?;
     let outro_bpm = estimate_bpm(&tail_onset.novelty, HOP, buffer.sample_rate)?;
-    let is_funkot = classify_is_funkot(
+    let (is_funkot, classify_scores) = classify_is_funkot(
         SideLock {
             novelty: &head_onset.novelty,
             grid_bpm: intro_bpm,
@@ -381,6 +382,7 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         outro_structure_bars_manual: false,
         needs_reanalysis: false,
         is_funkot,
+        classify_scores: Some(classify_scores),
         rms_dbfs,
         gain_db,
     })
@@ -1382,11 +1384,33 @@ fn classify_is_funkot(
     tail: SideLock,
     hop: usize,
     sample_rate: u32,
-) -> bool {
-    GridLock::verdict(
+) -> (bool, ClassifyScores) {
+    let scores = scores_from_locks(
         &head.measure(hop, sample_rate),
         &tail.measure(hop, sample_rate),
-    )
+    );
+    (scores.verdict(), scores)
+}
+
+/// Copy [`GridLock`] fields into the public [`ClassifyScores`] shape.
+fn scores_from_locks(head: &GridLock, tail: &GridLock) -> ClassifyScores {
+    ClassifyScores {
+        head_z: head.z,
+        head_z_ratio: head.z_ratio,
+        head_half_ratio: head.half_ratio,
+        tail_z: tail.z,
+        tail_z_ratio: tail.z_ratio,
+        tail_half_ratio: tail.half_ratio,
+    }
+}
+
+impl ClassifyScores {
+    /// Same three threshold tests as the live classifier.
+    pub fn verdict(&self) -> bool {
+        self.head_z.max(self.tail_z) >= CLASSIFY_MIN_Z
+            && self.head_z_ratio.max(self.tail_z_ratio) >= CLASSIFY_MIN_Z_RATIO
+            && self.head_half_ratio.max(self.tail_half_ratio) < CLASSIFY_MAX_HALF_RATIO
+    }
 }
 
 /// One side's inputs: its onset novelty and the grid BPM `analyze` estimated
@@ -1408,9 +1432,7 @@ impl GridLock {
     /// The three threshold tests, split out so `probe_classification` can
     /// reach the same verdict from measurements it already has.
     fn verdict(head: &GridLock, tail: &GridLock) -> bool {
-        head.z.max(tail.z) >= CLASSIFY_MIN_Z
-            && head.z_ratio.max(tail.z_ratio) >= CLASSIFY_MIN_Z_RATIO
-            && head.half_ratio.max(tail.half_ratio) < CLASSIFY_MAX_HALF_RATIO
+        scores_from_locks(head, tail).verdict()
     }
 }
 
@@ -1529,6 +1551,30 @@ pub struct ClassifyProbe {
     pub head: SideProbe,
     pub tail: SideProbe,
     pub is_funkot: bool,
+}
+
+/// Rebuild a [`ClassifyProbe`] from cached scores without decoding audio.
+///
+/// Returns `None` when `classify_scores` is absent (pre-v14 / stripped /
+/// provisional); the caller should fall back to [`probe_classification`].
+#[doc(hidden)]
+pub fn probe_from_cached(analysis: &TrackAnalysis) -> Option<ClassifyProbe> {
+    let scores = analysis.classify_scores.as_ref()?;
+    Some(ClassifyProbe {
+        is_funkot: analysis.is_funkot,
+        head: SideProbe {
+            grid_bpm: Some(analysis.intro_bpm),
+            z: scores.head_z,
+            z_ratio: scores.head_z_ratio,
+            half_ratio: scores.head_half_ratio,
+        },
+        tail: SideProbe {
+            grid_bpm: Some(analysis.outro_bpm),
+            z: scores.tail_z,
+            z_ratio: scores.tail_z_ratio,
+            half_ratio: scores.tail_half_ratio,
+        },
+    })
 }
 
 /// Measure the classification inputs for `buffer`, using the same head/tail
@@ -1682,7 +1728,7 @@ mod is_funkot_classify_tests {
     }
 
     fn classify(head: &[f64], tail: &[f64], sample_rate: u32) -> bool {
-        classify_is_funkot(side(head, sample_rate), side(tail, sample_rate), HOP, sample_rate)
+        classify_is_funkot(side(head, sample_rate), side(tail, sample_rate), HOP, sample_rate).0
     }
 
     #[test]
@@ -1729,6 +1775,109 @@ mod is_funkot_classify_tests {
         assert!(!classify(&[0.0; 8], &[0.0; 8], sr));
         let flat = vec![0.5; 20_000];
         assert!(!classify(&flat, &flat, sr));
+    }
+}
+
+#[cfg(test)]
+mod probe_from_cached_tests {
+    use super::*;
+    use crate::cache;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn scores() -> ClassifyScores {
+        ClassifyScores {
+            head_z: 12.0,
+            head_z_ratio: 1.0,
+            head_half_ratio: 0.8,
+            tail_z: 11.0,
+            tail_z_ratio: 0.95,
+            tail_half_ratio: 0.7,
+        }
+    }
+
+    fn analysis_with(scores: Option<ClassifyScores>) -> TrackAnalysis {
+        TrackAnalysis {
+            version: CACHE_VERSION,
+            file_name: "t.wav".into(),
+            sample_rate: 44_100,
+            total_frames: 1_000_000,
+            intro_bpm: 180.0,
+            outro_bpm: 179.5,
+            first_downbeat: 0,
+            outro_start: 0,
+            intro_bars: 16,
+            track_bars: 64,
+            outro_bars: 16,
+            outro_structure_bars: 16,
+            bars_estimated_low_confidence: false,
+            intro_bars_low_confidence: false,
+            outro_bars_low_confidence: false,
+            intro_bars_manual: false,
+            outro_bars_manual: false,
+            outro_structure_bars_manual: false,
+            needs_reanalysis: false,
+            is_funkot: true,
+            classify_scores: scores,
+            rms_dbfs: -14.0,
+            gain_db: 0.0,
+        }
+    }
+
+    #[test]
+    fn probe_from_cached_fills_when_scores_present() {
+        let a = analysis_with(Some(scores()));
+        let probe = probe_from_cached(&a).expect("Some");
+        assert!(probe.is_funkot);
+        assert_eq!(probe.head.grid_bpm, Some(180.0));
+        assert_eq!(probe.tail.grid_bpm, Some(179.5));
+        assert!((probe.head.z - 12.0).abs() < 1e-12);
+        assert!((probe.tail.z_ratio - 0.95).abs() < 1e-12);
+        assert!((probe.head.half_ratio - 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn probe_from_cached_none_without_scores() {
+        assert!(probe_from_cached(&analysis_with(None)).is_none());
+    }
+
+    #[test]
+    fn classify_probe_cache_hit_path_needs_no_decode() {
+        struct TempDir(std::path::PathBuf);
+        impl TempDir {
+            fn new() -> Self {
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let dir = std::env::temp_dir().join(format!(
+                    "funkot-probe-cache-{}-{}-{n}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                Self(dir)
+            }
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        // Any bytes are enough for content_hash; we never decode on the cache path.
+        let dir = TempDir::new();
+        let wav = dir.0.join("t.wav");
+        std::fs::write(&wav, b"RIFF....WAVE").expect("stub file");
+        let hash = cache::content_hash(&wav).expect("hash");
+        let a = analysis_with(Some(scores()));
+        cache::store(&dir.0, &hash, &a).expect("store");
+
+        let loaded = cache::load(&dir.0, &hash).expect("load v14");
+        let probe = probe_from_cached(&loaded).expect("cache scores");
+        assert!(probe.is_funkot);
+        assert_eq!(probe.head.grid_bpm, Some(180.0));
+        assert!((probe.head.z - 12.0).abs() < 1e-12);
     }
 }
 

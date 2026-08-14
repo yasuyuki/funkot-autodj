@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Classification scores (`z` / `z_ratio` / `half_ratio` for head and tail) are kept on `TrackAnalysis::classify_scores`. `CACHE_VERSION` 13 → 14, so existing caches reanalyze. Thresholds and the `is_funkot` verdict are unchanged.
+
 ### Fixed
 
 - Live manual skip/rewind: realtime hosts no longer run kick/hat phase-align inside the audio callback when the worker result is late/mismatched (use nominal entry, same as automatic transitions).

@@ -11,12 +11,13 @@
 //! Re-run it after touching the classifier: a threshold change that helps one
 //! corpus usually costs another, and the table is the only way to see which.
 //!
-//! Read-only: it calls `analysis::probe_classification`, which shares
-//! `analyze`'s windowing, onset envelopes and grid BPMs but changes nothing.
+//! Prefer `--cache-dir` when analyses already carry `classify_scores` (cache
+//! v14+): those tracks skip decode. Otherwise it falls back to
+//! `analysis::probe_classification` (re-decode).
 //!
 //! Usage (inside the dev container):
 //!   cargo run -p funkot-core --example classify_probe --release -- \
-//!     [-l PLAYLIST] [FILE...] [--tsv OUT.tsv]
+//!     [-l PLAYLIST] [FILE...] [--tsv OUT.tsv] [--cache-dir DIR]
 //!
 //! Tracks come from `-l PLAYLIST` (one path per line, `#`-comments and blank
 //! lines ignored, relative entries resolved against the playlist's own
@@ -26,7 +27,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use funkot_core::{analysis, decode};
+use funkot_core::{analysis, cache, decode};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,12 +52,15 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("usage: classify_probe [-l PLAYLIST] [FILE...] [--tsv OUT.tsv]");
+    eprintln!(
+        "usage: classify_probe [-l PLAYLIST] [FILE...] [--tsv OUT.tsv] [--cache-dir DIR]"
+    );
     eprintln!();
     eprintln!("  -l PLAYLIST      playlist file, one audio path per line ('#' comments ok);");
     eprintln!("                   relative entries resolve against PLAYLIST's own directory");
     eprintln!("  FILE...          bare audio file paths (combinable with -l)");
     eprintln!("  --tsv OUT.tsv    also write the per-track table to a file");
+    eprintln!("  --cache-dir DIR  use cached classify_scores when present (skip decode)");
     eprintln!("  -h, --help       print this message");
 }
 
@@ -64,6 +68,7 @@ struct Opts {
     playlist: Option<PathBuf>,
     files: Vec<PathBuf>,
     tsv_out: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
 }
 
 enum ParsedArgs {
@@ -76,6 +81,7 @@ impl Opts {
         let mut playlist = None;
         let mut files = Vec::new();
         let mut tsv_out = None;
+        let mut cache_dir = None;
 
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
@@ -83,6 +89,9 @@ impl Opts {
                 "-h" | "--help" => return Ok(ParsedArgs::Help),
                 "-l" => playlist = Some(PathBuf::from(it.next().ok_or("-l needs a path")?)),
                 "--tsv" => tsv_out = Some(PathBuf::from(it.next().ok_or("--tsv needs a path")?)),
+                "--cache-dir" => {
+                    cache_dir = Some(PathBuf::from(it.next().ok_or("--cache-dir needs a path")?))
+                }
                 other if other.starts_with('-') && other.len() > 1 => {
                     return Err(format!("unknown option '{other}'"))
                 }
@@ -97,6 +106,7 @@ impl Opts {
             playlist,
             files,
             tsv_out,
+            cache_dir,
         }))
     }
 }
@@ -119,19 +129,25 @@ fn run(opts: &Opts) -> Result<(), String> {
     let mut rows = Vec::new();
     let mut failed = 0usize;
     let mut funkot_true = 0usize;
+    let mut from_cache = 0usize;
+    let mut re_decoded = 0usize;
 
     for path in &tracks {
-        let buffer = match decode::decode_file(path) {
-            Ok(b) => b,
-            Err(e) => {
+        let probe = match probe_track(path, opts.cache_dir.as_deref()) {
+            Ok((p, ProbeSource::Cache)) => {
+                from_cache += 1;
+                p
+            }
+            Ok((p, ProbeSource::Decoded)) => {
+                re_decoded += 1;
+                p
+            }
+            Err(SkipReason::Decode(e)) => {
                 eprintln!("skip (decode failed): {} -- {e}", path.display());
                 failed += 1;
                 continue;
             }
-        };
-        let probe = match analysis::probe_classification(&buffer) {
-            Ok(p) => p,
-            Err(e) => {
+            Err(SkipReason::Probe(e)) => {
                 eprintln!("skip (probe failed): {} -- {e}", path.display());
                 failed += 1;
                 continue;
@@ -155,6 +171,8 @@ fn run(opts: &Opts) -> Result<(), String> {
     eprintln!();
     eprintln!("=== classify_probe ===");
     eprintln!("tracks probed : {}", rows.len());
+    eprintln!("from cache: {from_cache}");
+    eprintln!("re-decoded: {re_decoded}");
     eprintln!("decode/probe failures: {failed}");
     eprintln!(
         "is_funkot=true: {funkot_true} / {} ({:.0}%)",
@@ -171,6 +189,36 @@ fn run(opts: &Opts) -> Result<(), String> {
         eprintln!("wrote {}", p.display());
     }
     Ok(())
+}
+
+enum ProbeSource {
+    Cache,
+    Decoded,
+}
+
+enum SkipReason {
+    Decode(String),
+    Probe(String),
+}
+
+fn probe_track(
+    path: &Path,
+    cache_dir: Option<&Path>,
+) -> Result<(analysis::ClassifyProbe, ProbeSource), SkipReason> {
+    if let Some(dir) = cache_dir {
+        if let Ok(hash) = cache::content_hash(path) {
+            if let Some(analysis) = cache::load(dir, &hash) {
+                if let Some(probe) = analysis::probe_from_cached(&analysis) {
+                    return Ok((probe, ProbeSource::Cache));
+                }
+            }
+        }
+    }
+
+    let buffer = decode::decode_file(path).map_err(|e| SkipReason::Decode(e.to_string()))?;
+    let probe =
+        analysis::probe_classification(&buffer).map_err(|e| SkipReason::Probe(e.to_string()))?;
+    Ok((probe, ProbeSource::Decoded))
 }
 
 fn format_row(path: &Path, probe: &analysis::ClassifyProbe) -> String {

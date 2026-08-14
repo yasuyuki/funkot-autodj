@@ -56,6 +56,15 @@ fn classic_180_16_32_16() {
     assert!(!a.outro_bars_low_confidence);
     assert!(!a.bars_estimated_low_confidence);
     assert!(a.is_funkot, "180 BPM synth should classify as Funkot");
+    let scores = a
+        .classify_scores
+        .as_ref()
+        .expect("analyze should store classify_scores");
+    assert_eq!(
+        scores.verdict(),
+        a.is_funkot,
+        "stored scores must reproduce is_funkot"
+    );
 
     let fd_secs = a.first_downbeat as f64 / f64::from(sr);
     assert!(fd_secs.abs() < 0.05, "first_downbeat {fd_secs}s not near 0");
@@ -776,6 +785,7 @@ fn purge_auto_deletes_and_clears_manual() {
         outro_structure_bars_manual: false,
         needs_reanalysis: false,
         is_funkot: true,
+        classify_scores: None,
         rms_dbfs: -14.0,
         gain_db: 0.0,
     };
