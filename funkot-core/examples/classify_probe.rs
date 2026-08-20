@@ -2,14 +2,16 @@
 //!
 //! Dumps, per track, the three quantities `analysis::classify_is_funkot`
 //! decides on, alongside its verdict. The thresholds in `analysis.rs` were
-//! picked from this table over the labeled corpus in `testdata/`:
-//!
-//!   classify_funkot.txt       69 tracks, all Funkot   -> want all true
-//!   classify_funkot_hhhb.txt  63 tracks, all Funkot   -> want all true
-//!   classify_not_funkot.txt  261 tracks, non-Funkot   -> false positives
+//! picked from this table over files that used to live in `testdata/`
+//! (`classify_funkot.txt`, `classify_funkot_hhhb.txt`,
+//! `classify_not_funkot.txt`). **That corpus is not ground truth** — it was
+//! produced during operational testing and its contents are wrong. Thresholds
+//! will be re-derived from human labels collected in funkot-player labeling
+//! mode.
 //!
 //! Re-run it after touching the classifier: a threshold change that helps one
-//! corpus usually costs another, and the table is the only way to see which.
+//! slice of the library usually costs another, and the table is the only way
+//! to see which.
 //!
 //! Prefer `--cache-dir` when analyses already carry `classify_scores` (cache
 //! v14+): those tracks skip decode. Otherwise it falls back to
