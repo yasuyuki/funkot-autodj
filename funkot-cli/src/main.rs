@@ -418,6 +418,7 @@ fn build_options(args: &Args) -> Result<EngineOptions> {
         loop_playlist: !args.no_loop,
         output_sample_rate,
         cache_dir: args.cache_dir.clone(),
+        head_only_secs: None,
     })
 }
 

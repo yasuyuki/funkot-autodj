@@ -298,6 +298,7 @@ fn linear_fade_full_span_constant_signal() {
         loop_playlist: false,
         output_sample_rate: sr,
         cache_dir: cache.clone(),
+        head_only_secs: None,
     };
     let plan = plan_transition(4, intro, outro);
     assert_eq!(plan.f_eff, 4, "fade must remain 4 bars");
@@ -456,6 +457,7 @@ fn prev_deck_hard_stop_no_residual_after_fade_out() {
         loop_playlist: false,
         output_sample_rate: sr,
         cache_dir: cache,
+        head_only_secs: None,
     };
     let plan = plan_transition(4, intro, outro);
     assert_eq!(plan.f_eff, 4);

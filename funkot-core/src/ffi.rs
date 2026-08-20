@@ -148,6 +148,7 @@ fn options_from_c(options: &FunkotOptions) -> std::result::Result<EngineOptions,
         loop_playlist: options.loop_playlist != 0,
         output_sample_rate: options.output_sample_rate,
         cache_dir,
+        head_only_secs: None,
     })
 }
 

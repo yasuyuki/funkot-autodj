@@ -243,6 +243,13 @@ pub struct EngineOptions {
     pub output_sample_rate: u32,
     /// Directory for analysis cache JSON files.
     pub cache_dir: std::path::PathBuf,
+    /// Labeling mode (head-only prepare): `Some(secs)` decodes/stretches only
+    /// `first_downbeat..+secs` of every track instead of the full length. Not
+    /// part of the serialized config (CLI/JSON compatibility is unaffected).
+    /// Fixed at `Engine` construction — there is no live switch; changing it
+    /// requires restarting the engine.
+    #[serde(skip)]
+    pub head_only_secs: Option<f64>,
 }
 
 impl Default for EngineOptions {
@@ -257,6 +264,7 @@ impl Default for EngineOptions {
             loop_playlist: true,
             output_sample_rate: 48_000,
             cache_dir: std::path::PathBuf::from("funkot-cache"),
+            head_only_secs: None,
         }
     }
 }
