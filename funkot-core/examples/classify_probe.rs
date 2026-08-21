@@ -1,13 +1,10 @@
 //! Diagnostic dump for the Funkot / non-Funkot classifier.
 //!
 //! Dumps, per track, the three quantities `analysis::classify_is_funkot`
-//! decides on, alongside its verdict. The thresholds in `analysis.rs` were
-//! picked from this table over files that used to live in `testdata/`
-//! (`classify_funkot.txt`, `classify_funkot_hhhb.txt`,
-//! `classify_not_funkot.txt`). **That corpus is not ground truth** — it was
-//! produced during operational testing and its contents are wrong. Thresholds
-//! will be re-derived from human labels collected in funkot-player labeling
-//! mode.
+//! decides on, alongside its verdict. Thresholds in `analysis.rs` are tuned
+//! on human labels from funkot-player labeling mode (797 tracks: 398 Funkot /
+//! 399 non-Funkot). `testdata/classify_funkot.txt` / `classify_not_funkot.txt`
+//! are those labels as WSL paths (gitignored; do not treat as a public corpus).
 //!
 //! Re-run it after touching the classifier: a threshold change that helps one
 //! slice of the library usually costs another, and the table is the only way

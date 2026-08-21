@@ -57,21 +57,29 @@ const CLASSIFY_BPM_MAX: f64 = 200.0;
 /// How hard the low-band onsets must lock onto the grid period, in standard
 /// errors above the segment's own novelty mean (see [`comb_z`]).
 ///
-/// Measured over the labeled corpus: the 69 Funkot tracks of
-/// `testdata/classify_funkot.txt` bottom out at 9.44 on their better side,
-/// while the 261 hand-labeled non-Funkot tracks of
-/// `testdata/classify_not_funkot.txt` sit at a median of 5.8.
-const CLASSIFY_MIN_Z: f64 = 8.5;
+/// Tuned on 797 human labels (398 Funkot / 399 non-Funkot; 1 unlabeled
+/// excluded). Better-side z: Funkot p5 11.80, non-Funkot median 5.55; cut
+/// at 10.7. Remaining false negatives include pre-accelerated Funkot
+/// (filenames citing 193–204 BPM, etc.) whose grid lock is weak because
+/// search stays in 172–188 — lowering toward 4.7 floods false positives,
+/// so that is left as a feature limit. Confusion: 382/398 Funkot,
+/// 24/399 false positives.
+const CLASSIFY_MIN_Z: f64 = 10.7;
 /// Fraction of the best score anywhere in [`CLASSIFY_BPM_MIN`]–
 /// [`CLASSIFY_BPM_MAX`] that the grid period must still reach. Rejects tracks
-/// that lock harder at some unrelated tempo. Corpus positives bottom out at
-/// 0.81, negatives run a median 0.53.
-const CLASSIFY_MIN_Z_RATIO: f64 = 0.75;
+/// that lock harder at some unrelated tempo. On the same 797 labels, Funkot
+/// z_ratio p5 is 0.83 and non-Funkot median 0.52; cut at 0.65 (was 0.75,
+/// which dropped true Funkot already on the grid).
+const CLASSIFY_MIN_Z_RATIO: f64 = 0.65;
 /// Half-tempo veto: reject when the comb one metrical level below the grid
 /// beats the grid itself by more than this. A 90 BPM track whose kicks also
 /// land on a 180 comb passes the two tests above — this is the only thing
-/// that catches it. Corpus positives top out at 1.16.
-const CLASSIFY_MAX_HALF_RATIO: f64 = 1.40;
+/// that catches it. On the same labels, Funkot half_ratio p95 is 1.20 and
+/// true Funkot Colorful reaches 1.42; cut at 1.43 (was 1.40). A 90 BPM
+/// synthetic impulse train measures 1.435, so raising to 1.55 would kill
+/// the half-tempo veto. Danna Summer Hard at 1.52 is left as a feature
+/// limit (false negative).
+const CLASSIFY_MAX_HALF_RATIO: f64 = 1.43;
 pub(crate) const HOP: usize = 256;
 const LOWPASS_HZ: f64 = 150.0;
 const HIGHPASS_HZ: f64 = 1500.0;
@@ -1374,11 +1382,12 @@ fn estimate_bpm(onset: &[f64], hop: usize, sample_rate: u32) -> Result<f64> {
 /// known-Funkot corpus. Test 3 vetoes from either side.
 ///
 /// This replaced "re-run the BPM argmax over 100–200 and require both sides
-/// to land in band". That criterion scored 23/69 on
-/// `testdata/classify_funkot.txt`: with a raw comb mean, longer periods take
-/// fewer samples and so ride higher on noise, which handed the argmax to
-/// metrical-level aliases of 180 — measured landing sites were 135 (3/4),
-/// 120 (2/3) and 112.5 (5/8).
+/// to land in band". That criterion scored 23/69 on the old operational-test
+/// list `testdata/classify_funkot.txt` (not ground truth): with a raw comb
+/// mean, longer periods take fewer samples and so ride higher on noise,
+/// which handed the argmax to metrical-level aliases of 180 — measured
+/// landing sites were 135 (3/4), 120 (2/3) and 112.5 (5/8). On 797 human
+/// labels the current cut scores 382/398 Funkot and 24/399 false positives.
 fn classify_is_funkot(
     head: SideLock,
     tail: SideLock,
@@ -1561,7 +1570,7 @@ pub struct ClassifyProbe {
 pub fn probe_from_cached(analysis: &TrackAnalysis) -> Option<ClassifyProbe> {
     let scores = analysis.classify_scores.as_ref()?;
     Some(ClassifyProbe {
-        is_funkot: analysis.is_funkot,
+        is_funkot: scores.verdict(),
         head: SideProbe {
             grid_bpm: Some(analysis.intro_bpm),
             z: scores.head_z,
@@ -1838,6 +1847,26 @@ mod probe_from_cached_tests {
     #[test]
     fn probe_from_cached_none_without_scores() {
         assert!(probe_from_cached(&analysis_with(None)).is_none());
+    }
+
+    /// Stored `is_funkot` must not override a failing `ClassifyScores::verdict`.
+    #[test]
+    fn probe_from_cached_uses_verdict_not_stored_bool() {
+        let weak = ClassifyScores {
+            head_z: 9.0,
+            head_z_ratio: 1.0,
+            head_half_ratio: 0.8,
+            tail_z: 9.0,
+            tail_z_ratio: 1.0,
+            tail_half_ratio: 0.8,
+        };
+        let mut a = analysis_with(Some(weak));
+        a.is_funkot = true;
+        let probe = probe_from_cached(&a).expect("Some");
+        assert!(
+            !probe.is_funkot,
+            "z=9.0 fails CLASSIFY_MIN_Z 10.7 even when stored is_funkot is true"
+        );
     }
 
     #[test]
