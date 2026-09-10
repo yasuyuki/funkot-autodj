@@ -795,15 +795,15 @@ fn purge_auto_deletes_and_clears_manual() {
     manual.intro_bars_manual = true;
     manual.outro_bars = 32;
 
-    cache::store(&cache_dir, "aaa", &auto).expect("store auto");
-    cache::store(&cache_dir, "bbb", &manual).expect("store manual");
+    cache::store(&cache_dir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &auto).expect("store auto");
+    cache::store(&cache_dir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &manual).expect("store manual");
 
     let stats = cache::purge_auto(&cache_dir).expect("purge");
     assert_eq!(stats.deleted, 1);
     assert_eq!(stats.cleared, 1);
-    assert!(cache::load(&cache_dir, "aaa").is_none());
+    assert!(cache::load(&cache_dir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_none());
 
-    let cleared = cache::load(&cache_dir, "bbb").expect("kept");
+    let cleared = cache::load(&cache_dir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").expect("kept");
     assert!(cleared.needs_reanalysis);
     assert!(cleared.is_funkot); // stub until reanalysis
     assert_eq!(cleared.intro_bars, 8);
@@ -826,10 +826,7 @@ fn get_or_analyze_merges_manual_after_purge() {
 
     let a1 = get_or_analyze(&wav_path, &cache_dir, &buf).expect("first");
     let hash = cache::content_hash(&wav_path).expect("hash");
-    let mut cached = cache::load(&cache_dir, &hash).expect("load");
-    cached.intro_bars = 8;
-    cached.intro_bars_manual = true;
-    cache::store(&cache_dir, &hash, &cached).expect("store manual");
+    cache::set_manual_bars(&cache_dir, &hash, Some(8), None).expect("manual edit");
 
     let stats = cache::purge_auto(&cache_dir).expect("purge");
     assert_eq!(stats.cleared, 1);

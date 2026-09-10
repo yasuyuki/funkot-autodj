@@ -11,7 +11,7 @@
 | A 再生成可能 | `target*/`、`dist/`、`funkot-core/tests/fixtures/*.wav` | 消してよい。下のコマンドで戻る |
 | B 外部から再取得 | 原盤（実音源） | **リポジトリに置かない。** `FUNKOT_TESTDATA_DIR` で音楽ライブラリを指す |
 | C 高コストな派生 | `testdata/phase_ab/`、`testdata/click_*/`、`testdata/opus_s1/`、`testdata/synth/`、`whitelabel2022fall-b_transitions/` | 消してよい。再生成には原盤が要る |
-| D キャッシュ | `funkot-cache/`、`testdata/cache/`、`testdata/real-cache-v*/` | 消してよい。温め直す |
+| D 自動キャッシュ（manual 値は下記を参照） | `funkot-cache/`、`testdata/cache/`、`testdata/real-cache-v*/` | 消してよい。温め直す |
 | E **再生成不可** | `testdata/labels.tsv`、`testdata/survey.tsv`、`testdata/relabel_*.txt`、実耳評価の `*.md`、サーベイ生出力、`testdata/rekey_result.tsv`、`HANDOFF.md` | **公開リポジトリの外の private store が正。** 所在は `HANDOFF.md` |
 
 ## E がなぜ ignore なのか、どう守るか
@@ -92,3 +92,39 @@ DEV_BIND_SRC=<music-dir> ./dev.sh sh /work/tools/<script>.sh
 置き場所で決める。**手で書いたコードと文書は `testdata/` へ置かない。**
 `testdata/` は「実音源と計測の生データ」だけにして、スクリプトは `tools/`、
 残す知見は `docs/` へ置く。そうすれば ignore の粒度を細かくする必要がない。
+
+## キャッシュの保存契約（v14）
+
+`cache::load_checked` は不在と旧版を通常の結果として返し、不正 hash、JSON 破損、
+I/O エラーを操作・原因付きのエラーとして返す。従来の `load -> Option` も残り、
+polling のたびに警告を繰り返さない静かな互換 lookup とする。解析入口は破損 JSON を
+診断して修復する。I/O エラーは重い解析を始める前に返し、上書きで回避しない。
+通常の miss で警告や再試行ループは作らない。呼出側が診断を所有するときは `load_checked` を使う。
+
+hash は path を作る前に小文字 ASCII 16進64桁へ制限する。`cache_dir` 自体とその親・
+内容は利用者が管理する信頼済み directory を前提とする。symlink や、悪意のある別ユーザーが
+directory/lock/temp を置き換える攻撃全般を防ぐ仕組みではない。
+
+全更新は削除しない `.write.lock` を共有し、thread と process の read-modify-write を
+直列化する。重い解析は lock 外で行い、保存直前の最新 manual 値を再読込みして適用する。
+`store` は既存 entry の最新 manual 状態（解除を含む）を優先する。manual の変更には
+`set_manual_bars` / `set_manual_structure_bars` / `edit_bars` を使う。`edit_bars` は
+intro と構造境界の編集・取消しを1 transactionで保存する。新規 entry への `store` は
+信頼済み snapshot の初期化として manual 値も受け入れる。世代番号は持たないため、
+外部から削除済み entry の古い snapshot を再投入する操作は競合検出の対象外である。
+
+同じ directory の排他的な一時ファイルに書き、内容の `sync_all` 後に
+[`NamedTempFile::persist`](https://docs.rs/tempfile/3.27.0/tempfile/struct.NamedTempFile.html#method.persist)
+で既存 entry を atomic に置換する。reader は完全な旧 JSON または完全な新 JSON を読む。
+書込み・置換失敗では既存 entry を残し、所有する temp だけを片付ける。directory は同期せず、
+電源断後に置換が永続化している保証はしない。失敗注入テストは実際の電源断試験ではない。
+
+lock は Rust の [`File::lock`](https://doc.rust-lang.org/std/fs/struct.File.html#method.lock)
+を使う。共有 cache の全 writer がこの契約へ対応している必要がある。旧版 process、直接の
+JSON 編集、cache/lock の削除は稼働中に混在させない。更新前に旧 writer を停止する。
+これらのファイル I/O・lock・警告は control/loader thread の処理であり、音声 callback では使わない。
+
+**manual フラグ付き JSON の手動値は再解析だけでは戻らない。** 自動値を消すときは
+`purge_auto` を使う（最新の手動値を保持し `needs_reanalysis` を立てる）。cache directory の
+全削除を手動値のバックアップと取り違えない。labels/survey と同様、手動値を唯一保持する
+ファイルは private に保全する。CACHE_VERSION、content_hash、ラベルのキーは変更していない。
