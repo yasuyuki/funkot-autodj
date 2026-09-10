@@ -13,6 +13,8 @@
 //! worker is late (no in-callback align); offline render still computes sync.
 
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -197,6 +199,24 @@ const PHASE_ALIGN_FINE_BEATS: f64 = 0.5;
 const PHASE_ALIGN_MIN_CORR: f64 = 0.45;
 /// Bars before file end used as the sparse outro-tail phase anchor.
 const OUTRO_TAIL_ANCHOR_BARS: u32 = 4;
+
+// Thread-local on purpose: phase work done by the worker is not attributed to
+// the render caller. Realtime tests can assert that their render thread did no
+// synchronous phase search while a worker may still be computing elsewhere.
+#[cfg(test)]
+thread_local! {
+    static PHASE_ALIGN_CALLS_ON_THREAD: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_phase_align_calls_on_thread() {
+    PHASE_ALIGN_CALLS_ON_THREAD.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn phase_align_calls_on_thread() -> u64 {
+    PHASE_ALIGN_CALLS_ON_THREAD.with(Cell::get)
+}
 
 /// Micro-align `next_entry` to the previous outro's kick-band energy phase.
 ///
@@ -392,6 +412,8 @@ pub fn align_next_entry_with_phase_hypotheses(
     sample_rate: u32,
     beat_frames: f64,
 ) -> (u64, u64) {
+    #[cfg(test)]
+    PHASE_ALIGN_CALLS_ON_THREAD.with(|calls| calls.set(calls.get() + 1));
     const SCORE_EPS: f64 = 0.02;
 
     let next_frames = (next_interleaved.len() / 2) as u64;
@@ -2789,6 +2811,152 @@ mod tests {
     use crate::testutil::synth_track;
     use crate::PitchMode;
     use std::f32::consts::PI;
+
+    fn phase_test_track(index: usize, intro_bars: u32, outro_at: u64) -> PreparedTrack {
+        let frames = 512u64;
+        PreparedTrack {
+            path: PathBuf::from(format!("phase-{index}.wav")),
+            playlist_index: index,
+            samples: Arc::new((0..frames * 2).map(|i| (i % 17) as f32 / 32.0).collect()),
+            frames,
+            first_downbeat_out: 0,
+            outro_start_out: outro_at,
+            outro_end_anchored_out: outro_at,
+            intro_bars,
+            outro_bars: 8,
+            gain_linear: 1.0,
+            preview: false,
+            head_only: false,
+        }
+    }
+
+    fn phase_test_engine(realtime: bool, intro_bars: u32, sample_rate: u32) -> Engine {
+        let mut options = EngineOptions::default();
+        options.output_sample_rate = sample_rate;
+        options.loop_playlist = false;
+        let mut engine = Engine::from_prepared(
+            options,
+            vec![phase_test_track(0, 8, 16), phase_test_track(1, intro_bars, 16)],
+        )
+        .expect("prepared phase engine");
+        engine.set_realtime(realtime);
+        engine.active.as_mut().expect("active").playhead = 16;
+        // from_prepared schedules a phase worker. Each test controls its own
+        // receiver/result rather than racing that worker.
+        engine.phase_align_ready = None;
+        engine.phase_align_rx = None;
+        engine
+    }
+
+    #[derive(Clone, Copy)]
+    enum PhaseReceiverState {
+        Missing,
+        Delayed,
+        Disconnected,
+        Stale,
+    }
+
+    fn install_phase_receiver(engine: &mut Engine, state: PhaseReceiverState) -> Option<SyncSender<(u64, u64, u64)>> {
+        match state {
+            PhaseReceiverState::Missing => {
+                engine.phase_align_rx = None;
+                None
+            }
+            PhaseReceiverState::Delayed => {
+                let (tx, rx) = mpsc::sync_channel(1);
+                engine.phase_align_rx = Some(rx);
+                Some(tx)
+            }
+            PhaseReceiverState::Disconnected => {
+                let (tx, rx) = mpsc::sync_channel(1);
+                drop(tx);
+                engine.phase_align_rx = Some(rx);
+                None
+            }
+            PhaseReceiverState::Stale => {
+                let (tx, rx) = mpsc::sync_channel(1);
+                tx.send((999, 111, 0)).expect("seed stale phase result");
+                engine.phase_align_rx = Some(rx);
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn realtime_transition_never_sync_aligns_when_worker_is_unavailable() {
+        for sample_rate in [44_100, 48_000] {
+            for state in [
+                PhaseReceiverState::Missing,
+                PhaseReceiverState::Delayed,
+                PhaseReceiverState::Disconnected,
+                PhaseReceiverState::Stale,
+                ] {
+                let mut engine = phase_test_engine(true, 8, sample_rate);
+                let _delayed_sender = install_phase_receiver(&mut engine, state);
+                reset_phase_align_calls_on_thread();
+                engine.begin_transition(0);
+                assert_eq!(phase_align_calls_on_thread(), 0, "automatic at {sample_rate}");
+                assert_eq!(engine.active.as_ref().unwrap().playhead, 0, "nominal automatic entry");
+            }
+        }
+    }
+
+    #[test]
+    fn realtime_nav_never_sync_aligns_when_worker_is_unavailable() {
+        for state in [
+            PhaseReceiverState::Missing,
+            PhaseReceiverState::Delayed,
+            PhaseReceiverState::Disconnected,
+            PhaseReceiverState::Stale,
+        ] {
+            let mut engine = phase_test_engine(true, 8, 44_100);
+            let _delayed_sender = install_phase_receiver(&mut engine, state);
+            let next = engine.take_next().expect("next track");
+            reset_phase_align_calls_on_thread();
+            engine.begin_transition_to(next, false, false);
+            assert_eq!(phase_align_calls_on_thread(), 0, "nav fallback");
+            assert_eq!(engine.active.as_ref().unwrap().playhead, 0, "nominal nav entry");
+        }
+    }
+
+    #[test]
+    fn offline_transition_keeps_sync_phase_align_positive_control() {
+        let mut engine = phase_test_engine(false, 8, 44_100);
+        engine.phase_align_rx = None;
+        reset_phase_align_calls_on_thread();
+        engine.begin_transition(0);
+        assert!(phase_align_calls_on_thread() > 0, "offline must retain phase alignment");
+    }
+
+    #[test]
+    fn short_intro_transitions_hard_cut_without_prev_residual() {
+        for sample_rate in [44_100, 48_000] {
+            for intro in [0, 1, 7, 8, 9] {
+                let p = plan_transition(4, intro, 8);
+                assert!(p.m <= intro && p.skip <= intro, "I={intro}, sr={sample_rate}");
+                assert!(p.fadeout_start <= p.fadeout_end);
+                let mut engine = phase_test_engine(true, intro, sample_rate);
+                engine.phase_align_rx = None;
+                engine.bar_frames = 2.0;
+                engine.active.as_mut().unwrap().track.samples = Arc::new(
+                    (0..512).flat_map(|_| [1.0, 0.0]).collect(),
+                );
+                engine.next_track.as_mut().unwrap().samples = Arc::new(
+                    (0..512).flat_map(|_| [0.0, 1.0]).collect(),
+                );
+                engine.begin_transition(0);
+                for _ in 0..4 {
+                    let (left, right) = engine.render_one_frame();
+                    assert!(left.is_finite() && right.is_finite(), "I={intro}, sr={sample_rate}");
+                    assert!(left.abs() <= 1.0 && right.abs() <= 1.0, "peak I={intro}, sr={sample_rate}");
+                }
+                assert!(engine.prev.is_none(), "previous deck survived I={intro}, sr={sample_rate}");
+                let (left, right) = engine.render_one_frame();
+                assert_eq!(left, 0.0, "prev residual I={intro}, sr={sample_rate}");
+                assert_ne!(right, 0.0, "silent active gap I={intro}, sr={sample_rate}");
+            }
+        }
+    }
 
     #[test]
     fn plan_worked_examples_f4_main_gap8() {
