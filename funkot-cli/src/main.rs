@@ -63,8 +63,13 @@ struct Args {
     fade_bars: u32,
 
     /// High-pass cutoff (Hz) for mid/high-pass during transitions
-    #[arg(long = "highpass-hz", alias = "lpf-hz", default_value_t = 300.0)]
+    #[arg(long = "highpass-hz", default_value_t = 300.0)]
     highpass_hz: f32,
+
+    /// Removed: this named the inverse filter. Retained only to give callers a
+    /// migration error instead of silently applying an unintended effect.
+    #[arg(long = "lpf-hz", hide = true)]
+    removed_lpf_hz: Option<f32>,
 
     /// Shuffle playlist order (reshuffled every full cycle)
     #[arg(long)]
@@ -215,6 +220,9 @@ fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let mut args = Args::parse();
+    if args.removed_lpf_hz.is_some() {
+        bail!("--lpf-hz has been removed because it named the inverse filter; use --highpass-hz HZ instead");
+    }
     if args.ci_fast {
         args.no_loop = true;
         args.render_speed = 0.0;

@@ -50,7 +50,7 @@ RUST_TEST_THREADS=1 ./dev.sh cargo test --workspace --release
 Notes:
 
 - The first run builds the `funkot-autodj-dev` image.
-- Default parallel debug runs, or parallel release, can flake on `funkot-cli`’s `render_two_tracks_end_to_end` (`expected 1 transition clip, got 0`). Serial execution or `RUST_TEST_THREADS=1` with `--release` has been reliable.
+- CLI transition-clip tests use the existing `--jobs 2` prepare-first path. At accelerated render speed, the streaming loader can legitimately reach the end before the next track is ready; serial test scheduling alone did not make clip assertions deterministic.
 - Without a real audio library, tests that need external tracks may **skip** and the suite can still finish green.
 
 ## Host cargo exception
@@ -79,6 +79,21 @@ Hand-made labels and private evaluation artifacts are **not** required for a pub
 |---|---|
 | `docker: command not found` / `dev.sh` exit 127 | Install Docker Engine; see [Install Docker](#install-docker). |
 | `permission denied` on the Docker socket | Add your user to the `docker` group, then log out/in (or `newgrp docker`). |
-| `render_two_tracks_end_to_end` flake under parallel tests | Re-run with `RUST_TEST_THREADS=1` and `--release`. |
+| No transition clip with accelerated streaming render | Use the existing `--jobs` / `--ci-fast` prepare-first mode when all transitions are required. |
 | Image build fails for disk space | Free space and retry `./dev.sh ...`. |
 | crates.io timeout during `cargo` | Re-run the same `./dev.sh cargo ...` command. |
+
+## Container package reproducibility
+
+The development image currently uses `rust:1.93-slim-trixie`; its apt package
+versions are intentionally not pinned. This keeps security updates available,
+but a historical image cannot yet be rebuilt bit-for-bit. Track a future
+container-only change that chooses and documents one of these approaches:
+
+- pin the base image by digest and record the review procedure for refreshing it;
+- use a dated Debian snapshot for apt while defining the security-update cadence;
+- record resolved apt versions in a build artifact together with the base digest.
+
+Do not freeze package versions indefinitely merely to make an old build
+available. That future change must keep the Rust 1.93 toolchain and verify a
+fresh `./dev.sh` build after any base-image, snapshot, or package update.

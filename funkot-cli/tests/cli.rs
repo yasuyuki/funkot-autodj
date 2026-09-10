@@ -69,6 +69,18 @@ fn playlist_missing_file_errors() {
 }
 
 #[test]
+fn removed_lpf_hz_reports_highpass_migration() {
+    let output = bin()
+        .args(["--lpf-hz", "300"])
+        .output()
+        .expect("spawn");
+    assert!(!output.status.success(), "removed option must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--lpf-hz has been removed"), "stderr={stderr}");
+    assert!(stderr.contains("--highpass-hz HZ"), "stderr={stderr}");
+}
+
+#[test]
 fn render_two_tracks_end_to_end() {
     let dir = temp_dir("render_e2e");
     let cache = dir.join("cache");
@@ -92,6 +104,8 @@ fn render_two_tracks_end_to_end() {
             out.to_str().unwrap(),
             "--render-speed",
             "10",
+            "--jobs",
+            "2",
             "--transition-clip-seconds",
             "2",
             "--sample-rate",
@@ -104,6 +118,9 @@ fn render_two_tracks_end_to_end() {
     assert!(status.success(), "exit status {status}");
     assert!(out.is_file(), "out.wav missing");
 
+    // Prepare both tracks before CPU-speed rendering: this tests clip output,
+    // not whether a background decoder wins a wall-clock race. Streaming loader
+    // behavior is covered by the engine tests.
     // Transition clips should be emitted automatically for `--render`.
     let transitions_dir = dir.join("out_transitions");
     let entries: Vec<_> = fs::read_dir(&transitions_dir)
@@ -184,6 +201,8 @@ fn render_transitions_only_is_shorter_than_full_mix() {
         full.to_str().unwrap(),
         "--render-speed",
         "10",
+        "--jobs",
+        "2",
         "--transition-clip-seconds",
         "2",
         "--sample-rate",
@@ -200,6 +219,8 @@ fn render_transitions_only_is_shorter_than_full_mix() {
         only.to_str().unwrap(),
         "--render-speed",
         "10",
+        "--jobs",
+        "2",
         "--transition-clip-seconds",
         "2",
         "--sample-rate",

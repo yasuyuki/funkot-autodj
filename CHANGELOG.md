@@ -6,7 +6,10 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Cache writes now atomically replace JSON and serialize manual edits, undo and purge across cooperating processes. Existing manual state takes priority over stale `store` snapshots; use the edit APIs to change it. `load_checked` exposes read diagnostics and `edit_bars` performs combined intro/structure edits. Cache format v14 and content hashes are unchanged; stop older writers before sharing the cache with this version.
+
 - Funkot classify thresholds retuned on 797 human labels (398 Funkot / 399 non-Funkot; 1 unlabeled excluded): `CLASSIFY_MIN_Z` 8.5→10.7, `CLASSIFY_MIN_Z_RATIO` 0.75→0.65, `CLASSIFY_MAX_HALF_RATIO` 1.40→1.43. On that set: 382/398 Funkot, 24/399 false positives (was 382/398 and 29/399 at the old cut). `CACHE_VERSION` stays 14; `cache::load` reapplies `ClassifyScores::verdict` so existing entries pick up the new cut without re-decode.
+- `--lpf-hz` is removed. It named the inverse filter and now exits with a migration error; use `--highpass-hz HZ`.
 
 ### Added
 
