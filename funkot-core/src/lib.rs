@@ -27,6 +27,8 @@ pub mod stretch;
 pub mod structure;
 
 #[cfg(any(test, feature = "testutil"))]
+pub mod testdata;
+#[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
 
 #[cfg(test)]

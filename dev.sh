@@ -5,6 +5,9 @@
 # Usage: ./dev.sh cargo build --workspace
 # Optional: DEV_BIND_SRC=/host/path DEV_BIND_DST=/host/path (default: same as src)
 #
+# FUNKOT_TESTDATA_DIR is forwarded when set (see funkot_core::testdata). Pointing
+# it outside the repo needs DEV_BIND_SRC too, or the path won't exist in here.
+#
 # Local CI speed (dev.sh only; GitHub Actions is unchanged):
 #   DEV_JOBS             — cargo/rustc/test parallelism (default: nproc / hw.ncpu)
 #   CARGO_BUILD_JOBS     — override build jobs (default: DEV_JOBS)
@@ -70,6 +73,7 @@ if [ -n "${DEV_BIND_SRC:-}" ]; then
         -v funkot-cargo-registry:/usr/local/cargo/registry \
         -v funkot-target:/work/target \
         -e CARGO_TERM_COLOR=never \
+        -e FUNKOT_TESTDATA_DIR="${FUNKOT_TESTDATA_DIR:-}" \
         -e HOST_UID="$(id -u)" \
         -e HOST_GID="$(id -g)" \
         -e CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
@@ -84,6 +88,7 @@ exec docker run --rm -i \
     -v funkot-cargo-registry:/usr/local/cargo/registry \
     -v funkot-target:/work/target \
     -e CARGO_TERM_COLOR=never \
+    -e FUNKOT_TESTDATA_DIR="${FUNKOT_TESTDATA_DIR:-}" \
     -e HOST_UID="$(id -u)" \
     -e HOST_GID="$(id -g)" \
     -e CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \

@@ -590,19 +590,17 @@ fn nav_real_ivy_transition_clip_if_present() {
     use funkot_core::engine::NavAction;
     use hound::{SampleFormat, WavSpec, WavWriter};
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("testdata");
-    let path_a = root.join("AntonFer - Gakumas no Remix 2 - 02 IVY.flac");
-    let path_b = root.join("AntonFer - Gakumas no Remix 2 - 09 Sakura Photograph.flac");
-    if !path_a.is_file() || !path_b.is_file() {
-        eprintln!("skip nav_real_ivy: testdata FLAC missing");
+    let (Some(path_a), Some(path_b)) = (
+        funkot_core::testdata::track("AntonFer - Gakumas no Remix 2 - 02 IVY"),
+        funkot_core::testdata::track("AntonFer - Gakumas no Remix 2 - 09 Sakura Photograph"),
+    ) else {
+        eprintln!("skip nav_real_ivy: real-audio test set missing");
         return;
-    }
+    };
     let _lock = engine_test_lock();
 
     let dir = temp_dir("nav_real");
-    let cache = root.join("real-cache-v8");
+    let cache = funkot_core::testdata::local_dir().join("real-cache-v8");
     let options = EngineOptions {
         rate: 1.10,
         pitch_mode: PitchMode::Preserve,
@@ -676,8 +674,8 @@ fn nav_real_ivy_transition_clip_if_present() {
     }
     w.finalize().unwrap();
     eprintln!("wrote {}", clip.display());
-    // Keep clip under testdata for listening if desired.
-    let listen = root.join("nav_ivy_transition_clip.wav");
+    // Keep clip under this checkout's testdata for listening if desired.
+    let listen = funkot_core::testdata::local_dir().join("nav_ivy_transition_clip.wav");
     let _ = std::fs::copy(&clip, &listen);
     let _ = std::fs::remove_dir_all(&dir);
 }

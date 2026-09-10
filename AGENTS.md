@@ -3,7 +3,8 @@
 この文書を、変更時に必要な開発上の判断と検証の入口にする。製品仕様と利用方法は
 `README.md`、公開履歴は `CHANGELOG.md`、設計判断と実測知見は `docs/` を正とし、
 ローカルの `HANDOFF.md`、`testdata/`、キャッシュ、WAV、`dist/`、`target*` は
-調査・聴感確認に使ってもコミットしない。
+調査・聴感確認に使ってもコミットしない。**ただし ignore 対象がすべて使い捨てでは
+ない。** 何が再生成不可でどこにあるかは `docs/local-data.md`。
 
 ## HANDOFF.md と docs/ の運用
 
@@ -30,6 +31,7 @@
 | `docs/guide-clicks.md` | `--label-sections` のガイドクリック位置決定（4層方式、失敗した方式、実測） |
 | `docs/memory.md` | 全曲展開のメモリ内訳（保持側/一時側）、実測値、削れる場所と検証手順 |
 | `docs/labeling.md` | ラベリングのホスト実行手順と音声まわりの罠 |
+| `docs/local-data.md` | gitignore 対象の分類と再生成手順。何が再生成不可で、どう守るか |
 | `docs/section-analysis-redesign.md` | 区間解析再設計の意図・Stage 構成・着手前チェック |
 | `docs/transition-phase.md` | 遷移の位相・小節 identity と v6〜v17 の失敗履歴 |
 

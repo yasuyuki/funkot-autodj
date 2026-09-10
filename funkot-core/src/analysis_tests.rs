@@ -876,14 +876,13 @@ fn short_track_errors() {
     }
 }
 
-/// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
+/// Optional local regression: the master is gitignored / not shipped; skip if absent.
 #[test]
 fn love_and_joy_intro_64_if_testdata_present() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../testdata/Surya Groxyn - Gakumas no Remix 2 - 06 Love & Joy.flac");
-    if !path.is_file() {
+    let Some(path) = crate::testdata::track("Surya Groxyn - Gakumas no Remix 2 - 06 Love & Joy")
+    else {
         return;
-    }
+    };
     let buf = crate::decode::decode_file(&path).expect("decode Love & Joy");
     let a = analyze(&buf, path.file_name().unwrap().to_str().unwrap()).expect("analyze");
     assert_eq!(
@@ -893,17 +892,15 @@ fn love_and_joy_intro_64_if_testdata_present() {
     );
 }
 
-/// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
+/// Optional local regression: the master is gitignored / not shipped; skip if absent.
 ///
 /// IVY enters its vocal main at 48 with RMS held but the machine hats stepping
 /// back (brightness tension drop); a later fill at 62 used to false-trigger 64.
 #[test]
 fn ivy_intro_48_if_testdata_present() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../testdata/AntonFer - Gakumas no Remix 2 - 02 IVY.flac");
-    if !path.is_file() {
+    let Some(path) = crate::testdata::track("AntonFer - Gakumas no Remix 2 - 02 IVY") else {
         return;
-    }
+    };
     let buf = crate::decode::decode_file(&path).expect("decode IVY");
     let a = analyze(&buf, path.file_name().unwrap().to_str().unwrap()).expect("analyze");
     assert_eq!(
@@ -913,14 +910,12 @@ fn ivy_intro_48_if_testdata_present() {
     );
 }
 
-/// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
+/// Optional local regression: the master is gitignored / not shipped; skip if absent.
 #[test]
 fn shirube_intro_48_if_testdata_present() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../testdata/DimsR - Gakumas no Remix 2 - 10 Shirube.flac");
-    if !path.is_file() {
+    let Some(path) = crate::testdata::track("DimsR - Gakumas no Remix 2 - 10 Shirube") else {
         return;
-    }
+    };
     let buf = crate::decode::decode_file(&path).expect("decode Shirube");
     let a = analyze(&buf, path.file_name().unwrap().to_str().unwrap()).expect("analyze");
     assert_eq!(
@@ -930,18 +925,16 @@ fn shirube_intro_48_if_testdata_present() {
     );
 }
 
-/// Optional local regression: real FLAC is gitignored / not shipped; skip if absent.
+/// Optional local regression: the master is gitignored / not shipped; skip if absent.
 ///
 /// Starmine enters main with a spectral shout at bar 47–48 (RMS barely moves);
 /// a quieter mid-main at 64 used to win on the long-cue path. Outro is 32 bars;
 /// a bright end-tag used to inflate the floor and report 48.
 #[test]
 fn starmine_intro_48_outro_32_if_testdata_present() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../testdata/Maks Sopian - Gakumas no Remix 2 - 07 Starmine.flac");
-    if !path.is_file() {
+    let Some(path) = crate::testdata::track("Maks Sopian - Gakumas no Remix 2 - 07 Starmine") else {
         return;
-    }
+    };
     let buf = crate::decode::decode_file(&path).expect("decode Starmine");
     let a = analyze(&buf, path.file_name().unwrap().to_str().unwrap()).expect("analyze");
     assert_eq!(
