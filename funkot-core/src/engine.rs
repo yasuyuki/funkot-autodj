@@ -12,7 +12,8 @@
 //! load. Realtime automatic transitions fall back to the nominal entry when the
 //! worker is late (no in-callback align); offline render still computes sync.
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -77,6 +78,9 @@ pub struct PreparedTrack {
     pub gain_linear: f32,
     /// Head-only preview for first live track; full buffer arrives via loader upgrade.
     pub preview: bool,
+    /// Labeling mode: only `first_downbeat..+head_secs` was decoded/stretched.
+    /// Implies `preview == true`; never receives an Upgrade.
+    pub head_only: bool,
 }
 
 /// Pure transition schedule in bars relative to T = previous track's outro start
@@ -603,6 +607,32 @@ fn retire_prepared(track: PreparedTrack) {
     thread::spawn(move || drop(track));
 }
 
+/// ラベリング中、アクティブデッキの先にいくつ head を用意しておくか。
+///
+/// Labeling's `⏭ 次の曲` can fire many times faster than a normal transition
+/// wait, so a single `next_track` slot is not enough runway — the loader
+/// cannot prepare a fresh head between two rapid taps. Kept as a small queue
+/// (`Engine::head_queue`) behind `next_track` so a burst of taps always has a
+/// ready track to cut to.
+///
+/// 10連打に2本の余裕。1本あたり 20 秒 head ≈ 7.7 MB（48 kHz ステレオ f32）。
+pub const HEAD_ONLY_PREFETCH: usize = 12;
+
+/// nav コマンドの容量。通常モードが持っていた 8 に、ラベリング中の
+/// 一斉連打ぶんを足しただけ。
+const NAV_QUEUE_CAP: usize = 8 + HEAD_ONLY_PREFETCH;
+
+/// Prefetch depth for the given options: `HEAD_ONLY_PREFETCH` in labeling
+/// mode, `0` (single-slot `next_track`, unchanged normal-mode behavior)
+/// otherwise.
+fn prefetch_depth_for(options: &EngineOptions) -> usize {
+    if options.head_only_secs.is_some() {
+        HEAD_ONLY_PREFETCH
+    } else {
+        0
+    }
+}
+
 /// Pull-based auto-DJ engine.
 pub struct Engine {
     options: EngineOptions,
@@ -614,6 +644,10 @@ pub struct Engine {
     loader_join: Option<JoinHandle<()>>,
     /// Next prepared track waiting to enter a transition (at most one).
     next_track: Option<PreparedTrack>,
+    /// Labeling-mode overflow behind `next_track`: extra prepared heads
+    /// waiting their turn. Always empty when `prefetch_depth() == 0`
+    /// (normal mode has no queue behind the single `next_track` slot).
+    head_queue: VecDeque<PreparedTrack>,
     /// Previous track kept for rewind (holds a loader permit while present).
     last_track: Option<PreparedTrack>,
     active: Option<Deck>,
@@ -674,12 +708,17 @@ impl Engine {
         let bar_frames = options.bar_frames();
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
-        // Capacity 3 for history + current + next, but only seed current+next
-        // until rewind history / in-transition prev actually exists.
-        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(3);
-        let _ = permit_tx.try_send(());
-        let _ = permit_tx.try_send(());
-        let (nav_tx, nav_rx) = mpsc::sync_channel::<NavAction>(8);
+        // Permit capacity is fixed at construction (no live labeling switch):
+        // 3 for history + current + next in normal mode, plus the labeling
+        // head queue's depth when `head_only_secs` is set. Only seed
+        // current+next (`2 + prefetch`) until rewind history / in-transition
+        // prev actually exists.
+        let prefetch = prefetch_depth_for(&options);
+        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(3 + prefetch);
+        for _ in 0..(2 + prefetch) {
+            let _ = permit_tx.try_send(());
+        }
+        let (nav_tx, nav_rx) = mpsc::sync_channel::<NavAction>(NAV_QUEUE_CAP);
 
         let opts = options.clone();
         let shutdown_flag = Arc::clone(&shutdown);
@@ -699,6 +738,7 @@ impl Engine {
             permit_tx,
             loader_join: Some(join),
             next_track: None,
+            head_queue: VecDeque::new(),
             last_track: None,
             active: None,
             prev: None,
@@ -742,8 +782,9 @@ impl Engine {
         let bar_frames = options.bar_frames();
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
-        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(3);
-        let (nav_tx, nav_rx) = mpsc::sync_channel::<NavAction>(8);
+        let prefetch = prefetch_depth_for(&options);
+        let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(3 + prefetch);
+        let (nav_tx, nav_rx) = mpsc::sync_channel::<NavAction>(NAV_QUEUE_CAP);
 
         let mut tracks = tracks;
         let first = (!tracks.is_empty()).then(|| tracks.remove(0));
@@ -754,7 +795,7 @@ impl Engine {
         // Slots already filled by first/second are not free for the loader.
         // Do not seed the history/prev spare until that slot exists (see
         // `arm_third_permit_if_needed`).
-        let initial_permits = 2usize
+        let initial_permits = (2 + prefetch)
             .saturating_sub(usize::from(first.is_some()))
             .saturating_sub(usize::from(second.is_some()));
         for _ in 0..initial_permits {
@@ -776,6 +817,7 @@ impl Engine {
             permit_tx,
             loader_join: Some(join),
             next_track: second,
+            head_queue: VecDeque::new(),
             last_track: None,
             active: None,
             prev: None,
@@ -839,7 +881,7 @@ impl Engine {
         // Still waiting for the first track (or between tracks): silence.
         if self.active.is_none() && self.prev.is_none() {
             self.drain_loader();
-            if let Some(track) = self.next_track.take() {
+            if let Some(track) = self.take_next() {
                 self.start_first(track);
             } else if self.loader_exhausted {
                 self.mark_finished();
@@ -866,12 +908,13 @@ impl Engine {
             self.poll_nav_tempo();
             self.poll_phase_align();
             self.kick_phase_align_if_needed();
+            self.tick_head_only();
             self.await_preview_upgrade();
             self.tick_pending_nav();
             self.maybe_start_or_update_transition();
 
             if self.active.is_none() && self.prev.is_none() {
-                if self.loader_exhausted && self.next_track.is_none() {
+                if self.loader_exhausted && self.ready_ahead() == 0 {
                     self.mark_finished();
                 }
                 for s in out[frames_done * 2..].iter_mut() {
@@ -899,6 +942,57 @@ impl Engine {
     /// transition start from a multi-frame render chunk.
     pub fn transition_frames_into(&self) -> Option<u64> {
         self.transition.as_ref().map(|t| t.frames_into)
+    }
+
+    /// Path of the track prepared to follow the active one, if any.
+    ///
+    /// `None` covers two distinct situations a host can't tell apart from this
+    /// call alone: the loader hasn't finished preparing a replacement yet, or
+    /// the prepared track has already been consumed by a transition. Use
+    /// [`Self::frames_until_transition`] alongside this if the distinction
+    /// matters (e.g. `Some(0)` with `next_track_path() == None` means "already
+    /// mixing in").
+    pub fn next_track_path(&self) -> Option<&Path> {
+        self.next_track.as_ref().map(|t| t.path.as_path())
+    }
+
+    /// Frames remaining on the active deck before it reaches its own outro
+    /// (i.e. before a transition to `next_track` may begin).
+    ///
+    /// `Some(0)` means "no more runway": a transition is already in progress,
+    /// or the active deck is past its outro start and just waiting on a
+    /// prepared next track. A plain `None` means "unknown" (no active deck at
+    /// all) — hosts should not treat it the same as `Some(0)`.
+    pub fn frames_until_transition(&self) -> Option<u64> {
+        let active = self.active.as_ref()?;
+        if self.transition.is_some() || self.awaiting_next_at_outro {
+            return Some(0);
+        }
+        Some(active.track.outro_start_out.saturating_sub(active.playhead))
+    }
+
+    /// Discard the prepared `next_track` and hand its path back to the caller.
+    ///
+    /// Lets a host reorder its own queue (e.g. the user picked a different
+    /// track to play next) without waiting for the current transition trigger.
+    /// Releases the loader permit the discarded track was holding, so the
+    /// loader should ask [`TrackSource::next`] for a replacement right away —
+    /// callers must not sit on the returned path expecting the slot to stay
+    /// empty. Also drops any in-flight phase-align result: that computation is
+    /// keyed to the (active, next_track) pair, and applying it to whatever
+    /// track fills the slot next would sync against the wrong track.
+    ///
+    /// Returns `None` when there is nothing to revoke — either the loader
+    /// hasn't prepared a next track yet, or one was already taken into a
+    /// transition. Either way there is nothing for the host to hand back to
+    /// its queue.
+    pub fn revoke_next(&mut self) -> Option<PathBuf> {
+        let track = self.take_next()?;
+        let path = track.path.clone();
+        self.clear_phase_align();
+        retire_prepared(track);
+        self.release_permit();
+        Some(path)
     }
 
     /// Cloneable sender for live hosts (audio callback owns the engine).
@@ -933,6 +1027,41 @@ impl Engine {
 
     fn release_permit(&self) {
         let _ = self.permit_tx.try_send(());
+    }
+
+    fn prefetch_depth(&self) -> usize {
+        prefetch_depth_for(&self.options)
+    }
+
+    /// 次に鳴る1本を取り出し、控えの先頭をその場に繰り上げる。連打中も
+    /// `next_track_path()` が空にならないのはこの繰り上げによる。
+    fn take_next(&mut self) -> Option<PreparedTrack> {
+        let track = self.next_track.take()?;
+        self.next_track = self.head_queue.pop_front();
+        Some(track)
+    }
+
+    /// 先頭へ差し戻す。押し出された1本は控えの先頭へ回る ——
+    /// ただし通常モードには控えが無いので、従来どおり permit を返して破棄する。
+    fn push_front_next(&mut self, track: PreparedTrack) {
+        if let Some(displaced) = self.next_track.replace(track) {
+            if self.prefetch_depth() == 0 {
+                self.release_permit();
+                retire_prepared(displaced);
+            } else {
+                self.head_queue.push_front(displaced);
+            }
+        }
+    }
+
+    /// 用意済みの本数（`next_track` を含む）。ホストとテストが先読みの深さを
+    /// 観測する唯一の窓。
+    pub fn ready_ahead(&self) -> usize {
+        debug_assert!(
+            self.next_track.is_some() || self.head_queue.is_empty(),
+            "head_queue must never hold tracks while the next slot is empty"
+        );
+        usize::from(self.next_track.is_some()) + self.head_queue.len()
     }
 
     /// Enable the third loader permit once a distinct history/prev buffer exists.
@@ -992,17 +1121,36 @@ impl Engine {
         self.phase_align_rx = None;
     }
 
+    /// Normal mode coalesces a burst of taps into the last one (the single
+    /// `next_track` slot has no runway for more). Labeling mode has the head
+    /// queue for exactly this burst, so every tap is applied in order instead.
     fn drain_nav_commands(&mut self) {
-        let mut last = None;
-        while let Ok(action) = self.nav_rx.try_recv() {
-            last = Some(action);
+        if self.prefetch_depth() == 0 {
+            let mut last = None;
+            while let Ok(action) = self.nav_rx.try_recv() {
+                last = Some(action);
+            }
+            if let Some(action) = last {
+                self.begin_nav(action);
+            }
+            return;
         }
-        if let Some(action) = last {
+        while let Ok(action) = self.nav_rx.try_recv() {
             self.begin_nav(action);
         }
     }
 
     fn begin_nav(&mut self, action: NavAction) {
+        // Labeling mode: a head-only deck has no fade material and no outro to
+        // schedule a bar-grid transition against, so any nav is a hard cut.
+        let action = match self.active.as_ref() {
+            Some(active) if active.track.head_only => match action {
+                NavAction::TransitionToNext => NavAction::JumpToNextIntro,
+                NavAction::TransitionToPrev => NavAction::JumpToPrevIntro,
+                other => other,
+            },
+            _ => action,
+        };
         if self.active.is_none() {
             return;
         }
@@ -1148,16 +1296,13 @@ impl Engine {
                 };
                 self.abort_active_transition();
                 if let Some(cur) = self.active.take() {
-                    if let Some(old_next) = self.next_track.replace(cur.track) {
-                        self.release_permit();
-                        retire_prepared(old_next);
-                    }
-                    // cur's permit moved into next_track.
+                    // cur's permit moved into next_track (or the head queue).
+                    self.push_front_next(cur.track);
                 }
                 self.start_first(prev);
             }
             NavAction::JumpToNextIntro => {
-                let Some(next) = self.next_track.take() else {
+                let Some(next) = self.take_next() else {
                     return;
                 };
                 self.abort_active_transition();
@@ -1182,7 +1327,7 @@ impl Engine {
                 Some(t) => t,
                 None => return,
             },
-            NavAction::TransitionToNext => match self.next_track.take() {
+            NavAction::TransitionToNext => match self.take_next() {
                 Some(t) => t,
                 None => return,
             },
@@ -1200,7 +1345,7 @@ impl Engine {
         let Some(active) = self.active.take() else {
             if !restart_same {
                 // Put next back where it came from if we can.
-                self.next_track = Some(next);
+                self.push_front_next(next);
             }
             return;
         };
@@ -1221,7 +1366,7 @@ impl Engine {
             self.poll_phase_align();
             match self.phase_align_ready.take() {
                 Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
-                _ => align_next_entry_with_phase_hypotheses(
+                _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
                     &active.track.samples,
                     active.playhead,
                     &next.samples,
@@ -1231,9 +1376,11 @@ impl Engine {
                     self.options.output_sample_rate,
                     beat_frames,
                 ),
+                _ => (nominal, 0),
             }
         };
         self.clear_phase_align();
+        let entry = if next.head_only { next.first_downbeat_out } else { entry };
         let entry = if next.frames == 0 {
             0
         } else {
@@ -1321,6 +1468,11 @@ impl Engine {
     /// On-time transitions use `prev_start = outro_start_out`. Delayed starts
     /// fall back to an in-callback compute when the playhead disagrees.
     fn kick_phase_align_if_needed(&mut self) {
+        if self.active.as_ref().is_some_and(|a| a.track.head_only)
+            || self.next_track.as_ref().is_some_and(|t| t.head_only)
+        {
+            return;
+        }
         if self.phase_align_rx.is_some() || self.phase_align_ready.is_some() {
             return;
         }
@@ -1386,6 +1538,11 @@ impl Engine {
                     if self.next_track.is_none() {
                         self.next_track = Some(track);
                         self.kick_phase_align_if_needed();
+                    } else if self.head_queue.len() < self.prefetch_depth() {
+                        // Labeling mode: park behind `next_track` until a
+                        // `take_next()` call (nav or natural advance) draws it
+                        // to the front.
+                        self.head_queue.push_back(track);
                     } else {
                         // Permit accounting bug: accepting this would bounce
                         // prepares forever. Drop the buffer and keep the permit
@@ -1449,8 +1606,47 @@ impl Engine {
     fn preview_exhausted_awaiting_upgrade(&self) -> bool {
         self.active
             .as_ref()
-            .map(|d| d.track.preview && d.playhead >= d.track.frames)
+            .map(|d| d.track.preview && !d.track.head_only && d.playhead >= d.track.frames)
             .unwrap_or(false)
+    }
+
+    /// Head-only labeling preview never gets an Upgrade. When its playhead
+    /// reaches the end of the (short) head window, loop back to the start
+    /// instead of falling into the Upgrade-wait or outro-transition paths,
+    /// which assume a full-length track is coming.
+    fn tick_head_only(&mut self) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if !active.track.head_only {
+            return;
+        }
+        if active.playhead < active.track.frames {
+            return;
+        }
+
+        if self.loader_exhausted && self.ready_ahead() == 0 {
+            // Last track in the playlist: finish, same as a normal track running out.
+            self.retire_active();
+            self.drop_prev();
+            self.mark_finished();
+            return;
+        }
+        if let Some(next) = self.next_track.as_ref() {
+            if !next.head_only {
+                // Labeling mode was just turned off: hand off to the upcoming
+                // full-length track via the existing hard-jump path instead of
+                // looping a track that will never be replaced.
+                self.execute_jump(NavAction::JumpToNextIntro);
+                return;
+            }
+        }
+        if let Some(active) = self.active.as_mut() {
+            active.playhead = active
+                .track
+                .first_downbeat_out
+                .min(active.track.frames.saturating_sub(1));
+        }
     }
 
     /// Wait (or not) until Upgrade replaces an exhausted head preview.
@@ -1470,7 +1666,7 @@ impl Engine {
             if self.loader_exhausted {
                 self.retire_active();
                 self.drop_prev();
-                if self.next_track.is_none() {
+                if self.ready_ahead() == 0 {
                     self.mark_finished();
                 }
             }
@@ -1488,7 +1684,7 @@ impl Engine {
             if self.loader_exhausted {
                 self.retire_active();
                 self.drop_prev();
-                if self.next_track.is_none() {
+                if self.ready_ahead() == 0 {
                     self.mark_finished();
                 }
                 return;
@@ -1588,12 +1784,12 @@ impl Engine {
 
     /// `bars_already_into_outro`: 0 for on-time start; >0 when delayed (O reduced).
     fn begin_transition(&mut self, bars_already_into_outro: u32) {
-        let next = match self.next_track.take() {
+        let next = match self.take_next() {
             Some(t) => t,
             None => return,
         };
         let Some(active) = self.active.take() else {
-            self.next_track = Some(next);
+            self.push_front_next(next);
             return;
         };
 
@@ -1611,8 +1807,8 @@ impl Engine {
         // Prefer the background align when it matches this trigger playhead.
         // Realtime hosts must not fall back to in-callback kick/hat search —
         // that stalls the audio thread under load (noise / dropouts). Offline
-        // render keeps the sync compute for bit-stable WAVs. Manual nav uses
-        // [`Self::begin_transition_to`] and is unchanged.
+        // render keeps the sync compute for bit-stable WAVs. Manual nav via
+        // [`Self::begin_transition_to`] uses the same realtime/offline policy.
         let (entry, prev_nudge) = match self.phase_align_ready.take() {
             Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
             _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
@@ -1628,6 +1824,7 @@ impl Engine {
             _ => (nominal, 0),
         };
         self.clear_phase_align();
+        let entry = if next.head_only { next.first_downbeat_out } else { entry };
         let entry = if next.frames == 0 {
             0
         } else {
@@ -1797,7 +1994,7 @@ impl Engine {
             // Stale prev must never outlive the transition.
             self.drop_prev();
             self.drain_loader();
-            if let Some(track) = self.next_track.take() {
+            if let Some(track) = self.take_next() {
                 self.start_first(track);
             } else if self.loader_exhausted {
                 self.mark_finished();
@@ -1921,6 +2118,8 @@ fn loader_main(
 ) {
     // First live track: head stretch → play, then full stretch upgrades in place.
     let mut first_live = true;
+    // Fixed for the life of the loader (no live labeling switch): read once.
+    let head_secs = options.head_only_secs;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -1948,12 +2147,12 @@ fn loader_main(
 
         let is_first = first_live;
         first_live = false;
-        if is_first {
+        if is_first && head_secs.is_none() {
             if !prepare_first_live(&options, &path, idx, &tx, &shutdown) {
                 return;
             }
         } else {
-            match prepare_one(&options, &path, idx) {
+            match prepare_one(&options, &path, idx, head_secs) {
                 Ok(track) => {
                     if !send_msg(&tx, LoaderMsg::Ready(track), &shutdown) {
                         return;
@@ -2011,8 +2210,47 @@ fn prepare_one(
     options: &EngineOptions,
     path: &std::path::Path,
     index: usize,
+    head_secs: Option<f64>,
 ) -> Result<PreparedTrack> {
-    prepare_track(options, path, index)
+    match head_secs {
+        Some(secs) => prepare_track_head_only(options, path, index, secs),
+        None => prepare_track(options, path, index),
+    }
+}
+
+/// Decode + head-only stretch for labeling mode: cheap enough to run for
+/// every track, unlike `prepare_track`'s full-track stretch. Never sends an
+/// Upgrade — the caller gets one Ready-equivalent PreparedTrack and that's it.
+pub fn prepare_track_head_only(
+    options: &EngineOptions,
+    path: &std::path::Path,
+    index: usize,
+    head_secs: f64,
+) -> Result<PreparedTrack> {
+    let buffer = decode::decode_file(path)?;
+    if buffer.frames == 0 {
+        return Err(Error::Engine("empty audio buffer".into()));
+    }
+    let (analysis, _used_provisional) =
+        cache::get_cached_or_provisional(path, &options.cache_dir, &buffer)?;
+
+    let head_frames = ((head_secs * f64::from(buffer.sample_rate)).round() as u64).max(1);
+    let start = analysis.first_downbeat.min(buffer.frames - 1);
+    let end = start.saturating_add(head_frames).min(buffer.frames);
+    let head = decode::AudioBuffer {
+        sample_rate: buffer.sample_rate,
+        frames: end - start,
+        samples: buffer.samples[start as usize * 2..end as usize * 2].to_vec(),
+    };
+
+    let mut head_analysis = analysis.clone();
+    head_analysis.first_downbeat = 0;
+
+    let track = finish_prepare(options, path, index, head, &head_analysis, true, true)?;
+    if track.frames == 0 {
+        return Err(Error::Engine("empty head window".into()));
+    }
+    Ok(track)
 }
 
 /// Seconds of *input* audio stretched before first live playback starts.
@@ -2068,7 +2306,7 @@ fn prepare_first_live(
             frames: head_frames,
             samples: buffer.samples[..head_frames as usize * 2].to_vec(),
         };
-        match finish_prepare(options, path, index, &head, &analysis, true) {
+        match finish_prepare(options, path, index, head, &analysis, true, false) {
             Ok(preview) => {
                 if !send_msg(tx, LoaderMsg::Ready(preview), shutdown) {
                     return false;
@@ -2109,7 +2347,10 @@ fn prepare_first_live(
         analysis
     };
 
-    let full = match finish_prepare(options, path, index, &buffer, &analysis, false) {
+    // Read before `finish_prepare` moves `buffer`; used below to pick the
+    // final message variant.
+    let total_frames = buffer.frames;
+    let full = match finish_prepare(options, path, index, buffer, &analysis, false, false) {
         Ok(t) => t,
         Err(e) => {
             return send_msg(
@@ -2124,7 +2365,7 @@ fn prepare_first_live(
     };
 
     // Short file: only one Ready (no separate preview). Long file: Upgrade.
-    let msg = if head_frames < buffer.frames {
+    let msg = if head_frames < total_frames {
         LoaderMsg::Upgrade(full)
     } else {
         LoaderMsg::Ready(full)
@@ -2142,16 +2383,17 @@ pub fn prepare_track(
 ) -> Result<PreparedTrack> {
     let buffer = decode::decode_file(path)?;
     let analysis = cache::get_or_analyze(path, &options.cache_dir, &buffer)?;
-    finish_prepare(options, path, index, &buffer, &analysis, false)
+    finish_prepare(options, path, index, buffer, &analysis, false, false)
 }
 
 fn finish_prepare(
     options: &EngineOptions,
     path: &std::path::Path,
     index: usize,
-    buffer: &decode::AudioBuffer,
+    buffer: decode::AudioBuffer,
     analysis: &crate::TrackAnalysis,
     preview: bool,
+    head_only: bool,
 ) -> Result<PreparedTrack> {
     // Stretch so intro BPM lands on target_bpm. For Funkot, outro_bpm ≈ intro_bpm.
     let intro_bpm = if analysis.intro_bpm.is_finite() && analysis.intro_bpm > 0.0 {
@@ -2161,15 +2403,25 @@ fn finish_prepare(
     };
     let speed = options.target_bpm() / intro_bpm;
 
-    let rendered = stretch::render_track(
-        &buffer.samples,
-        buffer.sample_rate,
+    // Take sample_rate/frames before moving `buffer.samples` so the decoded
+    // buffer can be dropped as soon as the stretch stage is done with it
+    // (see `stretch::render_track_owned`), instead of staying alive until the
+    // resample stage allocates its output.
+    let sample_rate = buffer.sample_rate;
+    let in_frames = buffer.frames;
+
+    let mut rendered = stretch::render_track_owned(
+        buffer.samples,
+        sample_rate,
         options.output_sample_rate,
         speed,
         options.pitch_mode,
     )?;
 
-    let in_frames = buffer.frames;
+    if head_only {
+        fade_out_tail(&mut rendered, (0.010 * options.output_sample_rate as f64) as usize);
+    }
+
     let out_frames = (rendered.len() / 2) as u64;
     let scale = position_scale(in_frames, out_frames);
     let bar_frames = options.bar_frames();
@@ -2193,7 +2445,7 @@ fn finish_prepare(
             analysis.first_downbeat,
             analysis.outro_start,
             intro_bpm,
-            buffer.sample_rate,
+            sample_rate,
             mapped_fd,
             mapped_outro,
             analysis.outro_bars,
@@ -2224,7 +2476,22 @@ fn finish_prepare(
         outro_bars: analysis.outro_bars,
         gain_linear,
         preview,
+        head_only,
     })
+}
+
+/// Linearly fades the last `tail_frames` frames of an interleaved-stereo
+/// buffer to silence, in place. So a looped head-only preview has no seam click.
+fn fade_out_tail(samples: &mut [f32], tail_frames: usize) {
+    let total_frames = samples.len() / 2;
+    let tail_frames = tail_frames.min(total_frames);
+    let start_frame = total_frames - tail_frames;
+    for i in 0..tail_frames {
+        let gain = 1.0 - (i as f32 + 1.0) / tail_frames as f32;
+        let idx = (start_frame + i) * 2;
+        samples[idx] *= gain;
+        samples[idx + 1] *= gain;
+    }
 }
 
 /// Prepare every playlist path, optionally in parallel.
@@ -3275,6 +3542,7 @@ mod tests {
             loop_playlist: false,
             output_sample_rate: sr,
             cache_dir: cache_dir.clone(),
+            head_only_secs: None,
         };
         let (tx, rx) = mpsc::sync_channel::<LoaderMsg>(1);
         let shutdown = AtomicBool::new(false);

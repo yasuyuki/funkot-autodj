@@ -18,7 +18,9 @@ use crate::{
 /// from the old conditional rule, which collapsed onto the structural
 /// boundary on tracks whose outro starts 64 bars from the end — the
 /// transition ran inside the outro there.
-pub const CACHE_VERSION: u32 = 10;
+/// 14: head/tail classify scores (`ClassifyScores`: z / z_ratio / half_ratio)
+/// are stored on `TrackAnalysis` so threshold retunes need no re-decode.
+pub const CACHE_VERSION: u32 = 14;
 
 const HASH_CHUNK: u64 = 64 * 1024;
 
@@ -71,12 +73,20 @@ fn cache_path(cache_dir: &Path, hash: &str) -> std::path::PathBuf {
 }
 
 /// Load a cached analysis. `None` if missing, unreadable, corrupt JSON, or version mismatch.
+///
+/// When `classify_scores` is present, `is_funkot` is re-derived via
+/// [`ClassifyScores::verdict`] so threshold retunes apply without rewriting
+/// disk or bumping [`CACHE_VERSION`]. Absent scores (pre-v14 / stripped) keep
+/// the stored bool.
 pub fn load(cache_dir: &Path, hash: &str) -> Option<TrackAnalysis> {
     let path = cache_path(cache_dir, hash);
     let data = fs::read_to_string(&path).ok()?;
-    let analysis: TrackAnalysis = serde_json::from_str(&data).ok()?;
+    let mut analysis: TrackAnalysis = serde_json::from_str(&data).ok()?;
     if analysis.version != CACHE_VERSION {
         return None;
+    }
+    if let Some(ref scores) = analysis.classify_scores {
+        analysis.is_funkot = scores.verdict();
     }
     Some(analysis)
 }
@@ -197,6 +207,9 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
         outro_bars_manual: outro_m,
         outro_structure_bars_manual: structure_m,
         needs_reanalysis: true,
+        // Placeholder until reanalysis; overwritten by `analyze`.
+        is_funkot: true,
+        classify_scores: None,
         rms_dbfs: TARGET_RMS_DBFS,
         gain_db: 0.0,
     };
@@ -464,6 +477,8 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         outro_bars_manual: false,
         outro_structure_bars_manual: false,
         needs_reanalysis: false,
+        is_funkot: true,
+        classify_scores: None,
         rms_dbfs: TARGET_RMS_DBFS,
         gain_db: 0.0,
     }
@@ -472,6 +487,7 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ClassifyScores;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn sample_analysis() -> TrackAnalysis {
@@ -495,6 +511,8 @@ mod tests {
             outro_bars_manual: false,
             outro_structure_bars_manual: false,
             needs_reanalysis: false,
+            is_funkot: true,
+            classify_scores: None,
             rms_dbfs: TARGET_RMS_DBFS,
             gain_db: 0.0,
         }
@@ -758,5 +776,31 @@ mod tests {
             Error::Cache(msg) => assert!(msg.contains("does-not-exist")),
             other => panic!("expected Error::Cache, got {other:?}"),
         }
+    }
+
+    /// Scores below the live cut must flip `is_funkot` on load even when the
+    /// JSON still says true (threshold retune without CACHE_VERSION bump).
+    #[test]
+    fn load_reapplies_verdict_from_classify_scores() {
+        let dir = TempDir::new("verdict-reload");
+        let hash = "hash-verdict-reload";
+        let mut analysis = sample_analysis();
+        analysis.is_funkot = true;
+        analysis.classify_scores = Some(ClassifyScores {
+            head_z: 9.0,
+            head_z_ratio: 1.0,
+            head_half_ratio: 0.8,
+            tail_z: 9.0,
+            tail_z_ratio: 1.0,
+            tail_half_ratio: 0.8,
+        });
+        store(dir.path(), hash, &analysis).unwrap();
+
+        let loaded = load(dir.path(), hash).expect("load");
+        assert!(
+            !loaded.is_funkot,
+            "z=9.0 is below CLASSIFY_MIN_Z 10.7; stored true must not win"
+        );
+        assert!(loaded.classify_scores.is_some());
     }
 }

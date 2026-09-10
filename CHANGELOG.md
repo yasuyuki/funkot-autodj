@@ -4,8 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Funkot classify thresholds retuned on 797 human labels (398 Funkot / 399 non-Funkot; 1 unlabeled excluded): `CLASSIFY_MIN_Z` 8.5→10.7, `CLASSIFY_MIN_Z_RATIO` 0.75→0.65, `CLASSIFY_MAX_HALF_RATIO` 1.40→1.43. On that set: 382/398 Funkot, 24/399 false positives (was 382/398 and 29/399 at the old cut). `CACHE_VERSION` stays 14; `cache::load` reapplies `ClassifyScores::verdict` so existing entries pick up the new cut without re-decode.
+
+### Added
+
+- Classification scores (`z` / `z_ratio` / `half_ratio` for head and tail) are kept on `TrackAnalysis::classify_scores`. `CACHE_VERSION` 13 → 14, so existing caches reanalyze. Thresholds and the `is_funkot` verdict are unchanged.
+
 ### Fixed
 
+- Live manual skip/rewind: realtime hosts no longer run kick/hat phase-align inside the audio callback when the worker result is late/mismatched (use nominal entry, same as automatic transitions).
+- `TrackAnalysis::is_funkot` no longer rejects most Funkot. The previous rule re-ran the BPM argmax over a wide 100–200 band and required both intro and outro to land in 172..=188; measured over 69 known-Funkot tracks from the old operational-test corpus (not ground truth) it passed only 23. The comb score it compared is a *mean* over `len / period` samples, so longer periods ride higher on noise and the argmax went to metrical-level aliases of 180 — observed landing sites were 135 (3/4), 120 (2/3) and 112.5 (5/8). The score is now normalised for its sample count, the grid period is judged against the best score in the band instead of by argmax, a half-tempo veto is applied, and one dead side no longer sinks a track. On that same operational-test corpus the new rule scored 69/69 / 60/63 / 20/261 false positives — superseded for accuracy reporting by the human-label figures under Changed. `CACHE_VERSION` 12 → 13, so existing caches reanalyze.
 - Outro floor sampling falls back to the lower quartile when a bright final fill spikes the near-end window (max ≫ median), so true 32-bar outros are no longer reported as 48 (Starmine). Purge auto-cache to refresh older analyses.
 - `--label-sections` guide clicks land on the music's beat. Outro candidates are counted back from `total_frames`, whose phase is whatever the master's last sample happened to be — measured over the real test set it is spread across the full ±0.5 beat, and on IVY it is +0.494 beat, i.e. every outro click was on the off-beat. Both sides' click grids are now phase-locked to the listening window itself (`analysis::lock_beat_phase`). Worst measured click-vs-music error over the sample tracks drops from 0.45 beat to 0.10 beat. Bar identity is unchanged: the lock never moves a boundary by half a beat or more.
 
@@ -13,6 +23,7 @@ All notable changes to this project are documented in this file.
 
 - `analysis::lock_beat_phase`: full-beat-period phase lock from a broadband spectral-flux onset comb, for markers whose phase is unknown a priori. Complements `refine_groove_phase`, which micro-aligns (±0.45 beat, low-band) markers that are already approximately right.
 - `funkot-cli` example `click_phase_diag`: prints, per track and candidate, the nominal vs. locked `--label-sections` boundary and the shift in beats. Headless (no audio device).
+- `funkot-core` example `classify_probe`: prints, per track, the three quantities `is_funkot` decides on and the verdict. Run it over the labeled playlists in `testdata/` before and after touching the classifier — the thresholds were chosen from that table and a change that helps one corpus usually costs another. Headless.
 
 - Engine `TrackSource` trait and `Engine::new_with_source`: the loader asks the host for each track instead of owning a fixed `Vec<PathBuf>`, so a host-owned queue can be appended to, reordered or trimmed without restarting playback. `Engine::new` is unchanged and now wraps the same default shuffle/loop behaviour.
 - `./cross-build.sh android` cross-builds `funkot-core` for `aarch64-linux-android` and packages a C-ABI SDK (`libfunkot_core.{so,a}`, `libc++_shared.so`, `include/funkot.h`) into `dist/android-arm64/`. Guards against dependency changes that break the NDK build.

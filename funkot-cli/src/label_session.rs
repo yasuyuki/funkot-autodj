@@ -1562,6 +1562,8 @@ mod tests {
             needs_reanalysis: false,
             rms_dbfs: -14.0,
             gain_db: 0.0,
+            is_funkot: true,
+            classify_scores: None,
         }
     }
 

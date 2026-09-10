@@ -1,5 +1,7 @@
 //! Offline whole-buffer time-stretch and resample helpers for the loader.
 
+use std::borrow::Cow;
+
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Async, Fft, FixedAsync, FixedSync, Resampler, SincInterpolationParameters,
@@ -148,6 +150,46 @@ pub fn render_track_with_config(
     mode: PitchMode,
     stretch_config: Option<StretchConfig>,
 ) -> Result<Vec<f32>> {
+    render_track_cow(
+        Cow::Borrowed(samples_interleaved_stereo),
+        in_rate,
+        out_rate,
+        speed,
+        mode,
+        stretch_config,
+    )
+}
+
+/// Like [`render_track`], but takes ownership of the input buffer so it can be
+/// dropped as soon as the stretch/resample pipeline no longer needs it,
+/// instead of staying alive for the caller's lifetime. This lowers peak
+/// memory when the caller has no further use for the decoded buffer (see
+/// [`render_preserve`]'s `drop(samples)`).
+pub fn render_track_owned(
+    samples_interleaved_stereo: Vec<f32>,
+    in_rate: u32,
+    out_rate: u32,
+    speed: f64,
+    mode: PitchMode,
+) -> Result<Vec<f32>> {
+    render_track_cow(
+        Cow::Owned(samples_interleaved_stereo),
+        in_rate,
+        out_rate,
+        speed,
+        mode,
+        None,
+    )
+}
+
+fn render_track_cow(
+    samples_interleaved_stereo: Cow<'_, [f32]>,
+    in_rate: u32,
+    out_rate: u32,
+    speed: f64,
+    mode: PitchMode,
+    stretch_config: Option<StretchConfig>,
+) -> Result<Vec<f32>> {
     if !samples_interleaved_stereo.len().is_multiple_of(2) {
         return Err(Error::Stretch(
             "input buffer length is not an even stereo frame count".into(),
@@ -176,7 +218,7 @@ pub fn render_track_with_config(
 }
 
 fn render_preserve(
-    samples: &[f32],
+    samples: Cow<'_, [f32]>,
     in_rate: u32,
     out_rate: u32,
     speed: f64,
@@ -184,9 +226,17 @@ fn render_preserve(
 ) -> Result<Vec<f32>> {
     // Tempo change at the input rate (pitch preserved), then rate convert.
     let stretched = if (speed - 1.0).abs() < 1e-12 {
-        samples.to_vec()
+        samples.into_owned()
     } else {
-        time_stretch(samples, in_rate, speed, stretch_config)?
+        let stretched = time_stretch(&samples, in_rate, speed, stretch_config)?;
+        // Release the pre-stretch buffer now that `time_stretch` has produced
+        // its own (separately allocated) output, instead of holding it alive
+        // until `resample_fixed_rates` below allocates its output. When
+        // `samples` owns the decoded track (Cow::Owned), this is what keeps
+        // peak memory to two live whole-track buffers instead of three; for a
+        // borrowed slice this only drops the reference.
+        drop(samples);
+        stretched
     };
 
     if in_rate == out_rate {
@@ -196,7 +246,12 @@ fn render_preserve(
     }
 }
 
-fn render_shift(samples: &[f32], in_rate: u32, out_rate: u32, speed: f64) -> Result<Vec<f32>> {
+fn render_shift(
+    samples: Cow<'_, [f32]>,
+    in_rate: u32,
+    out_rate: u32,
+    speed: f64,
+) -> Result<Vec<f32>> {
     // Combined ratio: out_rate / (in_rate * speed).
     let ratio = f64::from(out_rate) / (f64::from(in_rate) * speed);
     resample_ratio(samples, ratio)
@@ -261,12 +316,12 @@ fn resample_fixed_rates(samples: &[f32], in_rate: u32, out_rate: u32) -> Result<
 }
 
 /// Arbitrary-ratio resample (used for [`PitchMode::Shift`] combined speed+rate).
-fn resample_ratio(samples: &[f32], ratio: f64) -> Result<Vec<f32>> {
+fn resample_ratio(samples: Cow<'_, [f32]>, ratio: f64) -> Result<Vec<f32>> {
     if !(ratio.is_finite() && ratio > 0.0) {
         return Err(Error::Stretch(format!("invalid resample ratio: {ratio}")));
     }
     if (ratio - 1.0).abs() < 1e-12 {
-        return Ok(samples.to_vec());
+        return Ok(samples.into_owned());
     }
 
     let in_frames = samples.len() / 2;
@@ -277,7 +332,7 @@ fn resample_ratio(samples: &[f32], ratio: f64) -> Result<Vec<f32>> {
     let mut resampler = Async::<f32>::new_sinc(ratio, 1.1, &params, 1024, 2, FixedAsync::Input)
         .map_err(|e| Error::Stretch(format!("rubato Async::new_sinc: {e}")))?;
 
-    let input = InterleavedSlice::new(samples, 2, in_frames)
+    let input = InterleavedSlice::new(&samples, 2, in_frames)
         .map_err(|e| Error::Stretch(format!("interleaved input: {e}")))?;
     let output = resampler
         .process_all(&input, in_frames, None)

@@ -59,6 +59,46 @@ pub const FALLBACK_BARS: u32 = 64;
 /// Reference loudness for RMS gain normalization, in dBFS.
 pub const TARGET_RMS_DBFS: f64 = -14.0;
 
+/// Head/tail lock scores that [`analysis::classify_is_funkot`] decides on.
+///
+/// `half_ratio` is `+inf` when that side's grid carries no signal; JSON stores
+/// non-finite values as `null` (see [`serde_inf_f64`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClassifyScores {
+    pub head_z: f64,
+    pub head_z_ratio: f64,
+    /// `+inf` when the head grid carries no signal. JSON `null`.
+    #[serde(with = "serde_inf_f64")]
+    pub head_half_ratio: f64,
+    pub tail_z: f64,
+    pub tail_z_ratio: f64,
+    #[serde(with = "serde_inf_f64")]
+    pub tail_half_ratio: f64,
+}
+
+/// serde_json rejects `f64::INFINITY`; map non-finite ↔ JSON `null`.
+mod serde_inf_f64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(v: &f64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if v.is_finite() {
+            serializer.serialize_f64(*v)
+        } else {
+            serializer.serialize_none()
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<f64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::INFINITY))
+    }
+}
+
 /// Result of the one-time per-track analysis. Serialized as JSON into the
 /// cache directory; users may hand-edit any field (e.g. `intro_bars`).
 ///
@@ -155,6 +195,16 @@ pub struct TrackAnalysis {
     /// Auto fields were stripped; next load reanalyzes and merges manual bars.
     #[serde(default)]
     pub needs_reanalysis: bool,
+    /// `true` when the low-band onsets lock hard enough onto the 172–188 BPM
+    /// grid on at least one of intro/outro, and neither side looks like a
+    /// half-tempo pulse read as its own double. See
+    /// `analysis::classify_is_funkot` for the three tests and the measured
+    /// thresholds; the scores live in [`Self::classify_scores`].
+    pub is_funkot: bool,
+    /// Head/tail lock scores `classify_is_funkot` decides on.
+    /// `None` on pre-v14 cache entries and on stripped/provisional analyses.
+    #[serde(default)]
+    pub classify_scores: Option<ClassifyScores>,
     /// Measured RMS loudness of the whole analyzed material, in dBFS.
     pub rms_dbfs: f64,
     /// Gain in dB to reach [`TARGET_RMS_DBFS`]. Applied unless disabled.
@@ -195,6 +245,13 @@ pub struct EngineOptions {
     pub output_sample_rate: u32,
     /// Directory for analysis cache JSON files.
     pub cache_dir: std::path::PathBuf,
+    /// Labeling mode (head-only prepare): `Some(secs)` decodes/stretches only
+    /// `first_downbeat..+secs` of every track instead of the full length. Not
+    /// part of the serialized config (CLI/JSON compatibility is unaffected).
+    /// Fixed at `Engine` construction — there is no live switch; changing it
+    /// requires restarting the engine.
+    #[serde(skip)]
+    pub head_only_secs: Option<f64>,
 }
 
 impl Default for EngineOptions {
@@ -209,6 +266,7 @@ impl Default for EngineOptions {
             loop_playlist: true,
             output_sample_rate: 48_000,
             cache_dir: std::path::PathBuf::from("funkot-cache"),
+            head_only_secs: None,
         }
     }
 }
@@ -265,3 +323,80 @@ impl From<std::io::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod classify_scores_serde_tests {
+    use super::*;
+
+    fn minimal_analysis(scores: Option<ClassifyScores>) -> TrackAnalysis {
+        TrackAnalysis {
+            version: 14,
+            file_name: "t.wav".into(),
+            sample_rate: 44_100,
+            total_frames: 1000,
+            intro_bpm: 180.0,
+            outro_bpm: 180.0,
+            first_downbeat: 0,
+            outro_start: 0,
+            intro_bars: 16,
+            track_bars: 64,
+            outro_bars: 16,
+            outro_structure_bars: 16,
+            bars_estimated_low_confidence: false,
+            intro_bars_low_confidence: false,
+            outro_bars_low_confidence: false,
+            intro_bars_manual: false,
+            outro_bars_manual: false,
+            outro_structure_bars_manual: false,
+            needs_reanalysis: false,
+            is_funkot: true,
+            classify_scores: scores,
+            rms_dbfs: -14.0,
+            gain_db: 0.0,
+        }
+    }
+
+    #[test]
+    fn inf_half_ratio_roundtrips_as_null() {
+        let scores = ClassifyScores {
+            head_z: 10.0,
+            head_z_ratio: 1.0,
+            head_half_ratio: f64::INFINITY,
+            tail_z: 9.0,
+            tail_z_ratio: 0.9,
+            tail_half_ratio: 0.5,
+        };
+        let a = minimal_analysis(Some(scores));
+        let json = serde_json::to_string(&a).expect("serialize");
+        assert!(
+            json.contains("null"),
+            "expected null for inf half_ratio, got {json}"
+        );
+        let back: TrackAnalysis = serde_json::from_str(&json).expect("deserialize");
+        let s = back.classify_scores.expect("scores");
+        assert!(s.head_half_ratio.is_infinite() && s.head_half_ratio.is_sign_positive());
+        assert!((s.tail_half_ratio - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn missing_classify_scores_deserializes_as_none() {
+        let json = r#"{
+            "version": 14,
+            "file_name": "t.wav",
+            "sample_rate": 44100,
+            "total_frames": 1000,
+            "intro_bpm": 180.0,
+            "outro_bpm": 180.0,
+            "first_downbeat": 0,
+            "outro_start": 0,
+            "intro_bars": 16,
+            "outro_bars": 16,
+            "bars_estimated_low_confidence": false,
+            "is_funkot": true,
+            "rms_dbfs": -14.0,
+            "gain_db": 0.0
+        }"#;
+        let a: TrackAnalysis = serde_json::from_str(json).expect("deserialize");
+        assert!(a.classify_scores.is_none());
+    }
+}

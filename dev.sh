@@ -47,7 +47,19 @@ fi
 : "${CARGO_INCREMENTAL:=1}"
 
 # Skip named volume /work/target (multi-GB); only fix bind-mount ownership.
-CHOWN_WORK='find /work -mindepth 1 -maxdepth 1 ! -name target -exec chown -R "$HOST_UID:$HOST_GID" {} + 2>/dev/null || true'
+#
+# Only do this under rootful Docker. Under rootless Docker, container UID 0
+# already *is* the invoking host user, and any other container UID (such as
+# $HOST_UID) is remapped through /etc/subuid to a disjoint high host UID
+# range -- chown-ing to "$HOST_UID:$HOST_GID" there does not restore the
+# invoking user's ownership, it reassigns everything to that subuid-mapped
+# id and locks the invoking user out instead.
+if docker info --format '{{range .SecurityOptions}}{{.}}{{"\n"}}{{end}}' 2>/dev/null \
+    | grep -qx 'name=rootless'; then
+    CHOWN_WORK=':'
+else
+    CHOWN_WORK='find /work -mindepth 1 -maxdepth 1 ! -name target -exec chown -R "$HOST_UID:$HOST_GID" {} + 2>/dev/null || true'
+fi
 
 # The container runs as root; hand ownership of anything it wrote in the
 # mounted workspace (Cargo.lock, testdata, ...) back to the invoking user.
