@@ -12,6 +12,14 @@ use crate::engine::{Engine, EngineEvent};
 use crate::{EngineOptions, PitchMode};
 
 /// Opaque engine handle for C hosts.
+///
+/// A handle has one owner: no two exported functions may run concurrently on
+/// the same handle. In particular, [`funkot_engine_render`] is mutually
+/// exclusive with polling, stopping, and freeing. Render is the only operation
+/// intended for an audio callback; the other operations belong on a control
+/// thread. `stop` signals the loader and detaches any in-flight preparation,
+/// so it does not wait for preparation to finish. `free` implies `stop` and
+/// invalidates the pointer immediately.
 pub struct FunkotEngine {
     engine: Engine,
     events: VecDeque<EngineEvent>,
@@ -275,6 +283,7 @@ pub unsafe extern "C" fn funkot_engine_new(
 /// # Safety
 /// - `engine` must be null or a pointer from [`funkot_engine_new`].
 /// - `out` must be null or point to at least `max_frames * 2` writable floats.
+/// - No other exported function may run concurrently on this `engine`.
 #[no_mangle]
 pub unsafe extern "C" fn funkot_engine_render(
     engine: *mut FunkotEngine,
@@ -301,6 +310,7 @@ pub unsafe extern "C" fn funkot_engine_render(
 /// # Safety
 /// - `engine` must be null or a pointer from [`funkot_engine_new`].
 /// - `event` must be null or point to a valid `FunkotEvent`.
+/// - No other exported function may run concurrently on this `engine`.
 #[no_mangle]
 pub unsafe extern "C" fn funkot_engine_poll_event(
     engine: *mut FunkotEngine,
@@ -327,9 +337,11 @@ pub unsafe extern "C" fn funkot_engine_poll_event(
 }
 
 /// Stop playback and detach the loader thread (prepare in flight may finish in background).
+/// This is a control-thread operation, not an audio-callback operation.
 ///
 /// # Safety
-/// `engine` must be null or a pointer from [`funkot_engine_new`].
+/// - `engine` must be null or a pointer from [`funkot_engine_new`].
+/// - No other exported function may run concurrently on this `engine`.
 #[no_mangle]
 pub unsafe extern "C" fn funkot_engine_stop(engine: *mut FunkotEngine) {
     if engine.is_null() {
@@ -346,8 +358,9 @@ pub unsafe extern "C" fn funkot_engine_stop(engine: *mut FunkotEngine) {
 /// Destroy the engine (implies stop). NULL-safe.
 ///
 /// # Safety
-/// `engine` must be null or a unique pointer previously returned by
-/// [`funkot_engine_new`] that has not already been freed.
+/// - `engine` must be null or a unique pointer previously returned by
+///   [`funkot_engine_new`] that has not already been freed.
+/// - No other exported function may run concurrently on this `engine`.
 #[no_mangle]
 pub unsafe extern "C" fn funkot_engine_free(engine: *mut FunkotEngine) {
     if engine.is_null() {

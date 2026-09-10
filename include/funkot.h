@@ -10,6 +10,18 @@ extern "C" {
 
 typedef struct FunkotEngine FunkotEngine; /* opaque */
 
+/*
+ * A handle has one owner. Do not call any function concurrently on the same
+ * handle: render is mutually exclusive with poll_event, stop, and free, and
+ * free is valid only once. The paths and cache_dir passed to new are copied
+ * during creation; they need only remain valid for that call.
+ *
+ * render is the only handle operation suitable for an audio callback. Call
+ * poll_event, stop, and free from a control thread. stop signals the loader
+ * and detaches any in-flight preparation; it does not wait for that work to
+ * complete. free implies stop and invalidates the handle immediately.
+ */
+
 typedef struct FunkotOptions {
     double   rate;               /* speed-up factor, default 1.10 */
     int32_t  pitch_shift;        /* 0 = preserve pitch, 1 = shift */
@@ -60,10 +72,10 @@ size_t funkot_engine_render(FunkotEngine* engine, float* out, size_t max_frames)
 /* Pop one pending event. Returns 1 and fills *event, or 0 if none pending. */
 int32_t funkot_engine_poll_event(FunkotEngine* engine, FunkotEvent* event);
 
-/* Stop playback and join the loader thread. */
+/* Stop playback; see the handle ownership and threading contract above. */
 void funkot_engine_stop(FunkotEngine* engine);
 
-/* Destroy the engine (implies stop). NULL-safe. */
+/* Destroy the engine (implies stop). NULL-safe; no later call may use it. */
 void funkot_engine_free(FunkotEngine* engine);
 
 #ifdef __cplusplus
