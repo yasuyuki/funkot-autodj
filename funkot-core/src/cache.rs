@@ -1178,7 +1178,12 @@ mod tests {
         assert!(result.intro_bars_manual && result.outro_structure_bars_manual);
         assert_eq!((result.intro_bars, result.outro_structure_bars), (12, 16));
         assert!(!result.needs_reanalysis);
-        assert_eq!(result, load(dir.path(), &hash).unwrap());
+        // Compare the persisted representation: the default JSON f64 parser
+        // need not reproduce every in-memory analysis bit on every platform.
+        let persisted: TrackAnalysis = serde_json::from_slice(
+            &serde_json::to_vec_pretty(&result).unwrap(),
+        ).unwrap();
+        assert_eq!(persisted, load(dir.path(), &hash).unwrap());
     }
 
     #[test]
