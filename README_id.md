@@ -116,7 +116,9 @@ konversi.
 Sebelum putar pertama, hanya awal dan akhir tiap track dianalisis; hasil
 disimpan sebagai JSON dengan kunci hash isi file di `--cache-dir`. Jika
 estimasi otomatis `intro_bars` / `outro_bars` meleset, edit JSON secara
-manual untuk override (jika estimasi kurang yakin, fallback ke 64 bar dengan
+manual lalu set `intro_bars_manual` / `outro_bars_manual` yang sesuai ke
+`true` (default `false`). Sisi yang manual tetap dipertahankan oleh
+`--purge-auto-cache` dan reanalisis. Jika estimasi kurang yakin, fallback ke 64 bar dengan
 `bars_estimated_low_confidence: true`. Flag per sisi
 `intro_bars_low_confidence` / `outro_bars_low_confidence` juga dicatat.
 Jika kedua sisi high-confidence, `intro < outro` tetap dipertahankan
@@ -124,7 +126,35 @@ Jika kedua sisi high-confidence, `intro < outro` tetap dipertahankan
 Jika hanya mengubah `outro_bars`, sesuaikan juga `outro_start` =
 `total_frames − outro_bars × bar_len` (tidak dihitung ulang saat load).
 Perubahan format cache menaikkan `version` dan menonaktifkan JSON lama
-(saat ini v9).
+(saat ini v14). Cache v14 juga menyimpan score classify; verdict dihitung
+ulang saat load agar perubahan ambang berlaku tanpa decode ulang.
+
+`outro_structure_bars` adalah batas struktur yang terdengar; `outro_bars`
+adalah pemicu transisi, diturunkan dari batas itu dengan lead-in sesuai panjang
+intro dan track. Untuk mengoreksi batas struktur, gunakan
+`outro_structure_bars_manual`; flag ini dan `outro_bars_manual` saling eksklusif.
+Pemicu manual yang lebih pendek juga membatasi struktur agar
+`outro_structure_bars <= outro_bars`. Editor player memakai API cache agar
+nilai, flag, dan posisi pemicu disimpan bersama. JSON hanya boleh diedit langsung
+ketika semua proses yang memakai cache itu sudah berhenti.
+
+Klasifikasi Funkot menyimpan score head/tail (`z`, `z_ratio`, `half_ratio`) di
+`classify_scores`. `is_funkot` dievaluasi ulang saat load; entry tanpa score tetap
+memakai verdict yang tersimpan. Klasifikasi dan nilai fallback tidak diubah oleh
+mekanisme penyimpanan cache. Detail keamanan, manual data, dan batas durabilitas:
+[docs/local-data.md](docs/local-data.md).
+
+Opsi startup:
+
+- `--purge-auto-cache` — hapus entry tanpa flag manual; entry yang memiliki
+  setidaknya satu flag manual mempertahankan nilai manual, menghapus field
+  otomatis, lalu diberi `needs_reanalysis: true`
+- `--fill-missing-cache` — hanya analisis ulang track dengan cache hilang atau
+  `needs_reanalysis`, lalu keluar; cache lengkap dilewati
+
+```sh
+funkot-autodj -l playlist.txt --purge-auto-cache --fill-missing-cache
+```
 
 ## Struktur
 

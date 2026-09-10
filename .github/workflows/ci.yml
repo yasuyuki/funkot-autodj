@@ -1,11 +1,17 @@
 name: CI
 
 on:
-  # At most ~2×/day when master moved; always on release tags.
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
   schedule:
     - cron: "0 */12 * * *"
-  push:
-    tags: ["v*"]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +19,7 @@ env:
 
 jobs:
   gate:
-    name: gate
+    name: schedule gate
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.check.outputs.run }}
@@ -22,13 +28,11 @@ jobs:
         with:
           fetch-depth: 0
       - id: check
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" != "schedule" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # schedule: only if master got a commit in the last 12h
-          if git log --since="12 hours ago" -1 --pretty=%H | grep -q .; then
+          elif git log master --since="12 hours ago" -1 --pretty=%H | grep -q .; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -42,124 +46,117 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-
       - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            g++ libclang-dev pkg-config libasound2-dev
-
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++ libclang-dev pkg-config libasound2-dev
       - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-
+        with: { toolchain: "${{ env.RUST_VERSION }}" }
       - uses: Swatinem/rust-cache@v2
+      - name: Check event gate
+        run: python3 scripts/test-ci-gate.py
+      - name: Check README cache-version claims
+        run: ./scripts/check-readme-cache-version.sh
+      - name: cargo test --locked --workspace --release
+        env: { CARGO_PROFILE_RELEASE_LTO: "false", RUST_TEST_THREADS: "1" }
+        run: cargo test --locked --workspace --release
 
-      - name: cargo test --workspace --release
-        # Skip thin LTO for test binaries only; build job keeps workspace LTO.
-        env:
-          CARGO_PROFILE_RELEASE_LTO: "false"
-        run: cargo test --workspace --release
-
-  build:
-    name: build (${{ matrix.artifact }})
+  windows-cache:
+    name: cache tests (windows)
     needs: [gate]
     if: needs.gate.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install LLVM (for bindgen)
+        shell: pwsh
+        run: |
+          $ver = "18.1.8"; $installer = Join-Path $env:RUNNER_TEMP "LLVM-$ver-win64.exe"; $dest = Join-Path $env:RUNNER_TEMP "llvm-$ver"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-win64.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/S","/D=$dest" -Wait
+          $llvmBin = Join-Path $dest "bin"
+          if (-not (Test-Path (Join-Path $llvmBin "libclang.dll"))) { throw "libclang.dll not found after LLVM install" }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvmBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "${{ env.RUST_VERSION }}" }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: windows-cache-tests }
+      - name: cargo test --locked cache unit tests
+        env: { CARGO_PROFILE_RELEASE_LTO: "false" }
+        run: cargo test --locked -p funkot-core --release cache::tests
+
+  dependency-policy:
+    name: dependency policy
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: advisories licenses sources
+          arguments: --locked
+
+  package:
+    name: package (${{ matrix.artifact }})
+    needs: [gate, test, windows-cache, dependency-policy]
+    if: >-
+      needs.gate.outputs.run == 'true' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            artifact: linux-x64
-          - os: windows-latest
-            artifact: windows-x64
-          - os: macos-latest
-            artifact: macos-arm64
+          - { os: ubuntu-latest, artifact: linux-x64 }
+          - { os: windows-latest, artifact: windows-x64 }
+          - { os: macos-latest, artifact: macos-arm64 }
     steps:
       - uses: actions/checkout@v5
-
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            g++ libclang-dev pkg-config libasound2-dev zip
-
-      # Avoid KyleMayes/install-llvm-action@v2 (still declares Node.js 20; GitHub
-      # forces Node 24 and emits a deprecation warning). Install the same LLVM 18
-      # win64 package the action would fetch, for bindgen's libclang only.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++ libclang-dev pkg-config libasound2-dev zip
       - name: Install LLVM (Windows, for bindgen)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ver = "18.1.8"
-          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$ver-win64.exe"
-          $dest = Join-Path $env:RUNNER_TEMP "llvm-$ver"
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-win64.exe"
-          Invoke-WebRequest -Uri $url -OutFile $installer
-          # NSIS: /D= must be last and unquoted; use a path without spaces.
+          $ver = "18.1.8"; $installer = Join-Path $env:RUNNER_TEMP "LLVM-$ver-win64.exe"; $dest = Join-Path $env:RUNNER_TEMP "llvm-$ver"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-win64.exe" -OutFile $installer
           Start-Process -FilePath $installer -ArgumentList "/S","/D=$dest" -Wait
           $llvmBin = Join-Path $dest "bin"
-          if (-not (Test-Path (Join-Path $llvmBin "libclang.dll"))) {
-            throw "libclang.dll not found under $llvmBin after LLVM install"
-          }
+          if (-not (Test-Path (Join-Path $llvmBin "libclang.dll"))) { throw "libclang.dll not found after LLVM install" }
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvmBin"
           Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
-
       - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-
+        with: { toolchain: "${{ env.RUST_VERSION }}" }
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: build-${{ matrix.artifact }}
-
-      - name: cargo build --workspace --release
-        run: cargo build --workspace --release
-
-      - name: Package CLI and SDK (Linux)
-        if: runner.os == 'Linux'
+        with: { key: "package-${{ matrix.artifact }}" }
+      - name: cargo build --locked --workspace --release
+        run: cargo build --locked --workspace --release
+      - name: Package CLI and SDK (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          zip -j "dist/funkot-autodj-${{ matrix.artifact }}.zip" \
-            target/release/funkot-autodj
-          zip -j "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip" \
-            target/release/libfunkot_core.so \
-            target/release/libfunkot_core.a \
-            include/funkot.h
-
+          zip -j "dist/funkot-autodj-${{ matrix.artifact }}.zip" target/release/funkot-autodj
+          zip -j "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip" target/release/libfunkot_core.a include/funkot.h
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            zip -j "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip" target/release/libfunkot_core.so
+          else
+            zip -j "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip" target/release/libfunkot_core.dylib
+          fi
       - name: Package CLI and SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $src = "target/release"
-          $cli = "dist/cli"
-          $sdk = "dist/sdk"
-          New-Item -ItemType Directory -Force -Path $cli, $sdk | Out-Null
-          Copy-Item "$src/funkot-autodj.exe" $cli/
-          Copy-Item "$src/funkot_core.dll" $sdk/
-          Copy-Item "include/funkot.h" $sdk/
-          foreach ($f in @("funkot_core.dll.lib", "funkot_core.lib")) {
-            if (Test-Path "$src/$f") { Copy-Item "$src/$f" $sdk/ }
-          }
-          Compress-Archive -Path "$cli/*" -DestinationPath "dist/funkot-autodj-${{ matrix.artifact }}.zip"
-          Compress-Archive -Path "$sdk/*" -DestinationPath "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip"
-          Remove-Item -Recurse -Force $cli, $sdk
-
-      - name: Package CLI and SDK (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p dist
-          zip -j "dist/funkot-autodj-${{ matrix.artifact }}.zip" \
-            target/release/funkot-autodj
-          zip -j "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip" \
-            target/release/libfunkot_core.dylib \
-            target/release/libfunkot_core.a \
-            include/funkot.h
-
+          New-Item -ItemType Directory -Force -Path dist,dist/cli,dist/sdk | Out-Null
+          Copy-Item target/release/funkot-autodj.exe dist/cli/; Copy-Item target/release/funkot_core.dll,include/funkot.h dist/sdk/
+          Get-ChildItem target/release -Filter 'funkot_core*.lib' | Copy-Item -Destination dist/sdk/
+          Compress-Archive -Path dist/cli/* -DestinationPath "dist/funkot-autodj-${{ matrix.artifact }}.zip"
+          Compress-Archive -Path dist/sdk/* -DestinationPath "dist/funkot-autodj-sdk-${{ matrix.artifact }}.zip"
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
@@ -168,22 +165,16 @@ jobs:
 
   release:
     name: release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v6
-        with:
-          path: artifacts
-
+        with: { path: artifacts }
       - name: Collect zip assets
-        run: |
-          mkdir -p release-assets
-          find artifacts -type f -name '*.zip' -exec cp -t release-assets {} +
-          ls -la release-assets
-
+        run: mkdir -p release-assets && find artifacts -type f -name '*.zip' -exec cp -t release-assets {} +
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
