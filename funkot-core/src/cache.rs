@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, Once};
 
 use sha2::{Digest, Sha256};
 
@@ -155,11 +156,31 @@ fn load_for_analysis(cache_dir: &Path, hash: &str) -> Result<Option<TrackAnalysi
 
 const WRITE_LOCK: &str = ".write.lock";
 
+/// Serializes this process's cache writers on every target. The file lock below
+/// widens that to other processes wherever the OS has one to give; Android does
+/// not, and there this mutex is the whole guarantee.
+static WRITE_TURN: Mutex<()> = Mutex::new(());
+
+/// Whether a target has file locks is a property of the build, not of one write.
+static UNLOCKED_NOTICE: Once = Once::new();
+
+/// `File::lock`, with a seam so tests can reproduce a target that has none.
+fn lock_file(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(kind) = LOCK_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::new(kind, "injected lock failure"));
+    }
+    file.lock()
+}
+
 /// A separate, persistent inode/handle serializes cooperating threads/processes.
 /// Never remove/replace this file while this cache can be in use. JSON readers
 /// need no lock. All of this I/O belongs on control/loader threads, not render.
 struct CacheWriter {
-    _lock: fs::File,
+    // Declared first so the file lock is released before the next writer in
+    // this process is admitted.
+    _lock: Option<fs::File>,
+    _turn: MutexGuard<'static, ()>,
 }
 
 impl CacheWriter {
@@ -167,13 +188,30 @@ impl CacheWriter {
         fs::create_dir_all(cache_dir).map_err(|e| {
             Error::Cache(format!("cannot create cache dir '{}': {e}", cache_dir.display()))
         })?;
+        // Taken before the file lock: it has to cover the same read-modify-write,
+        // and it is the only ordering left where the file lock is unavailable.
+        let turn = WRITE_TURN.lock().unwrap_or_else(|e| e.into_inner());
         let path = cache_dir.join(WRITE_LOCK);
         let file = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
             .open(&path)
             .map_err(|e| Error::Cache(format!("cannot open cache lock '{}': {e}", path.display())))?;
-        file.lock()
-            .map_err(|e| Error::Cache(format!("cannot lock cache '{}': {e}", path.display())))?;
-        Ok(Self { _lock: file })
+        let held = match lock_file(&file) {
+            Ok(()) => true,
+            // Android answers `Unsupported`. Refusing the write there left every
+            // track that still needed analysis unplayable, so keep writing with
+            // in-process serialization only; a second process would not be held off.
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                let (shown, reason) = (path.display().to_string(), e.to_string());
+                UNLOCKED_NOTICE.call_once(|| {
+                    log::warn!("no cross-process cache lock ('{shown}': {reason}); serializing writes in this process only");
+                });
+                false
+            }
+            Err(e) => {
+                return Err(Error::Cache(format!("cannot lock cache '{}': {e}", path.display())))
+            }
+        };
+        Ok(Self { _lock: held.then_some(file), _turn: turn })
     }
 
     fn write(&self, path: &Path, analysis: &TrackAnalysis) -> Result<()> {
@@ -672,6 +710,7 @@ enum WriteStage { DuringWrite, BeforeReplace }
 thread_local! {
     static BEFORE_ANALYSIS_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static WRITE_FAILURE: std::cell::Cell<Option<WriteStage>> = const { std::cell::Cell::new(None) };
+    static LOCK_FAILURE: std::cell::Cell<Option<std::io::ErrorKind>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -1107,6 +1146,40 @@ mod tests {
         assert_eq!(fs::read_to_string(destination.join("sentinel")).unwrap(), "keep");
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 4);
+    }
+
+    fn with_lock_failure<T>(kind: std::io::ErrorKind, f: impl FnOnce() -> T) -> T {
+        LOCK_FAILURE.with(|c| c.set(Some(kind)));
+        let out = f();
+        LOCK_FAILURE.with(|c| c.set(None));
+        out
+    }
+
+    #[test]
+    fn writes_and_keeps_manual_edits_where_the_target_has_no_file_lock() {
+        // Android: `File::lock` answers `Unsupported`, and refusing the write
+        // there left every not-yet-analyzed track unplayable.
+        let dir = TempDir::new("unsupported-lock");
+        let stale = sample_analysis();
+        with_lock_failure(std::io::ErrorKind::Unsupported, || {
+            store(dir.path(), TEST_HASH, &stale).unwrap();
+            edit_bars(dir.path(), TEST_HASH, Some(12), None, true).unwrap();
+            store(dir.path(), TEST_HASH, &stale).unwrap();
+        });
+        let saved = load(dir.path(), TEST_HASH).unwrap();
+        assert!(saved.intro_bars_manual);
+        assert_eq!(saved.intro_bars, 12);
+    }
+
+    #[test]
+    fn a_lock_the_target_does_support_still_fails_the_write() {
+        let dir = TempDir::new("denied-lock");
+        let analysis = sample_analysis();
+        let err = with_lock_failure(std::io::ErrorKind::PermissionDenied, || {
+            store(dir.path(), TEST_HASH, &analysis).unwrap_err()
+        });
+        assert!(err.to_string().contains("cannot lock cache"), "{err}");
+        assert!(load(dir.path(), TEST_HASH).is_none());
     }
 
     #[test]
