@@ -214,6 +214,13 @@ pub fn analyze_local_tempo(
     sample_rate: u32,
     target_bpm: f64,
 ) -> Option<LocalTempo> {
+    analyze_local_tempo_inner(interleaved, playhead, sample_rate, target_bpm, PeriodContext::Unanchored)
+}
+
+fn analyze_local_tempo_inner(
+    interleaved: &[f32], playhead: u64, sample_rate: u32, target_bpm: f64,
+    context: PeriodContext,
+) -> Option<LocalTempo> {
     if sample_rate == 0 || !target_bpm.is_finite() || target_bpm <= 0.0 {
         return None;
     }
@@ -268,9 +275,12 @@ pub fn analyze_local_tempo(
         .clamp(0.0, (frames.saturating_sub(1)) as f64) as u64;
 
     let in_transition_range = (bpm_lo..=bpm_hi).contains(&bpm)
-        && local_period_supported(&onset.novelty, bpm, sample_rate, target_bpm)
-        && local_grid_continuous(&interleaved[start as usize * 2..end as usize * 2],
-            0, end - start, sample_rate, bpm);
+        && local_period_supported(&onset.novelty, bpm, sample_rate, target_bpm, context)
+        // An overlap validates one reference across the full span
+        // after collecting all tempo tiles. Do not invent another reference
+        // at each arbitrary eight-second seam.
+        && (context == PeriodContext::Overlap || local_grid_continuous(&interleaved[start as usize * 2..end as usize * 2],
+            0, end - start, sample_rate, bpm));
     Some(LocalTempo {
         bpm,
         next_bar_frame,
@@ -282,7 +292,10 @@ pub fn analyze_local_tempo(
 /// metrical aliases and unrelated tempi compete with the proposed pulse.
 /// The short-window limits are exercised by the local-tempo regressions;
 /// they are deliberately independent of the intro/outro classifier cutoffs.
-fn local_period_supported(novelty: &[f64], bpm: f64, sr: u32, target: f64) -> bool {
+#[derive(Clone, Copy, PartialEq)]
+enum PeriodContext { Unanchored, Overlap }
+
+fn local_period_supported(novelty: &[f64], bpm: f64, sr: u32, target: f64, context: PeriodContext) -> bool {
     // Integrate the onset over its neighboring hops before comparing metrical
     // levels. At 48 kHz/180 BPM a beat is 62.5 hops: point sampling alternates
     // between a peak and an interpolated valley, spuriously favoring half time.
@@ -299,16 +312,57 @@ fn local_period_supported(novelty: &[f64], bpm: f64, sr: u32, target: f64) -> bo
     // the envelope mean. Sparse hits cannot establish a mixable pulse train.
     if novelty.len() as f64 / period < 8.0 || z < 3.0 { return false; }
     let mut best = z;
+    let mut best_period = period;
     let mut candidate = target / 3.0;
     while candidate <= target * 2.0 {
-        best = best.max(comb_z(novelty,
-            bpm_to_period_hops(candidate, HOP as f64, sr as f64), mean, sd));
+        let candidate_period = bpm_to_period_hops(candidate, HOP as f64, sr as f64);
+        let candidate_z = comb_z(novelty, candidate_period, mean, sd);
+        if candidate_z > best { best = candidate_z; best_period = candidate_period; }
         candidate += BPM_SEARCH_STEP;
     }
     let half = comb_z(novelty, period * 2.0, mean, sd);
     // The candidate may differ slightly from the wide sweep's sampling of the
     // same peak. A half-time peak must be clearly weaker, not merely in-band.
-    z >= best * 0.95 && half < z * 0.9
+    if z >= best * 0.95 && half < z * 0.9 { return true; }
+    if context == PeriodContext::Unanchored { return false; }
+    // A one-phase comb can prefer subdivisions or alternating accents in a
+    // syncopated groove. Full-span fixed-reference phase validation permits
+    // a second witness: all onset pairs at the proposed beat must correlate
+    // more strongly than the winning comb period and half time. Sub-beat
+    // subdivisions alone do not invalidate an independently preserved beat.
+    // Use the same samples for all lags; ties remain unknown. When the proposed
+    // beat is itself the comb winner, this intentionally cannot override the
+    // half-time ambiguity by comparing the candidate to itself.
+    // Refinement and the coarse sweep can sample the same peak at slightly
+    // different tempi. They are not independent evidence when their phase
+    // separation over the observed span is inside the existing 1/8-beat
+    // tolerance; a tiny interpolation advantage must not defeat a half tie.
+    if (1.0 / period - 1.0 / best_period).abs() * novelty.len() as f64 <= 0.125 {
+        return false;
+    }
+    let overlap = novelty.len().saturating_sub((period * 2.0).max(best_period).ceil() as usize + 1);
+    let proposed = period_correlation(novelty, period, overlap);
+    proposed > period_correlation(novelty, best_period, overlap)
+        && proposed > period_correlation(novelty, period * 2.0, overlap)
+}
+
+fn period_correlation(values: &[f64], lag: f64, overlap: usize) -> f64 {
+    if overlap == 0 { return 0.0; }
+    let mut dot = 0.0;
+    let mut left = 0.0;
+    let mut right = 0.0;
+    for i in 0..overlap {
+        let position = i as f64 + lag;
+        let j = position.floor() as usize;
+        let fraction = position - j as f64;
+        let x = values[i];
+        let y = values[j] * (1.0 - fraction) + values[j + 1] * fraction;
+        dot += x * y;
+        left += x * x;
+        right += y * y;
+    }
+    let norm = (left * right).sqrt();
+    if norm > SILENCE_EPS { dot / norm } else { 0.0 }
 }
 
 /// Inspect every part of an intended overlap, including future material.
@@ -328,7 +382,7 @@ pub(crate) fn local_sync_span(
         let a = start + offset;
         let b = (a + window).min(end);
         let segment = &samples[a as usize * 2..b as usize * 2];
-        let tempo = analyze_local_tempo(segment, (b - a) / 2, sr, target)?;
+        let tempo = analyze_local_tempo_inner(segment, (b - a) / 2, sr, target, PeriodContext::Overlap)?;
         if !tempo.in_transition_range { return None; }
         lo = lo.min(tempo.bpm);
         hi = hi.max(tempo.bpm);
@@ -340,57 +394,117 @@ pub(crate) fn local_sync_span(
         .then_some((lo, hi))
 }
 
-/// Preserve an existing beat count only across an unbroken audible pulse.
-/// This never creates bar/phrase identity from repetitive kicks. The first
-/// pulse's small residual is held constant across the corridor; a gap or a
-/// cumulative phase change invalidates propagation of the structural marker.
+/// Preserve an existing count only across continuous rhythmic evidence.
+/// A fixed multi-bar groove reference permits syncopation without promoting
+/// weak subdivisions of a slower pulse train into a new bar/phrase origin.
 pub(crate) fn local_grid_continuous(
     samples: &[f32], anchor: u64, end: u64, sr: u32, target: f64,
 ) -> bool {
     if sr == 0 || !target.is_finite() || target <= 0.0 || anchor >= end
         || end > (samples.len() / 2) as u64 { return false; }
     let beat = 60.0 * sr as f64 / target;
-    if !beat.is_finite() || beat < (HOP * 8) as f64 || beat * 8.0 > (end - anchor) as f64 {
-        return false;
-    }
-    // Filter overlapping four-bar chunks once. Resetting the low-pass at
-    // every beat produces artificial attacks when a kick crosses a slice edge.
-    let mut position = anchor as f64;
-    let mut reference = None;
-    let mut checked = 0;
-    while position + beat <= end as f64 {
-        let core_end = (position + 16.0 * beat).min(end as f64);
-        let a = (position - beat).max(0.0).floor() as usize;
-        let b = (core_end + beat).min(end as f64).ceil() as usize;
-        let mono: Vec<f32> = samples[a * 2..b * 2].chunks_exact(2)
-            .map(|s| (s[0] + s[1]) * 0.5).collect();
-        let Ok(onset) = onset_envelope(&mono, sr, HOP) else { return false; };
-        while position + beat <= core_end + 0.5 {
-            let expected = position + reference.unwrap_or(beat / 2.0);
-            let lo = ((expected - beat / 2.0 - a as f64).max(0.0) / HOP as f64).floor() as usize;
-            let hi = (((expected + beat / 2.0 - a as f64) / HOP as f64).ceil() as usize)
-                .min(onset.energy.len());
-            if lo >= hi { return false; }
-            let values = &onset.energy[lo..hi];
-            let (offset, peak) = values.iter().enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
-            let mean = values.iter().sum::<f64>() / values.len() as f64;
-            if *peak <= SILENCE_EPS || *peak < mean * 2.0 {
-                return false;
-            }
-            let observed = a as f64 + (lo + offset) as f64 * HOP as f64;
-            let phase = *reference.get_or_insert(observed - position);
-            if (observed - position - phase).abs() > beat * 0.125 {
-                return false;
-            }
-            checked += 1;
-            position += beat;
+    if beat < (HOP * 8) as f64 || beat * 8.0 > (end - anchor) as f64 { return false; }
+    // Keep the marker attack out of the envelope's forced-zero first hop.
+    // Real preceding samples warm the filter; only pre-file time is silence.
+    let padding_hops = (beat / HOP as f64).ceil() as usize;
+    let padding = padding_hops * HOP;
+    let from = anchor.saturating_sub(padding as u64);
+    let mut mono = vec![0.0; padding - (anchor - from) as usize];
+    mono.extend(samples[from as usize * 2..end as usize * 2]
+        .chunks_exact(2).map(|s| (s[0] + s[1]) * 0.5));
+    let Ok(mut onset) = onset_envelope(&mono, sr, HOP) else { return false; };
+    onset.novelty.drain(..padding_hops);
+
+    let bar_hops = beat * 4.0 / HOP as f64;
+    let extent = (end - anchor) as f64 / HOP as f64;
+    let bars = (extent / bar_hops).ceil() as usize;
+    let mut last = None;
+    let mut reference_peaks = Vec::new();
+    // Counting needs an observed attack before a whole half-time period can
+    // pass without evidence. Require the upper bound of each observed gap
+    // (including endpoint uncertainty) to stay below that competing period.
+    // This is independent of the density of any earlier bar or fill.
+    let half_time_period = beat * 2.0 / HOP as f64;
+    // These are observed times, not predicted marker phases: one hop per
+    // endpoint covers localization. The separate 1/8-beat phase allowance
+    // must not be counted again as uncertainty in a measured onset interval.
+    let gap_slack = 2.0;
+    for bar_index in 0..bars {
+        let a = (bar_index as f64 * bar_hops).round() as usize;
+        let b = (((bar_index + 1) as f64 * bar_hops).round() as usize).min(onset.novelty.len());
+        if b <= a { break; } // below envelope resolution; end-gap check still applies
+        let mean = onset.novelty[a..b].iter().sum::<f64>() / (b - a) as f64;
+        let mut candidates: Vec<usize> = (a..b).filter(|&i| onset.novelty[i] > SILENCE_EPS
+            && onset.novelty[i] >= mean * 2.0).collect();
+        candidates.sort_by(|&a, &b| onset.novelty[b].total_cmp(&onset.novelty[a]));
+        // Count attack peaks, not every hop across one drum's decay. Peaks
+        // inside the phase resolution are one observation;
+        // otherwise a broad reference kick makes later narrow kicks look
+        // like missing beats merely because their tails are shorter.
+        let resolution = 2.0 * beat * 0.125 / HOP as f64;
+        let mut peaks = Vec::<f64>::new();
+        for i in candidates {
+            if peaks.iter().all(|p| (*p - i as f64).abs() > resolution) { peaks.push(i as f64); }
         }
-        // Floating rounding must never leave an unprocessed sub-beat tail
-        // spinning forever; such a tail cannot establish another pulse.
-        if position + beat > end as f64 { break; }
+        peaks.sort_by(f64::total_cmp);
+        let offset = bar_index as f64 * bar_hops;
+        let partial = extent - offset < bar_hops - 1.0;
+        if partial {
+            // The final fraction cannot supply the scorer's two-beat window.
+            // Validate observed attacks against the fixed reference in both
+            // directions instead of silently discarding this part of a fade.
+            let tolerance = beat * 0.125 / HOP as f64 + 1.0;
+            if peaks.iter().any(|p| !reference_peaks.iter().any(|r: &f64|
+                (p - offset - r).abs() <= tolerance)) {
+                return false;
+            }
+            if reference_peaks.iter().any(|r| *r >= tolerance
+                && r + tolerance <= extent - offset
+                && !peaks.iter().any(|p| (p - offset - r).abs() <= tolerance)) {
+                return false;
+            }
+        }
+        let (Some(&first), Some(&final_peak)) = (peaks.first(), peaks.last()) else {
+            if partial { break; }
+            return false;
+        };
+        if bar_index == 0 { reference_peaks = peaks.clone(); }
+        let max_gap = peaks.windows(2).map(|p| p[1] - p[0]).fold(
+            last.map_or(first, |previous| first - previous), f64::max);
+        // Require positive evidence before half time, including one hop of
+        // localization error per measured endpoint.
+        if max_gap + gap_slack >= half_time_period {
+            return false;
+        }
+        last = Some(final_peak);
     }
-    checked >= 8
+    if last.is_none_or(|last| extent - last + gap_slack >= half_time_period) { return false; }
+    // Keep the existing scorer's multi-bar context: one fill must not become
+    // a half-beat phase change. Every window uses the same fixed reference;
+    // these observations never move the structural marker or the audio.
+    let bar = beat * 4.0;
+    let span = ((bar * crate::engine::PHASE_ALIGN_BARS as f64 + beat * 0.5).ceil() as u64)
+        .min(end - anchor);
+    let reference = &samples[anchor as usize * 2..(anchor + span) as usize * 2];
+    let Some(reference) = crate::engine::PreparedPhaseReference::new(reference, 0, sr, beat)
+        else { return false; };
+    let mut index = 1;
+    loop {
+        let start = anchor + (index as f64 * bar).round() as u64;
+        if start + bar.round() as u64 > end { break; }
+        let pad = beat.ceil() as u64;
+        let from = start - pad;
+        let stop = (start + span).min(end);
+        let window = &samples[from as usize * 2..stop as usize * 2];
+        let (entry, score, nudge) = reference.align(window, pad);
+        if score <= 0.0 || !score.is_finite()
+            || entry.abs_diff(pad) as f64 + nudge as f64 > beat * 0.125 {
+            return false;
+        }
+        index += 1;
+    }
+
+    true
 }
 
 /// Analyze a fully decoded track. `file_name` is stored for human reference.

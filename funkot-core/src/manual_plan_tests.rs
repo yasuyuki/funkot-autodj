@@ -20,9 +20,37 @@ fn track_at(index: usize, bpm: f64, sr: u32) -> PreparedTrack {
 fn request(active: &PreparedTrack, next: &PreparedTrack, start: u64, fade: u32) -> ManualRequest {
     ManualRequest {
         generation: 1, key: manual_key(NavAction::TransitionToNext, active, next),
-        playhead: start, active: Arc::clone(&active.samples), target: Arc::clone(&next.samples),
+        playhead: start, deadline: u64::MAX,
+        active: Arc::clone(&active.samples), target: Arc::clone(&next.samples),
         bar_frames: 58_800.0, sample_rate: 44_100, target_bpm: 180.0, fade_bars: fade,
     }
+}
+
+#[test]
+fn manual_plan_uses_an_anchored_one_bar_boundary_when_deadline_blocks_four_bars() {
+    let active = track(0, 180.0);
+    let next = track(1, 180.0);
+    let earliest = 4 * 58_800 + 1;
+
+    let mut four_bar = request(&active, &next, earliest, 4);
+    four_bar.deadline = 8 * 58_800;
+    let plan = build_manual_plan(four_bar);
+    assert!(!plan.simple, "{}", plan.reason);
+    assert_eq!(plan.reason, "four-bar sync");
+    assert_eq!(plan.start, 8 * 58_800);
+
+    let mut deadline_limited = request(&active, &next, earliest, 4);
+    deadline_limited.deadline = 5 * 58_800;
+    let plan = build_manual_plan(deadline_limited);
+    assert!(!plan.simple, "{}", plan.reason);
+    assert_eq!(plan.reason, "bar sync: deadline limited");
+    assert_eq!(plan.start, 5 * 58_800);
+
+    let mut no_late_plan = request(&active, &next, earliest, 4);
+    no_late_plan.deadline = 5 * 58_800 - 1;
+    let plan = build_manual_plan(no_late_plan);
+    assert!(plan.simple);
+    assert_eq!(plan.reason, "deadline boundary unavailable");
 }
 
 #[test]
@@ -63,9 +91,43 @@ fn manual_plan_rejects_bad_marker_and_does_not_bridge_a_break() {
     assert_eq!(marker.reason, "structural marker uncertain");
     active.first_downbeat_out = 0;
     Arc::make_mut(&mut active.samples)[2 * 58_800 * 2..3 * 58_800 * 2].fill(0.0);
-    let recovered = build_manual_plan(request(&active, &next, 8 * 58_800, 4));
-    assert!(recovered.simple);
-    assert_eq!(recovered.reason, "structural continuity unknown");
+    let earliest = 8 * 58_800 + 100;
+    let recovered = build_manual_plan(request(&active, &next, earliest, 4));
+    assert!(!recovered.simple, "{}", recovered.reason);
+    assert_eq!(recovered.reason, "beat sync: structural identity unknown");
+    assert_eq!(recovered.start, earliest, "beat fallback must not snap a new bar origin");
+    assert_eq!(recovered.fade_in_end, 4 * 58_800);
+    assert_eq!(recovered.fade_out_start, 4 * 58_800);
+    assert_eq!(recovered.fade_out_end, 8 * 58_800);
+    assert!(recovered.start + recovered.prev_nudge + recovered.fade_out_end <= active.frames);
+    assert!(recovered.entry + recovered.fade_out_end <= next.frames);
+
+    // A discontinuity inside the proposed real overlap must still reject the
+    // beat-only candidate; historical marker loss alone is not enough.
+    let mut overlap_break = track(2, 180.0);
+    Arc::make_mut(&mut overlap_break.samples)[10 * 58_800 * 2..11 * 58_800 * 2].fill(0.0);
+    let rejected = build_manual_plan(request(&overlap_break, &next, 8 * 58_800, 4));
+    assert!(rejected.simple);
+    assert_eq!(rejected.reason, "previous overlap unsafe");
+
+    // A recovered 90/120 BPM island in the actual overlap is just as unsafe
+    // as silence there. The historical break must not turn it into Beat.
+    for bpm in [90.0, 120.0] {
+        let mut excursion = active.clone();
+        let different_tempo = synth_track(bpm, 4, 0, 0, 44_100);
+        Arc::make_mut(&mut excursion.samples)[10 * 58_800 * 2..14 * 58_800 * 2]
+            .copy_from_slice(&different_tempo.samples[..4 * 58_800 * 2]);
+        let rejected = build_manual_plan(request(&excursion, &next, 8 * 58_800, 4));
+        assert!(rejected.simple, "{bpm}: {}", rejected.reason);
+        assert_ne!(rejected.reason, "beat sync: structural identity unknown");
+    }
+
+    // The fallback needs the target's trusted marker corridor as well.
+    let mut broken_target = next.clone();
+    Arc::make_mut(&mut broken_target.samples)[2 * 58_800 * 2..3 * 58_800 * 2].fill(0.0);
+    let rejected = build_manual_plan(request(&active, &broken_target, earliest, 4));
+    assert!(rejected.simple);
+    assert_eq!(rejected.reason, "structural continuity unknown");
 }
 
 #[test]
@@ -193,4 +255,54 @@ fn real_worker_correction_reaches_realtime_output_at_exact_sample() {
         assert_eq!(engine.last_manual_plan_diagnostic().unwrap().start, plan.start);
         proxy.join().unwrap();
     }
+}
+
+#[test]
+fn engine_adopts_deadline_limited_one_bar_plan_at_its_exact_deadline() {
+    let bar = 58_800u64;
+    let mut active = track(0, 180.0);
+    // The deadline is a one-bar marker boundary but not a four-bar boundary.
+    active.outro_start_out = 5 * bar;
+    active.outro_end_anchored_out = active.outro_start_out;
+    let mut next = active.clone();
+    next.path = PathBuf::from("deadline-next.wav");
+    next.playlist_index = 1;
+    let mut engine = Engine::from_prepared(
+        EngineOptions { rate: 1.0, output_sample_rate: 44_100, ..EngineOptions::default() },
+        vec![active, next],
+    ).unwrap();
+    engine.active.as_mut().unwrap().playhead = 3 * bar + 1;
+    engine.begin_nav(NavAction::TransitionToNext);
+    let start = match engine.pending_nav.as_ref() {
+        Some(PendingNav::Planned(plan)) => {
+            assert_eq!(plan.reason, "bar sync: deadline limited");
+            assert_eq!(plan.start, 5 * bar);
+            plan.start
+        }
+        None => panic!("offline planner did not prepare a deadline-limited plan"),
+    };
+    assert_eq!(engine.manual_deadline, Some(start));
+    engine.active.as_mut().unwrap().playhead = start;
+    assert_eq!(engine.render(&mut [0.0; 2]), 1);
+    let diagnostic = engine.last_manual_plan_diagnostic().expect("adopted plan diagnostic");
+    assert_eq!(diagnostic.reason, "bar sync: deadline limited");
+    assert_eq!(diagnostic.start, start);
+}
+
+#[test]
+fn manual_syncopated_groove_keeps_structural_four_bar_plan() {
+    let audio = crate::analysis_tests::syncopated_pulse_track(180.0, 48, 44_100);
+    let mut active = track(0, 180.0);
+    active.samples = Arc::new(audio.samples);
+    active.frames = audio.frames;
+    let mut next = active.clone();
+    next.path = PathBuf::from("syncopated-next.wav");
+    next.playlist_index = 1;
+    let plan = build_manual_plan(request(&active, &next, 4 * 58_800, 4));
+    assert!(!plan.simple, "syncopated structural groove rejected: {}", plan.reason);
+    assert_eq!(plan.reason, "four-bar sync");
+    assert_eq!(plan.start, 4 * 58_800);
+    assert_eq!(plan.fade_in_end, 4 * 58_800);
+    assert_eq!(plan.fade_out_start, 4 * 58_800);
+    assert_eq!(plan.fade_out_end, 8 * 58_800);
 }

@@ -187,7 +187,7 @@ fn bar_to_frames(bars: u32, bar_frames: f64) -> u64 {
 const PHASE_ALIGN_HOP: usize = 256;
 /// Compare this many bars when locking next entry to prev (intro-head /
 /// outro-edge groove; longer than a single fade bar so sparse kick+hat settle).
-const PHASE_ALIGN_BARS: u32 = 8;
+pub(crate) const PHASE_ALIGN_BARS: u32 = 8;
 /// Relative weight of hi-hat envelope vs kick in [`align_next_entry_scored`].
 /// Kick dominates bar/downbeat identity; hat breaks pure 4-on-floor ties.
 const PHASE_ALIGN_HAT_WEIGHT: f64 = 0.40;
@@ -197,6 +197,8 @@ const PHASE_ALIGN_HAT_WEIGHT: f64 = 0.40;
 const PHASE_ALIGN_FINE_BEATS: f64 = 0.5;
 /// Ignore the adjustment when the best normalized correlation is below this.
 const PHASE_ALIGN_MIN_CORR: f64 = 0.45;
+/// Shared preview/upgrade de-click duration.
+const HEAD_DECLICK_SECS: f64 = 0.010;
 /// Bars before file end used as the sparse outro-tail phase anchor.
 const OUTRO_TAIL_ANCHOR_BARS: u32 = 4;
 
@@ -244,6 +246,91 @@ pub fn align_next_entry_to_prev(
     .0
 }
 
+#[derive(Clone, Copy)]
+struct PhaseAlignGeometry {
+    hops_per_beat: f64,
+    max_lag_hops: usize,
+    win_hops: usize,
+    need_frames: usize,
+    need_hops: usize,
+}
+
+fn phase_align_geometry(
+    prev_frames: usize, prev_start: u64, next_frames: usize, next_entry: u64,
+    sample_rate: u32, beat_frames: f64,
+) -> Option<PhaseAlignGeometry> {
+    if sample_rate == 0 || !(beat_frames.is_finite() && beat_frames > 1.0)
+        || prev_frames < PHASE_ALIGN_HOP * 4 || next_frames < PHASE_ALIGN_HOP * 4 {
+        return None;
+    }
+    let hops_per_beat = beat_frames / PHASE_ALIGN_HOP as f64;
+    if !(hops_per_beat.is_finite() && hops_per_beat > 1.0) { return None; }
+    let max_lag_hops = (PHASE_ALIGN_FINE_BEATS * hops_per_beat).floor() as usize;
+    let full_win_hops = ((PHASE_ALIGN_BARS as f64) * f64::from(BEATS_PER_BAR) * hops_per_beat)
+        .round().max(16.0) as usize;
+    let full_need_frames = (full_win_hops + max_lag_hops) * PHASE_ALIGN_HOP;
+    let avail = prev_frames.saturating_sub(prev_start as usize)
+        .min(next_frames.saturating_sub(next_entry as usize));
+    let (win_hops, need_frames) = if avail >= full_need_frames {
+        (full_win_hops, full_need_frames)
+    } else {
+        let min_lag_frames = max_lag_hops * PHASE_ALIGN_HOP;
+        let min_win_frames = (2.0 * beat_frames).round() as usize;
+        if avail < min_lag_frames + min_win_frames { return None; }
+        let w_hops = ((avail - min_lag_frames) / PHASE_ALIGN_HOP).max(8);
+        (w_hops, (w_hops + max_lag_hops) * PHASE_ALIGN_HOP)
+    };
+    Some(PhaseAlignGeometry { hops_per_beat, max_lag_hops, win_hops,
+        need_frames, need_hops: need_frames / PHASE_ALIGN_HOP })
+}
+
+fn phase_envelopes(mono: &[f32], sample_rate: u32) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let kick = band_energy_envelope(mono, sample_rate, PHASE_ALIGN_HOP, BandKind::Kick);
+    let hat = band_energy_envelope(mono, sample_rate, PHASE_ALIGN_HOP, BandKind::Hat);
+    let groove = kick.iter().zip(&hat)
+        .map(|(kick, hat)| kick + PHASE_ALIGN_HAT_WEIGHT * hat).collect();
+    (kick, hat, groove)
+}
+
+/// Request-local cached outro reference for repeated candidate entry scoring.
+/// It owns only the filtered envelope prefixes; the original slice remains the
+/// source of truth for geometry and the previous-deck nudge clamp.
+pub(crate) struct PreparedPhaseReference<'a> {
+    prev_interleaved: &'a [f32],
+    prev_start: u64,
+    sample_rate: u32,
+    beat_frames: f64,
+    kick: Vec<f64>,
+    hat: Vec<f64>,
+    groove: Vec<f64>,
+}
+
+impl<'a> PreparedPhaseReference<'a> {
+    pub(crate) fn new(
+        prev_interleaved: &'a [f32], prev_start: u64, sample_rate: u32, beat_frames: f64,
+    ) -> Option<Self> {
+        let prev_frames = prev_interleaved.len() / 2;
+        if sample_rate == 0 || !(beat_frames.is_finite() && beat_frames > 1.0)
+            || prev_frames < PHASE_ALIGN_HOP * 4 { return None; }
+        let hops_per_beat = beat_frames / PHASE_ALIGN_HOP as f64;
+        if !(hops_per_beat.is_finite() && hops_per_beat > 1.0) { return None; }
+        let max_lag_hops = (PHASE_ALIGN_FINE_BEATS * hops_per_beat).floor() as usize;
+        let win_hops = ((PHASE_ALIGN_BARS as f64) * f64::from(BEATS_PER_BAR) * hops_per_beat)
+            .round().max(16.0) as usize;
+        let max_frames = (win_hops + max_lag_hops) * PHASE_ALIGN_HOP;
+        let cached_frames = prev_frames.saturating_sub(prev_start as usize).min(max_frames);
+        let mono = mono_slice(prev_interleaved, prev_start as usize, cached_frames);
+        let (kick, hat, groove) = phase_envelopes(&mono, sample_rate);
+        Some(Self { prev_interleaved, prev_start, sample_rate, beat_frames, kick, hat, groove })
+    }
+
+    pub(crate) fn align(
+        &self, next_interleaved: &[f32], next_entry: u64,
+    ) -> (u64, f64, u64) {
+        align_next_entry_with_reference(self, next_interleaved, next_entry)
+    }
+}
+
 /// Like [`align_next_entry_to_prev`], returning `(entry, score, prev_nudge_frames)`.
 ///
 /// `prev_nudge_frames` is a small forward skip on the previous playhead when the
@@ -257,64 +344,53 @@ pub fn align_next_entry_scored(
     sample_rate: u32,
     beat_frames: f64,
 ) -> (u64, f64, u64) {
-    if sample_rate == 0 || !(beat_frames.is_finite() && beat_frames > 1.0) {
-        return (next_entry, 0.0, 0);
-    }
     let prev_frames = prev_interleaved.len() / 2;
     let next_frames = next_interleaved.len() / 2;
-    if prev_frames < PHASE_ALIGN_HOP * 4 || next_frames < PHASE_ALIGN_HOP * 4 {
+    let Some(geometry) = phase_align_geometry(
+        prev_frames, prev_start, next_frames, next_entry, sample_rate, beat_frames,
+    ) else { return (next_entry, 0.0, 0); };
+    let prev_mono = mono_slice(prev_interleaved, prev_start as usize, geometry.need_frames);
+    let next_mono = mono_slice(next_interleaved, next_entry as usize, geometry.need_frames);
+    if prev_mono.len() < geometry.need_frames || next_mono.len() < geometry.need_frames {
         return (next_entry, 0.0, 0);
     }
+    let (prev_kick, prev_hat, prev_groove) = phase_envelopes(&prev_mono, sample_rate);
+    let (next_kick, next_hat, next_groove) = phase_envelopes(&next_mono, sample_rate);
+    align_next_entry_from_envelopes(next_entry, prev_frames, prev_start, next_frames,
+        beat_frames, geometry, &prev_kick, &prev_hat, &prev_groove,
+        &next_kick, &next_hat, &next_groove)
+}
 
-    let hops_per_beat = beat_frames / PHASE_ALIGN_HOP as f64;
-    if !(hops_per_beat.is_finite() && hops_per_beat > 1.0) {
+fn align_next_entry_with_reference(
+    reference: &PreparedPhaseReference<'_>, next_interleaved: &[f32], next_entry: u64,
+) -> (u64, f64, u64) {
+    let prev_frames = reference.prev_interleaved.len() / 2;
+    let next_frames = next_interleaved.len() / 2;
+    let Some(geometry) = phase_align_geometry(prev_frames, reference.prev_start, next_frames,
+        next_entry, reference.sample_rate, reference.beat_frames)
+    else { return (next_entry, 0.0, 0); };
+    let next_mono = mono_slice(next_interleaved, next_entry as usize, geometry.need_frames);
+    if next_mono.len() < geometry.need_frames { return (next_entry, 0.0, 0); }
+    let (next_kick, next_hat, next_groove) = phase_envelopes(&next_mono, reference.sample_rate);
+    align_next_entry_from_envelopes(next_entry, prev_frames, reference.prev_start, next_frames,
+        reference.beat_frames, geometry, &reference.kick, &reference.hat, &reference.groove,
+        &next_kick, &next_hat, &next_groove)
+}
+
+fn align_next_entry_from_envelopes(
+    next_entry: u64, prev_frames: usize, prev_start: u64, next_frames: usize,
+    beat_frames: f64, geometry: PhaseAlignGeometry,
+    prev_kick: &[f64], prev_hat: &[f64], prev_groove: &[f64],
+    next_kick: &[f64], next_hat: &[f64], next_groove: &[f64],
+) -> (u64, f64, u64) {
+    if prev_kick.len() < geometry.need_hops || prev_hat.len() < geometry.need_hops
+        || prev_groove.len() < geometry.need_hops || next_kick.len() < geometry.need_hops
+        || next_hat.len() < geometry.need_hops || next_groove.len() < geometry.need_hops {
         return (next_entry, 0.0, 0);
     }
-    let max_lag_hops = (PHASE_ALIGN_FINE_BEATS * hops_per_beat).floor() as usize;
-    let win_hops = ((PHASE_ALIGN_BARS as f64) * f64::from(BEATS_PER_BAR) * hops_per_beat)
-        .round()
-        .max(16.0) as usize;
-    let need = win_hops + max_lag_hops;
-    let need_frames = need * PHASE_ALIGN_HOP;
-
-    let avail_prev = prev_frames.saturating_sub(prev_start as usize);
-    let avail_next = next_frames.saturating_sub(next_entry as usize);
-    let avail = avail_prev.min(avail_next);
-    let (win_hops, need_frames) = if avail >= need_frames {
-        (win_hops, need_frames)
-    } else {
-        let min_lag_frames = max_lag_hops * PHASE_ALIGN_HOP;
-        let min_win_frames = (2.0 * beat_frames).round() as usize;
-        if avail < min_lag_frames + min_win_frames {
-            return (next_entry, 0.0, 0);
-        }
-        let w_frames = avail - min_lag_frames;
-        let w_hops = (w_frames / PHASE_ALIGN_HOP).max(8);
-        (w_hops, (w_hops + max_lag_hops) * PHASE_ALIGN_HOP)
-    };
-
-    let prev_mono = mono_slice(prev_interleaved, prev_start as usize, need_frames);
-    let next_mono = mono_slice(next_interleaved, next_entry as usize, need_frames);
-    if prev_mono.len() < need_frames || next_mono.len() < need_frames {
-        return (next_entry, 0.0, 0);
-    }
-
-    let prev_kick = band_energy_envelope(&prev_mono, sample_rate, PHASE_ALIGN_HOP, BandKind::Kick);
-    let next_kick = band_energy_envelope(&next_mono, sample_rate, PHASE_ALIGN_HOP, BandKind::Kick);
-    let prev_hat = band_energy_envelope(&prev_mono, sample_rate, PHASE_ALIGN_HOP, BandKind::Hat);
-    let next_hat = band_energy_envelope(&next_mono, sample_rate, PHASE_ALIGN_HOP, BandKind::Hat);
-    let need_hops = need_frames / PHASE_ALIGN_HOP;
-    if prev_kick.len() < need_hops
-        || next_kick.len() < need_hops
-        || prev_hat.len() < need_hops
-        || next_hat.len() < need_hops
-    {
-        return (next_entry, 0.0, 0);
-    }
-
-    let fine_radius = max_lag_hops as i64;
+    let fine_radius = geometry.max_lag_hops as i64;
     let best_lag = |prev_env: &[f64], next_env: &[f64]| {
-        let xcorr = |lag: i64| energy_xcorr_at_win(prev_env, next_env, lag, win_hops);
+        let xcorr = |lag: i64| energy_xcorr_at_win(prev_env, next_env, lag, geometry.win_hops);
         let mut lag_hops = 0i64;
         let mut fine_corr = xcorr(0);
         for lag in -fine_radius..=fine_radius {
@@ -330,16 +406,10 @@ pub fn align_next_entry_scored(
     let (lag_kick, corr_kick) = best_lag(&prev_kick, &next_kick);
     let (lag_hat, corr_hat) = best_lag(&prev_hat, &next_hat);
 
-    let mut prev_groove = Vec::with_capacity(need_hops);
-    let mut next_groove = Vec::with_capacity(need_hops);
-    for i in 0..need_hops {
-        prev_groove.push(prev_kick[i] + PHASE_ALIGN_HAT_WEIGHT * prev_hat[i]);
-        next_groove.push(next_kick[i] + PHASE_ALIGN_HAT_WEIGHT * next_hat[i]);
-    }
-    let (lag_groove, corr_groove) = best_lag(&prev_groove, &next_groove);
+    let (lag_groove, corr_groove) = best_lag(prev_groove, next_groove);
 
     // Kick/hat micro-phase disagreement (e.g. on-beat vs off-beat hats): trust kick.
-    let disagree_hops = (0.25 * hops_per_beat).round().max(1.0) as i64;
+    let disagree_hops = (0.25 * geometry.hops_per_beat).round().max(1.0) as i64;
     let (lag_hops, fine_corr) = if corr_kick.is_finite()
         && corr_hat.is_finite()
         && corr_kick >= PHASE_ALIGN_MIN_CORR
@@ -363,14 +433,14 @@ pub fn align_next_entry_scored(
         if want > next_entry {
             let nudge = want
                 .min((PHASE_ALIGN_FINE_BEATS * beat_frames).round() as u64)
-                .min(prev_frames.saturating_sub(prev_start as usize + need_frames) as u64);
+                .min(prev_frames.saturating_sub(prev_start as usize + geometry.need_frames) as u64);
             return (next_entry, fine_corr, nudge);
         }
         let adjusted = next_entry - want;
         if adjusted == 0 && next_entry > 0 && want > 0 {
             let nudge = want
                 .min((PHASE_ALIGN_FINE_BEATS * beat_frames).round() as u64)
-                .min(prev_frames.saturating_sub(prev_start as usize + need_frames) as u64);
+                .min(prev_frames.saturating_sub(prev_start as usize + geometry.need_frames) as u64);
             return (next_entry, fine_corr, nudge);
         }
         (adjusted, fine_corr, 0)
@@ -600,6 +670,15 @@ struct Deck {
     playhead: u64,
     highpass_enabled: bool,
     filter: StereoHighPass,
+    upgrade_fade: Option<UpgradeFade>,
+}
+
+/// Old preview retained briefly while a full first-live buffer takes over.
+struct UpgradeFade {
+    track: PreparedTrack,
+    playhead: u64,
+    frames_into: u64,
+    frames: u64,
 }
 
 struct ActiveTransition {
@@ -672,6 +751,8 @@ struct ManualRequest {
     generation: u64,
     key: ManualKey,
     playhead: u64,
+    /// Fixed navigation deadline captured before dispatching the worker.
+    deadline: u64,
     active: Arc<Vec<f32>>,
     target: Arc<Vec<f32>>,
     bar_frames: f64,
@@ -721,20 +802,48 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
     if !anchors { return simple("structural marker uncertain"); }
 
     let aligned_configuration = request.fade_bars % 4 == 0 && request.key.target_intro % 4 == 0;
-    let grid_bars = if aligned_configuration { 4.0 } else { 1.0 };
-    let relative = request.playhead.saturating_sub(request.key.active_first) as f64;
-    let mut bars = (relative / request.bar_frames / grid_bars).floor() * grid_bars;
-    let mut start = request.key.active_first.saturating_add((bars * request.bar_frames).round() as u64);
-    // Compare rounded sample positions, not continuous times: ceil would skip
-    // a valid boundary whenever its ideal fractional frame rounds upward.
-    if start < request.playhead {
-        bars += grid_bars;
-        start = request.key.active_first.saturating_add((bars * request.bar_frames).round() as u64);
-    }
-    let remaining = (request.key.active_frames.saturating_sub(start) as f64 / request.bar_frames)
+    let next_marker_boundary = |grid_bars: f64| {
+        let relative = request.playhead.saturating_sub(request.key.active_first) as f64;
+        let mut bars = (relative / request.bar_frames / grid_bars).floor() * grid_bars;
+        let mut start = request.key.active_first
+            .saturating_add((bars * request.bar_frames).round() as u64);
+        // Compare rounded sample positions, not continuous times: ceil would
+        // skip a valid boundary whenever its ideal fractional frame rounds up.
+        if start < request.playhead {
+            bars += grid_bars;
+            start = request.key.active_first
+                .saturating_add((bars * request.bar_frames).round() as u64);
+        }
+        start
+    };
+    let (mut start, deadline_limited) = if aligned_configuration {
+        let four_bar_start = next_marker_boundary(4.0);
+        if four_bar_start <= request.deadline {
+            (four_bar_start, false)
+        } else {
+            let one_bar_start = next_marker_boundary(1.0);
+            if one_bar_start <= request.deadline {
+                (one_bar_start, true)
+            } else {
+                return simple("deadline boundary unavailable");
+            }
+        }
+    } else {
+        let one_bar_start = next_marker_boundary(1.0);
+        if one_bar_start <= request.deadline {
+            (one_bar_start, false)
+        } else {
+            return simple("deadline boundary unavailable");
+        }
+    };
+    let mut remaining = (request.key.active_frames.saturating_sub(start) as f64 / request.bar_frames)
         .floor().min(u32::MAX as f64) as u32;
     let mut schedule = plan_transition(request.fade_bars, request.key.target_intro, remaining);
     let mut shortened_for_drift = false;
+    // Losing the historical marker propagation does not prove that the tempo
+    // or the immediate overlap is unsafe. This flag permits one bounded retry
+    // from the captured earliest frame, without inventing a new bar origin.
+    let mut beat_only = false;
     loop {
         if schedule.fadeout_end == 0 || schedule.f_eff > schedule.fadeout_end {
             return simple("insufficient fade material");
@@ -747,10 +856,31 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
         }
         // This on-demand corridor check preserves the count from the marker.
         // A break/tempo change cannot be bridged by a newly invented kick grid.
-        if !local_grid_continuous(&request.active, request.key.active_first,
-                start.saturating_add(overlap), request.sample_rate, request.target_bpm)
-            || !local_grid_continuous(&request.target, request.key.target_first,
-                nominal.saturating_add(overlap), request.sample_rate, request.target_bpm) {
+        let active_continuous = !beat_only && local_grid_continuous(
+            &request.active, request.key.active_first, start.saturating_add(overlap),
+            request.sample_rate, request.target_bpm,
+        );
+        if !active_continuous && !beat_only
+            && request.playhead <= request.deadline {
+            // Recompute from the actual earliest frame. Validate the target
+            // corridor for that final schedule below, not for an abandoned
+            // candidate, then require every corrected-overlap check before
+            // accepting Beat. Do not snap to a new marker/bar boundary.
+            beat_only = true;
+            start = request.playhead;
+            remaining = (request.key.active_frames.saturating_sub(start) as f64 / request.bar_frames)
+                .floor().min(u32::MAX as f64) as u32;
+            schedule = plan_transition(request.fade_bars, request.key.target_intro, remaining);
+            shortened_for_drift = false;
+            continue;
+        }
+        let target_continuous = local_grid_continuous(&request.target, request.key.target_first,
+            nominal.saturating_add(overlap), request.sample_rate, request.target_bpm);
+        // Once the one permitted beat-only retry is selected, the active
+        // marker corridor is precisely the evidence it no longer claims.
+        // The target corridor and corrected actual-overlap gates remain
+        // mandatory.
+        if !target_continuous || (!beat_only && !active_continuous) {
             return simple("structural continuity unknown");
         }
         let (entry, score, nudge) = align_next_entry_scored(&request.active, start,
@@ -791,7 +921,9 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
         let four_bar = aligned_configuration && schedule.skip % 4 == 0
             && schedule.f_eff % 4 == 0 && schedule.fadeout_start % 4 == 0
             && schedule.fadeout_end % 4 == 0 && schedule.m % 4 == 0;
-        let reason = if four_bar { "four-bar sync" }
+        let reason = if beat_only { "beat sync: structural identity unknown" }
+            else if deadline_limited { "bar sync: deadline limited" }
+            else if four_bar { "four-bar sync" }
             else if shortened_for_drift { "bar sync: drift shortened" }
             else if schedule.f_eff != request.fade_bars { "bar sync: material shortened" }
             else { "bar sync: explicit fade or intro" };
@@ -829,6 +961,19 @@ fn retire_deck(deck: Deck) {
 /// Same as [`retire_deck`] for a bare [`PreparedTrack`] (surplus Ready, Upgrade, history).
 fn retire_prepared(track: PreparedTrack) {
     thread::spawn(move || drop(track));
+}
+
+/// Preserve the history/current ownership while retiring an interrupted
+/// Upgrade's preview off the render thread.
+fn deck_track_retiring_upgrade(mut deck: Deck) -> PreparedTrack {
+    retire_upgrade_fade(deck.upgrade_fade.take());
+    deck.track
+}
+
+fn retire_upgrade_fade(fade: Option<UpgradeFade>) {
+    if let Some(fade) = fade {
+        retire_prepared(fade.track);
+    }
 }
 
 /// ラベリング中、アクティブデッキの先にいくつ head を用意しておくか。
@@ -1351,9 +1496,10 @@ impl Engine {
             });
             if same {
                 // RestartCurrent: shared buffer / single permit with active.
+                retire_upgrade_fade(deck.upgrade_fade);
                 return;
             }
-            self.push_history(deck.track);
+            self.push_history(deck_track_retiring_upgrade(deck));
         }
     }
 
@@ -1369,7 +1515,7 @@ impl Engine {
 
     fn retire_active(&mut self) {
         if let Some(deck) = self.active.take() {
-            self.push_history(deck.track);
+            self.push_history(deck_track_retiring_upgrade(deck));
             // History keeps the permit; do not release here.
         }
     }
@@ -1567,6 +1713,7 @@ impl Engine {
             // Reserve a scheduling quantum; a result whose start is already
             // behind the current render frame is never committed.
             playhead: active.playhead.saturating_add(bar_to_frames(1, self.bar_frames)).min(active.track.frames),
+            deadline: self.manual_deadline.unwrap_or(u64::MAX),
             active: Arc::clone(&active.track.samples), target: Arc::clone(&target.samples),
             bar_frames: self.bar_frames, sample_rate: self.options.output_sample_rate,
             target_bpm: self.options.target_bpm(), fade_bars: self.options.fade_bars };
@@ -1640,7 +1787,7 @@ impl Engine {
                 self.abort_active_transition();
                 if let Some(cur) = self.active.take() {
                     // cur's permit moved into next_track (or the head queue).
-                    self.push_front_next(cur.track);
+                    self.push_front_next(deck_track_retiring_upgrade(cur));
                 }
                 self.start_first(prev);
             }
@@ -1650,7 +1797,7 @@ impl Engine {
                 };
                 self.abort_active_transition();
                 if let Some(cur) = self.active.take() {
-                    self.push_history(cur.track);
+                    self.push_history(deck_track_retiring_upgrade(cur));
                 }
                 self.start_first(next);
             }
@@ -1686,6 +1833,7 @@ impl Engine {
             playhead: entry,
             highpass_enabled: !plan.simple,
             filter: StereoHighPass::new(self.options.output_sample_rate, self.options.highpass_hz),
+            upgrade_fade: None,
         };
 
         let mut prev_deck = active;
@@ -1858,10 +2006,15 @@ impl Engine {
     fn apply_upgrade(&mut self, track: PreparedTrack) {
         if let Some(deck) = self.active.as_mut() {
             if deck.track.path == track.path {
-                deck.playhead = deck.playhead.min(track.frames.saturating_sub(1));
+                // A second Upgrade is not normally emitted, but do not leave
+                // its already-retained preview to drop on this callback.
+                retire_upgrade_fade(deck.upgrade_fade.take());
+                let old_playhead = deck.playhead;
+                let playhead = old_playhead.min(track.frames);
                 let old = std::mem::replace(&mut deck.track, track);
-                // Preview Arc free can be multi-ms; never on the audio thread.
-                retire_prepared(old);
+                deck.playhead = playhead;
+                deck.upgrade_fade = Some(UpgradeFade { track: old, playhead: old_playhead,
+                    frames_into: 0, frames: declick_frames(self.options.output_sample_rate) });
                 // Markers / buffer changed — any in-flight align is stale.
                 self.clear_phase_align();
                 self.cancel_pending_nav();
@@ -1985,6 +2138,7 @@ impl Engine {
             playhead,
             highpass_enabled: false,
             filter,
+            upgrade_fade: None,
         });
         self.pending_events
             .push(EngineEvent::TrackStarted { index, path });
@@ -2123,6 +2277,7 @@ impl Engine {
             playhead: entry,
             highpass_enabled: true,
             filter: StereoHighPass::new(self.options.output_sample_rate, self.options.highpass_hz),
+            upgrade_fade: None,
         };
 
         let mut prev_deck = active;
@@ -2205,7 +2360,7 @@ impl Engine {
 
             // Skip the mix bus at bit-exact silence, but always drive the HPF so
             // enabling mid-transition does not click from a cold filter state.
-            if deck.playhead < deck.track.frames {
+            if deck.playhead < deck.track.frames || deck.upgrade_fade.is_some() {
                 let (mut l, mut r) = read_deck_frame(deck);
                 let mut fl = l;
                 let mut fr = r;
@@ -2219,7 +2374,7 @@ impl Engine {
                     mix_l += l * g;
                     mix_r += r * g;
                 }
-                deck.playhead += 1;
+                if deck.playhead < deck.track.frames { deck.playhead += 1; }
             }
         }
 
@@ -2233,7 +2388,7 @@ impl Engine {
                 deck.highpass_enabled = !simple && frames_into < fade_in_end;
             }
 
-            if deck.playhead < deck.track.frames {
+            if deck.playhead < deck.track.frames || deck.upgrade_fade.is_some() {
                 let (mut l, mut r) = read_deck_frame(deck);
                 // Active HPF is on from transition start (incl. silent first
                 // fade-in frame), so drive it whenever enabled.
@@ -2246,7 +2401,7 @@ impl Engine {
                     mix_l += l * g;
                     mix_r += r * g;
                 }
-                deck.playhead += 1;
+                if deck.playhead < deck.track.frames { deck.playhead += 1; }
             }
         }
 
@@ -2268,7 +2423,7 @@ impl Engine {
         let active_done = self
             .active
             .as_ref()
-            .map(|d| d.playhead >= d.track.frames && !d.track.preview)
+            .map(|d| d.playhead >= d.track.frames && !d.track.preview && d.upgrade_fade.is_none())
             .unwrap_or(true);
         if active_done && self.transition.is_none() {
             if self.active.is_some() {
@@ -2300,14 +2455,50 @@ impl Drop for Engine {
     }
 }
 
-fn read_deck_frame(deck: &Deck) -> (f32, f32) {
-    let i = deck.playhead as usize * 2;
-    let s = &deck.track.samples;
+fn read_track_frame(track: &PreparedTrack, playhead: u64) -> (f32, f32) {
+    let i = playhead as usize * 2;
+    let s = &track.samples;
     if i + 1 < s.len() {
         (s[i], s[i + 1])
     } else {
         (0.0, 0.0)
     }
+}
+
+/// Read one deck frame. Normal decks use the exact old raw-read path. During
+/// first-live Upgrade, blend old/new pre-HPF samples and retain the old buffer
+/// until the fixed de-click span completes.
+fn read_deck_frame(deck: &mut Deck) -> (f32, f32) {
+    let i = deck.playhead as usize * 2;
+    if deck.upgrade_fade.is_none() {
+        let s = &deck.track.samples;
+        return if i + 1 < s.len() { (s[i], s[i + 1]) } else { (0.0, 0.0) };
+    }
+    let (new_l, new_r) = read_track_frame(&deck.track, deck.playhead);
+    let (old_l, old_r, old_gain, frame, span) = {
+        let fade = deck.upgrade_fade.as_mut().expect("checked above");
+        let old = read_track_frame(&fade.track, fade.playhead);
+        fade.playhead = fade.playhead.saturating_add(1);
+        let frame = fade.frames_into.min(fade.frames.saturating_sub(1));
+        fade.frames_into = fade.frames_into.saturating_add(1);
+        (old.0, old.1, fade.track.gain_linear, frame, fade.frames)
+    };
+    let new_gain = deck.track.gain_linear;
+    let old_scale = if new_gain.is_finite() && new_gain.abs() > f32::MIN_POSITIVE {
+        old_gain / new_gain
+    } else {
+        0.0
+    };
+    let old_weight = fade_out_gain(frame, span);
+    let new_weight = fade_in_gain(frame, span);
+    let out = (
+        old_l * old_scale * old_weight + new_l * new_weight,
+        old_r * old_scale * old_weight + new_r * new_weight,
+    );
+    if deck.upgrade_fade.as_ref().is_some_and(|fade| fade.frames_into >= fade.frames) {
+        retire_upgrade_fade(deck.upgrade_fade.take());
+    }
+    out
 }
 
 fn prepared_loader_main(
@@ -2701,8 +2892,8 @@ fn finish_prepare(
         options.pitch_mode,
     )?;
 
-    if head_only {
-        fade_out_tail(&mut rendered, (0.010 * options.output_sample_rate as f64) as usize);
+    if preview {
+        fade_out_tail(&mut rendered, declick_frames(options.output_sample_rate) as usize);
     }
 
     let out_frames = (rendered.len() / 2) as u64;
@@ -2775,6 +2966,10 @@ fn fade_out_tail(samples: &mut [f32], tail_frames: usize) {
         samples[idx] *= gain;
         samples[idx + 1] *= gain;
     }
+}
+
+fn declick_frames(sample_rate: u32) -> u64 {
+    (HEAD_DECLICK_SECS * f64::from(sample_rate)).round().max(2.0) as u64
 }
 
 /// Prepare every playlist path, optionally in parallel.
@@ -3111,6 +3306,86 @@ mod tests {
         engine.phase_align_ready = None;
         engine.phase_align_rx = None;
         engine
+    }
+
+    fn upgrade_test_track(path: &str, frames: usize, sample: f32, gain: f32, preview: bool) -> PreparedTrack {
+        PreparedTrack {
+            path: PathBuf::from(path), playlist_index: 0,
+            samples: Arc::new(vec![sample; frames * 2]), frames: frames as u64,
+            first_downbeat_out: 0, outro_start_out: frames as u64,
+            outro_end_anchored_out: frames as u64, intro_bars: 0, outro_bars: 0,
+            gain_linear: gain, preview, head_only: false,
+        }
+    }
+
+    #[test]
+    fn upgrade_fade_engine_uses_actual_arrival_and_is_chunk_independent() {
+        for sr in [44_100u32, 48_000] {
+            let span = declick_frames(sr);
+            let frames = span as usize + 48;
+            let mut preview = upgrade_test_track("upgrade.wav", frames, 0.0, 0.5, true);
+            let mut full = upgrade_test_track("upgrade.wav", frames, 0.0, 0.25, false);
+            Arc::make_mut(&mut preview.samples).chunks_exact_mut(2).enumerate()
+                .for_each(|(i, s)| s.fill(0.1 + i as f32 / 1000.0));
+            Arc::make_mut(&mut full.samples).chunks_exact_mut(2).enumerate()
+                .for_each(|(i, s)| s.fill(-0.7 + i as f32 / 2000.0));
+            let mut options = EngineOptions::default();
+            options.output_sample_rate = sr;
+            options.loop_playlist = false;
+            let mut engine = Engine::from_prepared(options, vec![preview.clone()]).unwrap();
+            let arrival = 7u64;
+            let mut prefix = vec![0.0; arrival as usize * 2];
+            assert_eq!(engine.render(&mut prefix), arrival as usize);
+            assert_eq!(engine.active.as_ref().unwrap().playhead, arrival);
+            let generation = engine.nav_gen;
+            engine.apply_upgrade(full.clone());
+            let active = engine.active.as_ref().unwrap();
+            assert_eq!(active.playhead, arrival, "{sr}Hz preserve arrival playhead");
+            assert!(!active.track.preview);
+            assert_eq!(active.track.intro_bars, full.intro_bars);
+            assert!(active.upgrade_fade.is_some());
+            assert_ne!(engine.nav_gen, generation, "Upgrade invalidates stale plans");
+
+            let mut rendered = Vec::new();
+            for chunk in [3usize, 19, (span as usize).saturating_sub(22), 2] {
+                let mut out = vec![0.0; chunk * 2];
+                assert_eq!(engine.render(&mut out), chunk);
+                rendered.extend_from_slice(&out);
+            }
+            let old_at_arrival = preview.samples[arrival as usize * 2] * preview.gain_linear;
+            let full_at_arrival = full.samples[arrival as usize * 2] * full.gain_linear;
+            assert_eq!(rendered[0], old_at_arrival, "{sr}Hz first frame uses old arrival waveform");
+            assert_ne!(rendered[0], full_at_arrival, "hard replacement would fail this");
+            let last = (span as usize - 1) * 2;
+            assert_eq!(rendered[last], full.samples[(arrival as usize + span as usize - 1) * 2] * full.gain_linear);
+            assert_eq!(rendered[span as usize * 2], full.samples[(arrival as usize + span as usize) * 2] * full.gain_linear);
+            assert!(engine.active.as_ref().unwrap().upgrade_fade.is_none());
+        }
+    }
+
+    #[test]
+    fn upgrade_fade_handles_last_preview_frame_and_exhaustion_without_shortening() {
+        let sr = 44_100u32;
+        let span = declick_frames(sr);
+        let full = upgrade_test_track("upgrade.wav", span as usize + 4, 0.25, 1.0, false);
+        for old_playhead in [0u64, 1, 2] {
+            let old = upgrade_test_track("upgrade.wav", 1, 0.75, 1.0, true);
+            let mut deck = Deck {
+                track: full.clone(), playhead: 0, highpass_enabled: false,
+                filter: StereoHighPass::new(sr, 300.0),
+                upgrade_fade: Some(UpgradeFade { track: old, playhead: old_playhead,
+                    frames_into: 0, frames: span }),
+            };
+            let first = read_deck_frame(&mut deck).0;
+            assert_eq!(first, if old_playhead == 0 { 0.75 } else { 0.0 });
+            // Advance in deliberately irregular chunks; the fixed 10ms span,
+            // not old remaining material, controls completion.
+            for chunk in [7u64, 19, span - 1 - 26] {
+                for _ in 0..chunk { let _ = read_deck_frame(&mut deck); }
+            }
+            assert!(deck.upgrade_fade.is_none());
+            assert_eq!(read_deck_frame(&mut deck), (0.25, 0.25));
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -3536,6 +3811,70 @@ mod tests {
             end_err_ms < 8.0,
             "end-anchored outro must stay on analysis kick: err {end_err_ms:.2}ms"
         );
+    }
+
+    fn phase_reference_fixture(sr: u32, beat: f64, kick_shift: i64, hat_shift: i64) -> Vec<f32> {
+        let beats = 64u32;
+        let frames = (f64::from(beats) * beat).round() as usize;
+        let mut mono = vec![0.0f32; frames];
+        for b in 0..beats {
+            let kick = (f64::from(b) * beat).round() as i64 + kick_shift;
+            if kick >= 0 && (kick as usize) < frames {
+                for (i, frame) in (kick as usize..(kick as usize + (0.06 * f64::from(sr)) as usize).min(frames)).enumerate() {
+                    let t = i as f64 / f64::from(sr);
+                    mono[frame] += 0.9 * (-t / 0.03).exp() as f32
+                        * (2.0 * std::f64::consts::PI * 60.0 * t).sin() as f32;
+                }
+            }
+            let hat = (f64::from(b) * beat + beat * 0.5).round() as i64 + hat_shift;
+            if hat >= 0 && (hat as usize) < frames {
+                for (i, frame) in (hat as usize..(hat as usize + (0.02 * f64::from(sr)) as usize).min(frames)).enumerate() {
+                    let t = i as f64 / f64::from(sr);
+                    mono[frame] += 0.45 * (-t / 0.006).exp() as f32
+                        * (2.0 * std::f64::consts::PI * 9_000.0 * t).sin() as f32;
+                }
+            }
+        }
+        mono.into_iter().flat_map(|sample| [sample, sample]).collect()
+    }
+
+    #[test]
+    fn prepared_phase_reference_matches_one_shot_across_geometry_edges() {
+        for sr in [44_100u32, 48_000] {
+            let beat = f64::from(sr) * 60.0 / 198.0;
+            let prev = phase_reference_fixture(sr, beat, 0, 0);
+            let shifted = phase_reference_fixture(sr, beat, 0, (0.07 * f64::from(sr)).round() as i64);
+            let start = (4.0 * beat).round() as u64;
+            let prepared = PreparedPhaseReference::new(&prev, start, sr, beat).expect("reference");
+            assert_eq!(
+                align_next_entry_scored(&prev, start, &shifted, start, sr, beat),
+                prepared.align(&shifted, start),
+                "{sr}Hz ordinary entry",
+            );
+            let early = phase_reference_fixture(sr, beat,
+                -(0.07 * f64::from(sr)).round() as i64, -(0.07 * f64::from(sr)).round() as i64);
+            let head_one_shot = align_next_entry_scored(&prev, start, &early, 0, sr, beat);
+            assert_eq!(head_one_shot, prepared.align(&early, 0), "{sr}Hz head clamp");
+            assert_eq!(head_one_shot.0, 0, "{sr}Hz head entry must stay at zero");
+            assert!(head_one_shot.2 > 0, "{sr}Hz head clamp must nudge prev");
+
+            // The window reduction near the next head must use the same
+            // cached causal reference prefix as a fresh one-shot filter.
+            let short_frames = ((2.8 * beat).round() as usize) * 2;
+            let short = &shifted[..short_frames];
+            assert_eq!(
+                align_next_entry_scored(&prev, 0, short, 0, sr, beat),
+                PreparedPhaseReference::new(&prev, 0, sr, beat).unwrap().align(short, 0),
+                "{sr}Hz short window",
+            );
+
+            let silence = vec![0.0; prev.len()];
+            assert_eq!(
+                align_next_entry_scored(&silence, start, &silence, start, sr, beat),
+                PreparedPhaseReference::new(&silence, start, sr, beat).unwrap().align(&silence, start),
+                "{sr}Hz silence",
+            );
+        }
     }
 
     #[test]
@@ -4046,7 +4385,7 @@ mod tests {
                 for offset in [-1i64, 0, 1] {
                     let earliest = (base as i64 + offset).max(0) as u64;
                     let request = ManualRequest { generation: 1, key: manual_key(NavAction::TransitionToNext, &active, &next),
-                        playhead: earliest, active: Arc::clone(&samples), target: Arc::clone(&samples),
+                        playhead: earliest, deadline: u64::MAX, active: Arc::clone(&samples), target: Arc::clone(&samples),
                         bar_frames: bar, sample_rate: sr, target_bpm: 180.0, fade_bars: 4 };
                     let plan = build_manual_plan(request);
                     assert!(!plan.simple, "sr={sr} beat={beats} offset={offset}: {}", plan.reason);
