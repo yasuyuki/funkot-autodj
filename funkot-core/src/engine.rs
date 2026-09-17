@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
 
-use crate::analysis::{analyze_local_tempo, refine_groove_phase, LocalTempo};
+use crate::analysis::{local_grid_continuous, local_sync_span, refine_groove_phase};
 use crate::filter::StereoHighPass;
 use crate::stretch::{self, position_scale};
 use crate::{cache, decode, EngineOptions, Error, Result, BEATS_PER_BAR, MAIN_GAP_BARS};
@@ -611,9 +611,211 @@ struct ActiveTransition {
     simple: bool,
 }
 
+#[derive(Clone)]
 enum PendingNav {
-    Analyzing { gen: u64 },
-    WaitBar { action: NavAction, at_frame: u64 },
+    Planned(ManualPlan),
+}
+
+/// Identity for a prepared deck as observed by the local-sync planner.  This is
+/// deliberately value-only: a reply never keeps a PCM buffer alive and cannot
+/// be applied to a replacement occupying the same queue slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManualKey {
+    action: NavAction,
+    active_path: PathBuf,
+    active_index: usize,
+    active_ptr: usize,
+    active_frames: u64,
+    active_first: u64,
+    active_preview: bool,
+    target_path: PathBuf,
+    target_index: usize,
+    target_ptr: usize,
+    target_frames: u64,
+    target_first: u64,
+    target_intro: u32,
+    target_preview: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ManualPlan {
+    generation: u64,
+    key: ManualKey,
+    start: u64,
+    entry: u64,
+    prev_nudge: u64,
+    fade_in_end: u64,
+    fade_out_start: u64,
+    fade_out_end: u64,
+    simple: bool,
+    reason: &'static str,
+}
+
+/// Value-only local-sync decision for host diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManualPlanDiagnostic {
+    pub generation: u64,
+    /// Previous deck's scheduled frame, before any fractional phase nudge.
+    pub start: u64,
+    pub entry: u64,
+    pub prev_nudge: u64,
+    /// Target main marker relative to its actual corrected entry.
+    pub next_main: u64,
+    pub fade_in_end: u64,
+    pub fade_out_start: u64,
+    pub fade_out_end: u64,
+    pub simple: bool,
+    pub reason: &'static str,
+}
+
+struct ManualRequest {
+    generation: u64,
+    key: ManualKey,
+    playhead: u64,
+    active: Arc<Vec<f32>>,
+    target: Arc<Vec<f32>>,
+    bar_frames: f64,
+    sample_rate: u32,
+    target_bpm: f64,
+    fade_bars: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ManualDemand { generation: u64, action: NavAction }
+
+fn manual_key(action: NavAction, active: &PreparedTrack, target: &PreparedTrack) -> ManualKey {
+    ManualKey {
+        action, active_path: active.path.clone(), active_index: active.playlist_index,
+        active_ptr: Arc::as_ptr(&active.samples) as usize, active_frames: active.frames,
+        active_first: active.first_downbeat_out, active_preview: active.preview,
+        target_path: target.path.clone(),
+        target_index: target.playlist_index, target_ptr: Arc::as_ptr(&target.samples) as usize,
+        target_frames: target.frames, target_first: target.first_downbeat_out,
+        target_intro: target.intro_bars, target_preview: target.preview,
+    }
+}
+
+/// Pure, off-audio-thread local plan builder.  A repeating beat may validate
+/// propagation from an existing structural marker, but never invents one.
+fn build_manual_plan(request: ManualRequest) -> ManualPlan {
+    let simple = |reason| {
+        let available = request.key.active_frames.saturating_sub(request.playhead)
+            .min(request.key.target_frames.saturating_sub(request.key.target_first));
+        let fade = bar_to_frames(request.fade_bars.max(1), request.bar_frames).min(available);
+        ManualPlan { generation: request.generation, key: request.key.clone(),
+            start: request.playhead, entry: request.key.target_first, prev_nudge: 0,
+            fade_in_end: fade, fade_out_start: 0, fade_out_end: fade,
+            simple: true, reason }
+    };
+    let beat = request.bar_frames / BEATS_PER_BAR as f64;
+    if request.key.active_preview || request.key.target_preview || !(beat.is_finite() && beat > 0.0)
+        || request.key.active_first >= request.key.active_frames
+        || request.key.target_first >= request.key.target_frames {
+        return simple("unprepared material");
+    }
+    // A file's analysed first pulse is an existing structural anchor, not a
+    // new origin selected from the request window. Reject markers preceded by
+    // equally strong material: a one-beat marker error must not become identity.
+    let anchors = manual_anchor_supported(&request.active, request.key.active_first, beat)
+        && manual_anchor_supported(&request.target, request.key.target_first, beat);
+    if !anchors { return simple("structural marker uncertain"); }
+
+    let aligned_configuration = request.fade_bars % 4 == 0 && request.key.target_intro % 4 == 0;
+    let grid_bars = if aligned_configuration { 4.0 } else { 1.0 };
+    let relative = request.playhead.saturating_sub(request.key.active_first) as f64;
+    let mut bars = (relative / request.bar_frames / grid_bars).floor() * grid_bars;
+    let mut start = request.key.active_first.saturating_add((bars * request.bar_frames).round() as u64);
+    // Compare rounded sample positions, not continuous times: ceil would skip
+    // a valid boundary whenever its ideal fractional frame rounds upward.
+    if start < request.playhead {
+        bars += grid_bars;
+        start = request.key.active_first.saturating_add((bars * request.bar_frames).round() as u64);
+    }
+    let remaining = (request.key.active_frames.saturating_sub(start) as f64 / request.bar_frames)
+        .floor().min(u32::MAX as f64) as u32;
+    let mut schedule = plan_transition(request.fade_bars, request.key.target_intro, remaining);
+    let mut shortened_for_drift = false;
+    loop {
+        if schedule.fadeout_end == 0 || schedule.f_eff > schedule.fadeout_end {
+            return simple("insufficient fade material");
+        }
+        let nominal = request.key.target_first.saturating_add(bar_to_frames(schedule.skip, request.bar_frames));
+        let overlap = bar_to_frames(schedule.fadeout_end, request.bar_frames);
+        if start.saturating_add(overlap) > request.key.active_frames
+            || nominal.saturating_add(bar_to_frames(schedule.m, request.bar_frames)) > request.key.target_frames {
+            return simple("insufficient remaining material");
+        }
+        // This on-demand corridor check preserves the count from the marker.
+        // A break/tempo change cannot be bridged by a newly invented kick grid.
+        if !local_grid_continuous(&request.active, request.key.active_first,
+                start.saturating_add(overlap), request.sample_rate, request.target_bpm)
+            || !local_grid_continuous(&request.target, request.key.target_first,
+                nominal.saturating_add(overlap), request.sample_rate, request.target_bpm) {
+            return simple("structural continuity unknown");
+        }
+        let (entry, score, nudge) = align_next_entry_scored(&request.active, start,
+            &request.target, nominal, request.sample_rate, beat);
+        if !score.is_finite() || score <= 0.0
+            || entry.abs_diff(nominal) as f64 >= beat / 2.0 || nudge as f64 >= beat / 2.0 {
+            return simple("phase evidence uncertain");
+        }
+        // The corrected positions, not the nominal ones, bound all subsequent
+        // analysis and material checks. An earlier target entry retains its
+        // fractional phase correction without changing bar identity.
+        let prev_start = start.saturating_add(nudge);
+        let prev_end = prev_start.saturating_add(overlap);
+        let target_end = entry.saturating_add(overlap);
+        if prev_end > request.key.active_frames || target_end > request.key.target_frames
+            || entry.saturating_add(bar_to_frames(schedule.m, request.bar_frames)) > request.key.target_frames {
+            return simple("corrected entry exceeds material");
+        }
+        let Some((a_lo, a_hi)) = local_sync_span(&request.active, prev_start, prev_end,
+            request.sample_rate, request.target_bpm) else { return simple("previous overlap unsafe") };
+        let Some((b_lo, b_hi)) = local_sync_span(&request.target, entry, target_end,
+            request.sample_rate, request.target_bpm) else { return simple("target overlap unsafe") };
+        let delta = (a_hi - b_lo).abs().max((b_hi - a_lo).abs());
+        // Conservative provisional ceiling, exercised by synthetic drift
+        // tests. Listening acceptance is still required before tuning it.
+        let drift = delta * overlap as f64 / request.sample_rate as f64 / 60.0;
+        if drift > 0.125 {
+            if shortened_for_drift { return simple("tempo drift"); }
+            let max_frames = 0.125 * 60.0 / delta * request.sample_rate as f64;
+            let fade_bars = (max_frames / request.bar_frames / 2.0).floor() as u32;
+            if fade_bars == 0 || fade_bars >= schedule.f_eff { return simple("tempo drift"); }
+            schedule = plan_transition(fade_bars, request.key.target_intro, remaining);
+            shortened_for_drift = true;
+            // Changing fade length changes entry: recompute phase and inspect
+            // the new overlap instead of reusing the previous correction.
+            continue;
+        }
+        let four_bar = aligned_configuration && schedule.skip % 4 == 0
+            && schedule.f_eff % 4 == 0 && schedule.fadeout_start % 4 == 0
+            && schedule.fadeout_end % 4 == 0 && schedule.m % 4 == 0;
+        let reason = if four_bar { "four-bar sync" }
+            else if shortened_for_drift { "bar sync: drift shortened" }
+            else if schedule.f_eff != request.fade_bars { "bar sync: material shortened" }
+            else { "bar sync: explicit fade or intro" };
+        return ManualPlan { generation: request.generation, key: request.key, start, entry,
+            prev_nudge: nudge, fade_in_end: bar_to_frames(schedule.f_eff, request.bar_frames),
+            fade_out_start: bar_to_frames(schedule.fadeout_start, request.bar_frames),
+            fade_out_end: overlap, simple: false, reason };
+    }
+}
+
+fn manual_anchor_supported(samples: &[f32], anchor: u64, beat: f64) -> bool {
+    let frames = (samples.len() / 2) as u64;
+    if anchor >= frames || !beat.is_finite() || beat <= 0.0 { return false; }
+    // At the physical beginning there is no earlier pulse to confuse with the
+    // supplied marker. A lead-in marker must separate quiet from audible audio.
+    if (anchor as f64) < beat / 2.0 { return true; }
+    let before = anchor.saturating_sub((beat * 4.0).round() as u64);
+    let after = anchor.saturating_add((beat * 4.0).round() as u64).min(frames);
+    let energy = |a: u64, b: u64| {
+        let slice = &samples[a as usize * 2..b as usize * 2];
+        slice.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / slice.len().max(1) as f64
+    };
+    let post = energy(anchor, after);
+    post > 1e-12 && energy(before, anchor) < post / 2.0
 }
 
 /// Free a finished deck off the audio thread.
@@ -703,7 +905,15 @@ pub struct Engine {
     nav_rx: Receiver<NavAction>,
     pending_nav: Option<PendingNav>,
     nav_gen: u64,
-    nav_tempo_rx: Option<Receiver<(u64, NavAction, Option<LocalTempo>)>>,
+    /// One long-lived local planner.  The request channel is capacity one;
+    /// when it is occupied the engine retains just the newest snapshot.
+    manual_tx: SyncSender<ManualRequest>,
+    manual_rx: Receiver<ManualPlan>,
+    manual_pending: Option<ManualDemand>,
+    manual_in_flight: bool,
+    manual_deadline: Option<u64>,
+    manual_action: Option<NavAction>,
+    last_manual_plan: Option<ManualPlan>,
 }
 
 impl Engine {
@@ -752,6 +962,13 @@ impl Engine {
             .spawn(move || loader_main(opts, source, msg_tx, permit_rx, shutdown_flag))
             .map_err(|e| Error::Engine(format!("spawn loader: {e}")))?;
 
+        let (manual_tx, manual_work_rx) = mpsc::sync_channel(1);
+        let (manual_result_tx, manual_rx) = mpsc::sync_channel(1);
+        thread::Builder::new().name("funkot-local-sync".into()).spawn(move || {
+            while let Ok(request) = manual_work_rx.recv() {
+                if manual_result_tx.send(build_manual_plan(request)).is_err() { break; }
+            }
+        }).map_err(|e| Error::Engine(format!("spawn local sync worker: {e}")))?;
         Ok(Self {
             options,
             bar_frames,
@@ -780,7 +997,7 @@ impl Engine {
             nav_rx,
             pending_nav: None,
             nav_gen: 0,
-            nav_tempo_rx: None,
+            manual_tx, manual_rx, manual_pending: None, manual_in_flight: false, manual_deadline: None, manual_action: None, last_manual_plan: None,
         })
     }
 
@@ -831,6 +1048,13 @@ impl Engine {
             .spawn(move || prepared_loader_main(rest, msg_tx, permit_rx, shutdown_flag))
             .map_err(|e| Error::Engine(format!("spawn prepared loader: {e}")))?;
 
+        let (manual_tx, manual_work_rx) = mpsc::sync_channel(1);
+        let (manual_result_tx, manual_rx) = mpsc::sync_channel(1);
+        thread::Builder::new().name("funkot-local-sync".into()).spawn(move || {
+            while let Ok(request) = manual_work_rx.recv() {
+                if manual_result_tx.send(build_manual_plan(request)).is_err() { break; }
+            }
+        }).map_err(|e| Error::Engine(format!("spawn local sync worker: {e}")))?;
         let mut engine = Self {
             options,
             bar_frames,
@@ -859,7 +1083,7 @@ impl Engine {
             nav_rx,
             pending_nav: None,
             nav_gen: 0,
-            nav_tempo_rx: None,
+            manual_tx, manual_rx, manual_pending: None, manual_in_flight: false, manual_deadline: None, manual_action: None, last_manual_plan: None,
         };
         if let Some(track) = first {
             engine.start_first(track);
@@ -966,6 +1190,16 @@ impl Engine {
         self.transition.as_ref().map(|t| t.frames_into)
     }
 
+    /// Most recently adopted local plan, without retaining audio ownership.
+    pub fn last_manual_plan_diagnostic(&self) -> Option<ManualPlanDiagnostic> {
+        self.last_manual_plan.as_ref().map(|p| ManualPlanDiagnostic { generation: p.generation,
+            start: p.start, entry: p.entry, prev_nudge: p.prev_nudge,
+            next_main: p.key.target_first.saturating_add(bar_to_frames(p.key.target_intro, self.bar_frames)).saturating_sub(p.entry),
+            fade_in_end: p.fade_in_end,
+            fade_out_start: p.fade_out_start, fade_out_end: p.fade_out_end,
+            simple: p.simple, reason: p.reason })
+    }
+
     /// Path of the track prepared to follow the active one, if any.
     ///
     /// `None` covers two distinct situations a host can't tell apart from this
@@ -1011,6 +1245,7 @@ impl Engine {
     pub fn revoke_next(&mut self) -> Option<PathBuf> {
         let track = self.take_next()?;
         let path = track.path.clone();
+        self.cancel_pending_nav();
         self.clear_phase_align();
         retire_prepared(track);
         self.release_permit();
@@ -1029,6 +1264,7 @@ impl Engine {
     }
 
     pub fn stop(&mut self) {
+        self.cancel_pending_nav();
         self.stopped = true;
         self.shutdown.store(true, Ordering::SeqCst);
         while let Ok(msg) = self.loader_rx.try_recv() {
@@ -1202,90 +1438,64 @@ impl Engine {
 
         self.cancel_pending_nav();
         self.nav_gen = self.nav_gen.wrapping_add(1);
-        let gen = self.nav_gen;
-        let Some(active) = self.active.as_ref() else {
-            return;
-        };
-        let samples = Arc::clone(&active.track.samples);
-        let playhead = active.playhead;
-        let sr = self.options.output_sample_rate;
-        let target = self.options.target_bpm();
-
-        // Offline / tests: analyze inline (deterministic, no callback stall concern).
-        if self.block_on_preview_upgrade {
-            let tempo = analyze_local_tempo(&samples, playhead, sr, target);
-            let dj = tempo.map(|t| t.in_transition_range).unwrap_or(false);
-            if dj {
-                let at = tempo.map(|t| t.next_bar_frame).unwrap_or(playhead);
-                self.pending_nav = Some(PendingNav::WaitBar {
-                    action,
-                    at_frame: at,
-                });
-            } else {
-                self.execute_nav_transition(action, true);
-            }
-            return;
-        }
-
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.nav_tempo_rx = Some(rx);
-        self.pending_nav = Some(PendingNav::Analyzing { gen });
-        let _ = thread::Builder::new()
-            .name("funkot-nav-tempo".into())
-            .spawn(move || {
-                let tempo = analyze_local_tempo(&samples, playhead, sr, target);
-                let _ = tx.send((gen, action, tempo));
-            });
+        let Some(active) = self.active.as_ref() else { return };
+        // The worker gets only the material that can still be used.  When that
+        // deadline passes we make one bounded simple transition, never restart
+        // an obsolete analysis loop indefinitely.
+        let simple_fade = bar_to_frames(self.options.fade_bars.max(1), self.bar_frames);
+        let material_end = active.track.frames.saturating_sub(simple_fade);
+        let natural_end = if active.track.outro_start_out > active.playhead { active.track.outro_start_out } else { material_end };
+        self.manual_deadline = Some(active.playhead.saturating_add(bar_to_frames(16, self.bar_frames)).min(natural_end).min(material_end));
+        self.manual_action = Some(action);
+        self.manual_pending = Some(ManualDemand { generation: self.nav_gen, action });
+        self.kick_manual_plan_if_idle();
     }
 
     fn cancel_pending_nav(&mut self) {
         self.pending_nav = None;
-        self.nav_tempo_rx = None;
+        self.manual_pending = None;
+        self.manual_deadline = None;
+        self.manual_action = None;
         self.nav_gen = self.nav_gen.wrapping_add(1);
     }
 
     fn poll_nav_tempo(&mut self) {
-        let Some(rx) = self.nav_tempo_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok((gen, action, tempo)) => {
-                self.nav_tempo_rx = None;
-                let still = matches!(
-                    self.pending_nav,
-                    Some(PendingNav::Analyzing { gen: g }) if g == gen
-                );
-                if !still {
-                    return;
-                }
-                let dj = tempo.map(|t| t.in_transition_range).unwrap_or(false);
-                if dj {
-                    let at = tempo
-                        .map(|t| t.next_bar_frame)
-                        .unwrap_or_else(|| self.active.as_ref().map(|d| d.playhead).unwrap_or(0));
-                    self.pending_nav = Some(PendingNav::WaitBar {
-                        action,
-                        at_frame: at,
-                    });
-                } else {
-                    self.pending_nav = None;
-                    self.execute_nav_transition(action, true);
-                }
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.nav_tempo_rx = None;
-                if matches!(self.pending_nav, Some(PendingNav::Analyzing { .. })) {
-                    self.pending_nav = None;
-                }
-            }
-        }
+        loop { match self.manual_rx.try_recv() {
+            Ok(plan) => { self.manual_in_flight = false; if plan.generation == self.nav_gen && self.manual_plan_matches(&plan) { self.pending_nav = Some(PendingNav::Planned(plan)); } },
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => { self.manual_in_flight = false; self.manual_pending = None; break },
+        }}
+        self.kick_manual_plan_if_idle();
     }
 
     fn tick_pending_nav(&mut self) {
-        let Some(PendingNav::WaitBar { action, at_frame }) = self.pending_nav else {
+        let exact_ready = match (self.pending_nav.as_ref(), self.active.as_ref()) {
+            (Some(PendingNav::Planned(plan)), Some(active)) => plan.start == active.playhead
+                && plan.generation == self.nav_gen && self.manual_plan_matches(plan),
+            _ => false,
+        };
+        if let (Some(deadline), Some(action), Some(active)) = (self.manual_deadline, self.manual_action, self.active.as_ref()) {
+            if active.playhead >= deadline && !exact_ready {
+                self.manual_deadline = None;
+                self.manual_action = None;
+                self.manual_pending = None;
+                self.pending_nav = None;
+                self.nav_gen = self.nav_gen.wrapping_add(1);
+                if let Some(plan) = self.manual_simple_plan(action, "deadline fallback") {
+                    self.commit_manual_plan(plan);
+                }
+                return;
+            }
+        }
+        let Some(PendingNav::Planned(plan)) = self.pending_nav.as_ref() else {
             return;
         };
+        if plan.generation != self.nav_gen || !self.manual_plan_matches(plan) {
+            self.pending_nav = None;
+            return;
+        }
+        let start = plan.start;
+        let action = plan.key.action;
         let playhead = match self.active.as_ref() {
             Some(d) => d.playhead,
             None => {
@@ -1293,18 +1503,129 @@ impl Engine {
                 return;
             }
         };
-        if playhead >= at_frame {
+        if playhead > start {
+            // Missing an exact frame never applies a late plan.  Rebuild from
+            // the live position; this also bounds a slow worker to useful work.
             self.pending_nav = None;
-            self.execute_nav_transition(action, false);
+            if self.manual_deadline.is_some_and(|deadline| playhead < deadline) {
+                self.manual_pending = Some(ManualDemand { generation: self.nav_gen, action });
+                self.kick_manual_plan_if_idle();
+            } else {
+                self.manual_deadline = None;
+                self.manual_action = None;
+                if let Some(plan) = self.manual_simple_plan(action, "late preparation fallback") {
+                    self.commit_manual_plan(plan);
+                }
+            }
+        } else if playhead == start {
+            let Some(PendingNav::Planned(plan)) = self.pending_nav.take() else { return };
+            self.manual_deadline = None;
+            self.manual_action = None;
+            self.commit_manual_plan(plan);
         }
+    }
+
+    fn manual_plan_matches(&self, plan: &ManualPlan) -> bool {
+        let Some(active) = self.active.as_ref() else { return false };
+        let target = match plan.key.action {
+            NavAction::RestartCurrent => &active.track,
+            NavAction::TransitionToPrev => match self.last_track.as_ref() { Some(t) => t, None => return false },
+            NavAction::TransitionToNext => match self.next_track.as_ref() { Some(t) => t, None => return false },
+            _ => return false,
+        };
+        // This runs while waiting on every rendered frame. Compare borrowed
+        // identity fields; constructing a key here would allocate two paths
+        // per sample on the audio thread.
+        let key = &plan.key;
+        key.active_path == active.track.path
+            && key.active_index == active.track.playlist_index
+            && key.active_ptr == Arc::as_ptr(&active.track.samples) as usize
+            && key.active_frames == active.track.frames
+            && key.active_first == active.track.first_downbeat_out
+            && key.active_preview == active.track.preview
+            && key.target_path == target.path
+            && key.target_index == target.playlist_index
+            && key.target_ptr == Arc::as_ptr(&target.samples) as usize
+            && key.target_frames == target.frames
+            && key.target_first == target.first_downbeat_out
+            && key.target_intro == target.intro_bars
+            && key.target_preview == target.preview
+    }
+
+    fn kick_manual_plan_if_idle(&mut self) {
+        if self.manual_in_flight { return; }
+        let Some(demand) = self.manual_pending.take() else { return };
+        let Some(active) = self.active.as_ref() else { return };
+        let target = match demand.action {
+            NavAction::RestartCurrent => &active.track,
+            NavAction::TransitionToPrev => match self.last_track.as_ref() { Some(t) => t, None => return },
+            NavAction::TransitionToNext => match self.next_track.as_ref() { Some(t) => t, None => return },
+            _ => return,
+        };
+        let request = ManualRequest { generation: demand.generation,
+            key: manual_key(demand.action, &active.track, target),
+            // Reserve a scheduling quantum; a result whose start is already
+            // behind the current render frame is never committed.
+            playhead: active.playhead.saturating_add(bar_to_frames(1, self.bar_frames)).min(active.track.frames),
+            active: Arc::clone(&active.track.samples), target: Arc::clone(&target.samples),
+            bar_frames: self.bar_frames, sample_rate: self.options.output_sample_rate,
+            target_bpm: self.options.target_bpm(), fade_bars: self.options.fade_bars };
+        // Offline rendering uses the identical pure builder synchronously for
+        // deterministic output; realtime always hands it to the sole worker.
+        if self.block_on_preview_upgrade {
+            let plan = build_manual_plan(request);
+            if plan.generation == self.nav_gen && self.manual_plan_matches(&plan) {
+                self.pending_nav = Some(PendingNav::Planned(plan));
+            }
+            return;
+        }
+        match self.manual_tx.try_send(request) {
+            Ok(()) => self.manual_in_flight = true,
+            Err(TrySendError::Full(_)) => { self.manual_pending = Some(demand); },
+            Err(TrySendError::Disconnected(_)) => {},
+        }
+    }
+
+    fn commit_manual_plan(&mut self, plan: ManualPlan) {
+        if !self.manual_plan_matches(&plan) { return; }
+        let action = plan.key.action;
+        let target = match action {
+            NavAction::RestartCurrent => match self.active.as_ref() { Some(d) => d.track.clone(), None => return },
+            NavAction::TransitionToPrev => match self.last_track.take() { Some(t) => t, None => return },
+            NavAction::TransitionToNext => match self.take_next() { Some(t) => t, None => return },
+            _ => return,
+        };
+        self.last_manual_plan = Some(plan.clone());
+        self.begin_transition_to(target, plan, matches!(action, NavAction::RestartCurrent));
+    }
+
+    fn manual_simple_plan(&self, action: NavAction, reason: &'static str) -> Option<ManualPlan> {
+        let active = self.active.as_ref()?;
+        let target = match action {
+            NavAction::RestartCurrent => &active.track,
+            NavAction::TransitionToPrev => self.last_track.as_ref()?,
+            NavAction::TransitionToNext => self.next_track.as_ref()?,
+            _ => return None,
+        };
+        let available = active.track.frames.saturating_sub(active.playhead)
+            .min(target.frames.saturating_sub(target.first_downbeat_out));
+        let fade = bar_to_frames(self.options.fade_bars.max(1), self.bar_frames).min(available);
+        Some(ManualPlan { generation: self.nav_gen, key: manual_key(action, &active.track, target),
+            start: active.playhead, entry: target.first_downbeat_out, prev_nudge: 0,
+            fade_in_end: fade, fade_out_start: 0, fade_out_end: fade, simple: true, reason })
     }
 
     fn abort_active_transition(&mut self) {
         self.transition = None;
         self.awaiting_next_at_outro = false;
         if let Some(deck) = self.prev.take() {
-            // Mid-transition abort: prev loses its slot.
-            self.release_permit();
+            // RestartCurrent shares active's permit. Aborting that overlap
+            // must not grant a nonexistent free loader slot on every tap.
+            let shared = self.active.as_ref().is_some_and(|active| {
+                active.track.playlist_index == deck.track.playlist_index
+                    && active.track.path == deck.track.path
+            });
+            if !shared { self.release_permit(); }
             retire_deck(deck);
         }
         self.clear_phase_align();
@@ -1337,33 +1658,11 @@ impl Engine {
         }
     }
 
-    fn execute_nav_transition(&mut self, action: NavAction, simple: bool) {
-        let target = match action {
-            NavAction::RestartCurrent => {
-                let Some(active) = self.active.as_ref() else {
-                    return;
-                };
-                active.track.clone()
-            }
-            NavAction::TransitionToPrev => match self.last_track.take() {
-                Some(t) => t,
-                None => return,
-            },
-            NavAction::TransitionToNext => match self.take_next() {
-                Some(t) => t,
-                None => return,
-            },
-            NavAction::JumpToPrevIntro | NavAction::JumpToNextIntro => return,
-        };
-
-        // RestartCurrent shares the same Arc buffer — no extra permit.
-        let restart_same = matches!(action, NavAction::RestartCurrent);
-        self.begin_transition_to(target, simple, restart_same);
-    }
-
-    /// Start a user-triggered or automatic-style transition onto `next`.
-    fn begin_transition_to(&mut self, next: PreparedTrack, simple: bool, restart_same: bool) {
+    /// Commit an already validated manual plan. No analysis or planning runs here.
+    fn begin_transition_to(&mut self, next: PreparedTrack, plan: ManualPlan, restart_same: bool) {
         self.abort_active_transition();
+        // Replacing the active deck invalidates every uncommitted local reply.
+        self.cancel_pending_nav();
         let Some(active) = self.active.take() else {
             if !restart_same {
                 // Put next back where it came from if we can.
@@ -1372,42 +1671,8 @@ impl Engine {
             return;
         };
 
-        let plan = plan_transition(
-            self.options.fade_bars,
-            next.intro_bars,
-            active.track.outro_bars.max(self.options.fade_bars * 2),
-        );
-        let nominal = next
-            .first_downbeat_out
-            .saturating_add(bar_to_frames(plan.skip, self.bar_frames));
-
-        let (entry, prev_nudge) = if simple {
-            (nominal, 0)
-        } else {
-            let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
-            self.poll_phase_align();
-            match self.phase_align_ready.take() {
-                Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
-                _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
-                    &active.track.samples,
-                    active.playhead,
-                    &next.samples,
-                    nominal,
-                    active.track.outro_start_out,
-                    active.track.outro_end_anchored_out,
-                    self.options.output_sample_rate,
-                    beat_frames,
-                ),
-                _ => (nominal, 0),
-            }
-        };
-        self.clear_phase_align();
-        let entry = if next.head_only { next.first_downbeat_out } else { entry };
-        let entry = if next.frames == 0 {
-            0
-        } else {
-            entry.min(next.frames - 1)
-        };
+        let entry = plan.entry;
+        let prev_nudge = plan.prev_nudge;
 
         let from_path = active.track.path.clone();
         let to_path = next.path.clone();
@@ -1419,7 +1684,7 @@ impl Engine {
         let next_deck = Deck {
             track: next,
             playhead: entry,
-            highpass_enabled: !simple,
+            highpass_enabled: !plan.simple,
             filter: StereoHighPass::new(self.options.output_sample_rate, self.options.highpass_hz),
         };
 
@@ -1430,16 +1695,8 @@ impl Engine {
             prev_deck.playhead = prev_deck.playhead.saturating_add(prev_nudge).min(max_ph);
         }
 
-        let (fade_in_end, fade_out_start, fade_out_end) = if simple {
-            let n = bar_to_frames(self.options.fade_bars.max(1), self.bar_frames);
-            (n, 0, n)
-        } else {
-            (
-                bar_to_frames(plan.f_eff, self.bar_frames),
-                bar_to_frames(plan.fadeout_start, self.bar_frames),
-                bar_to_frames(plan.fadeout_end, self.bar_frames),
-            )
-        };
+        let (fade_in_end, fade_out_start, fade_out_end) =
+            (plan.fade_in_end, plan.fade_out_start, plan.fade_out_end);
 
         self.pending_events.push(EngineEvent::TransitionStarted {
             from: from_path,
@@ -1459,7 +1716,7 @@ impl Engine {
             fade_in_end,
             fade_out_start,
             fade_out_end,
-            simple,
+            simple: plan.simple,
         });
         self.awaiting_next_at_outro = false;
         self.arm_third_permit_if_needed();
@@ -1607,6 +1864,7 @@ impl Engine {
                 retire_prepared(old);
                 // Markers / buffer changed — any in-flight align is stale.
                 self.clear_phase_align();
+                self.cancel_pending_nav();
                 self.kick_phase_align_if_needed();
                 return;
             }
@@ -1616,6 +1874,7 @@ impl Engine {
                 let old = std::mem::replace(next, track);
                 retire_prepared(old);
                 self.clear_phase_align();
+                self.cancel_pending_nav();
                 self.kick_phase_align_if_needed();
                 return;
             }
@@ -1716,6 +1975,7 @@ impl Engine {
     }
 
     fn start_first(&mut self, track: PreparedTrack) {
+        self.cancel_pending_nav();
         let path = track.path.clone();
         let index = track.playlist_index;
         let playhead = track.first_downbeat_out.min(track.frames);
@@ -1806,6 +2066,7 @@ impl Engine {
 
     /// `bars_already_into_outro`: 0 for on-time start; >0 when delayed (O reduced).
     fn begin_transition(&mut self, bars_already_into_outro: u32) {
+        self.cancel_pending_nav();
         let next = match self.take_next() {
             Some(t) => t,
             None => return,
@@ -1829,8 +2090,8 @@ impl Engine {
         // Prefer the background align when it matches this trigger playhead.
         // Realtime hosts must not fall back to in-callback kick/hat search —
         // that stalls the audio thread under load (noise / dropouts). Offline
-        // render keeps the sync compute for bit-stable WAVs. Manual nav via
-        // [`Self::begin_transition_to`] uses the same realtime/offline policy.
+        // render keeps the sync compute for bit-stable WAVs.
+        // Manual navigation supplies its correction in a prepared plan instead.
         let (entry, prev_nudge) = match self.phase_align_ready.take() {
             Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
             _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
@@ -2805,6 +3066,10 @@ fn fisher_yates(order: &mut [usize], rng: &mut Rng) {
 }
 
 #[cfg(test)]
+#[path = "manual_plan_tests.rs"]
+mod manual_plan_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis::refine_periodic_phase;
@@ -2911,9 +3176,9 @@ mod tests {
         ] {
             let mut engine = phase_test_engine(true, 8, 44_100);
             let _delayed_sender = install_phase_receiver(&mut engine, state);
-            let next = engine.take_next().expect("next track");
+            let plan = engine.manual_simple_plan(NavAction::TransitionToNext, "worker unavailable").unwrap();
             reset_phase_align_calls_on_thread();
-            engine.begin_transition_to(next, false, false);
+            engine.commit_manual_plan(plan);
             assert_eq!(phase_align_calls_on_thread(), 0, "nav fallback");
             assert_eq!(engine.active.as_ref().unwrap().playhead, 0, "nominal nav entry");
         }
@@ -3760,5 +4025,185 @@ mod tests {
         assert!(cache_dir.join(format!("{hash}.json")).is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_planner_keeps_stable_markers_on_four_bar_grid() {
+        for sr in [44_100, 48_000] {
+            let audio = synth_track(180.0, 16, 32, 16, sr);
+            let samples = Arc::new(audio.samples);
+            let bar = f64::from(sr) * 60.0 / 180.0 * 4.0;
+            let frames = (samples.len() / 2) as u64;
+            for beats in 0..=16u64 {
+                let active = PreparedTrack { path: PathBuf::from("active.wav"), playlist_index: 0,
+                    samples: Arc::clone(&samples), frames, first_downbeat_out: 0,
+                    outro_start_out: frames.saturating_sub(bar_to_frames(16, bar)),
+                    outro_end_anchored_out: frames.saturating_sub(bar_to_frames(16, bar)),
+                    intro_bars: 16, outro_bars: 16, gain_linear: 1.0, preview: false, head_only: false };
+                let next = PreparedTrack { path: PathBuf::from("next.wav"), playlist_index: 1,
+                    samples: Arc::clone(&samples), ..active.clone() };
+                let base = (beats as f64 * bar / 4.0).round() as u64;
+                for offset in [-1i64, 0, 1] {
+                    let earliest = (base as i64 + offset).max(0) as u64;
+                    let request = ManualRequest { generation: 1, key: manual_key(NavAction::TransitionToNext, &active, &next),
+                        playhead: earliest, active: Arc::clone(&samples), target: Arc::clone(&samples),
+                        bar_frames: bar, sample_rate: sr, target_bpm: 180.0, fade_bars: 4 };
+                    let plan = build_manual_plan(request);
+                    assert!(!plan.simple, "sr={sr} beat={beats} offset={offset}: {}", plan.reason);
+                    assert_eq!(plan.reason, "four-bar sync");
+                    let expect_start = ((earliest as f64 / (4.0 * bar)).ceil() * 4.0 * bar).round() as u64;
+                    assert_eq!(plan.start, expect_start, "sr={sr} beat={beats} offset={offset}");
+                    assert!(plan.start >= earliest);
+                    assert_eq!(plan.entry, bar_to_frames(0, bar));
+                    assert_eq!(plan.fade_in_end, bar_to_frames(4, bar));
+                    assert_eq!(plan.fade_out_start, bar_to_frames(4, bar));
+                    assert_eq!(plan.fade_out_end, bar_to_frames(8, bar));
+                }
+            }
+        }
+    }
+
+    fn controlled_manual_plan(engine: &Engine, action: NavAction, start: u64, entry: u64) -> ManualPlan {
+        let active = engine.active.as_ref().expect("active");
+        let target = match action {
+            NavAction::TransitionToNext => engine.next_track.as_ref().expect("next"),
+            NavAction::TransitionToPrev => engine.last_track.as_ref().expect("previous"),
+            NavAction::RestartCurrent => &active.track,
+            _ => panic!("not a transition"),
+        };
+        ManualPlan { generation: engine.nav_gen, key: manual_key(action, &active.track, target),
+            start, entry, prev_nudge: 0, fade_in_end: 1, fade_out_start: 0,
+            fade_out_end: 1, simple: true, reason: "controlled reply" }
+    }
+
+    #[test]
+    fn manual_reply_commits_only_on_the_exact_frame() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let start = engine.active.as_ref().unwrap().playhead + 2;
+        engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, start, 7)));
+        engine.tick_pending_nav();
+        assert!(engine.transition.is_none());
+        engine.active.as_mut().unwrap().playhead = start;
+        engine.tick_pending_nav();
+        assert_eq!(engine.active.as_ref().unwrap().playhead, 7);
+        assert!(engine.transition.is_some());
+    }
+
+    #[test]
+    fn late_manual_reply_replans_without_an_intermediate_transition() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        engine.manual_tx = request_tx;
+        let now = engine.active.as_ref().unwrap().playhead;
+        let generation = engine.nav_gen;
+        engine.manual_deadline = Some(now + 32);
+        engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, now - 1, 7)));
+        engine.tick_pending_nav();
+        assert!(engine.transition.is_none());
+        let replanned = request_rx.try_recv().expect("fresh work was dispatched");
+        assert!(replanned.playhead > now, "the new phase search must use a future position");
+        assert_eq!(replanned.generation, generation);
+        assert_eq!(replanned.key.action, NavAction::TransitionToNext);
+        assert_eq!(engine.manual_deadline, Some(now + 32), "retry must not extend the deadline");
+        assert!(engine.manual_in_flight);
+    }
+
+    #[test]
+    fn deadline_beats_ready_reply_once_and_records_simple_plan() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let now = engine.active.as_ref().unwrap().playhead;
+        engine.manual_deadline = Some(now);
+        engine.manual_action = Some(NavAction::TransitionToNext);
+        engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, now + 8, 7)));
+        engine.tick_pending_nav();
+        assert!(engine.transition.is_some());
+        let diagnostic = engine.last_manual_plan_diagnostic().expect("fallback diagnostic");
+        assert!(diagnostic.simple);
+        assert_eq!(diagnostic.reason, "deadline fallback");
+        engine.tick_pending_nav();
+        assert_eq!(engine.last_manual_plan_diagnostic().unwrap(), diagnostic);
+    }
+
+    #[test]
+    fn exact_ready_reply_wins_at_its_deadline() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let now = engine.active.as_ref().unwrap().playhead;
+        engine.manual_deadline = Some(now);
+        engine.manual_action = Some(NavAction::TransitionToNext);
+        engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, now, 13)));
+        engine.tick_pending_nav();
+        assert_eq!(engine.active.as_ref().unwrap().playhead, 13);
+        assert_eq!(engine.last_manual_plan_diagnostic().unwrap().reason, "controlled reply");
+    }
+
+    #[test]
+    fn stale_manual_reply_after_new_generation_is_ignored() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let now = engine.active.as_ref().unwrap().playhead;
+        let mut reply = controlled_manual_plan(&engine, NavAction::TransitionToNext, now, 7);
+        reply.generation = engine.nav_gen.wrapping_sub(1);
+        engine.pending_nav = Some(PendingNav::Planned(reply));
+        engine.tick_pending_nav();
+        assert!(engine.transition.is_none());
+        assert!(engine.pending_nav.is_none());
+    }
+
+    #[test]
+    fn target_replacement_revocation_and_stop_invalidate_accepted_plan() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let now = engine.active.as_ref().unwrap().playhead;
+        engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, now + 4, 7)));
+        let before = engine.nav_gen;
+        let mut replacement = engine.next_track.as_ref().unwrap().clone();
+        replacement.samples = Arc::new(vec![0.1; replacement.samples.len()]);
+        engine.apply_upgrade(replacement);
+        assert!(engine.pending_nav.is_none());
+        assert_ne!(engine.nav_gen, before);
+
+        engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, now + 4, 7)));
+        assert!(engine.revoke_next().is_some());
+        assert!(engine.pending_nav.is_none());
+        engine.stop();
+        assert!(engine.pending_nav.is_none());
+    }
+
+    #[test]
+    fn disconnected_worker_resolves_at_deadline_without_waiting() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let (tx, rx) = mpsc::sync_channel::<ManualPlan>(1);
+        drop(tx);
+        engine.manual_rx = rx;
+        engine.manual_in_flight = true;
+        let now = engine.active.as_ref().unwrap().playhead;
+        engine.manual_deadline = Some(now);
+        engine.manual_action = Some(NavAction::TransitionToNext);
+        engine.poll_nav_tempo();
+        assert!(!engine.manual_in_flight);
+        engine.tick_pending_nav();
+        assert!(engine.transition.is_some());
+        assert_eq!(engine.last_manual_plan_diagnostic().unwrap().reason, "deadline fallback");
+    }
+
+    #[test]
+    fn realtime_controlled_reply_uses_corrected_entry_in_output() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let mut target = vec![0.0; 1024 * 2];
+        target[0] = 0.01;
+        target[1] = -0.02;
+        target[19 * 2] = 0.25;
+        target[19 * 2 + 1] = -0.5;
+        engine.next_track.as_mut().unwrap().samples = Arc::new(target);
+        let now = engine.active.as_ref().unwrap().playhead;
+        engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, now, 19)));
+        engine.tick_pending_nav();
+        assert_eq!(engine.active.as_ref().unwrap().playhead, 19);
+        assert_eq!(engine.render_one_frame(), (0.25, -0.5));
     }
 }

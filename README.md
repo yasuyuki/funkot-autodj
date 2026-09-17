@@ -107,10 +107,12 @@ During live playback:
   - ×2: jump immediately to the next track's intro
 - **Ctrl+C** / kill — stop
 
-On each navigational transition the engine estimates BPM near the playhead.
-If it falls in the Funkot band (source-equivalent 172–188 BPM), the mix waits
-for the next bar boundary and uses the normal DJ transition; otherwise it uses
-a simple linear crossfade (no high-pass / phase lock).
+Navigational transitions prepare a plan while playback continues. When the
+structural markers and local pulse remain reliable, the engine prefers a future
+four-bar boundary and checks both tracks through the end of the overlap.
+Uncertain structure, tempo drift, short material, or late preparation can
+require a shorter or simpler transition. Immediate intro jumps remain immediate.
+See [transition alignment](docs/transition-phase.md) for the evidence and limitations.
 
 Supported formats: MP3 / AAC(m4a) / ALAC(m4a) / FLAC / Ogg Vorbis / WAV. If `ffmpeg`
 is on `PATH`, other formats (Opus, WMA, AIFF, APE, …) are converted to FLAC on the

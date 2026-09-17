@@ -195,10 +195,12 @@ pub struct SectionEstimate {
 pub struct LocalTempo {
     /// Estimated BPM in the output / playback domain.
     pub bpm: f64,
-    /// Next bar-boundary frame at or after `playhead` (output domain).
+    /// Legacy four-beat projection from a local kick (output domain).
+    /// This has no known bar or four-bar identity. Navigation must use a
+    /// validated structural marker instead; retained for source compatibility.
     pub next_bar_frame: u64,
-    /// `true` when `bpm` falls in the Funkot transition band around `target_bpm`
-    /// (source-equivalent 172..=188 mapped by `target_bpm / 180`).
+    /// Local pulse passes the transition band and competing-tempo tests.
+    /// This alone does not prove stability over a future overlap or bar identity.
     pub in_transition_range: bool,
 }
 
@@ -215,6 +217,10 @@ pub fn analyze_local_tempo(
     if sample_rate == 0 || !target_bpm.is_finite() || target_bpm <= 0.0 {
         return None;
     }
+    // A beat needs enough envelope samples to distinguish phase and coverage.
+    if 60.0 * sample_rate as f64 / target_bpm < (HOP * 8) as f64 {
+        return None;
+    }
     let frames = (interleaved.len() / 2) as u64;
     if frames < 8 || playhead >= frames {
         return None;
@@ -222,6 +228,10 @@ pub fn analyze_local_tempo(
 
     let sr = f64::from(sample_rate);
     let win_frames = ((8.0 * sr).round() as u64).max(1);
+    let beat_frames = 60.0 * sr / target_bpm;
+    if !beat_frames.is_finite() || beat_frames * 8.0 > frames.min(win_frames) as f64 {
+        return None;
+    }
     let half = win_frames / 2;
     let start = playhead.saturating_sub(half);
     let end = (start + win_frames).min(frames);
@@ -257,12 +267,130 @@ pub fn analyze_local_tempo(
         .round()
         .clamp(0.0, (frames.saturating_sub(1)) as f64) as u64;
 
-    let in_transition_range = (bpm_lo..=bpm_hi).contains(&bpm);
+    let in_transition_range = (bpm_lo..=bpm_hi).contains(&bpm)
+        && local_period_supported(&onset.novelty, bpm, sample_rate, target_bpm)
+        && local_grid_continuous(&interleaved[start as usize * 2..end as usize * 2],
+            0, end - start, sample_rate, bpm);
     Some(LocalTempo {
         bpm,
         next_bar_frame,
         in_transition_range,
     })
+}
+
+/// Local evidence is stricter than whole-track genre classification: both
+/// metrical aliases and unrelated tempi compete with the proposed pulse.
+/// The short-window limits are exercised by the local-tempo regressions;
+/// they are deliberately independent of the intro/outro classifier cutoffs.
+fn local_period_supported(novelty: &[f64], bpm: f64, sr: u32, target: f64) -> bool {
+    // Integrate the onset over its neighboring hops before comparing metrical
+    // levels. At 48 kHz/180 BPM a beat is 62.5 hops: point sampling alternates
+    // between a peak and an interpolated valley, spuriously favoring half time.
+    let integrated: Vec<f64> = (0..novelty.len()).map(|i| {
+        let a = i.saturating_sub(1);
+        let b = (i + 2).min(novelty.len());
+        novelty[a..b].iter().sum::<f64>() / (b - a) as f64
+    }).collect();
+    let novelty = integrated.as_slice();
+    let Some((mean, sd)) = novelty_stats(novelty) else { return false };
+    let period = bpm_to_period_hops(bpm, HOP as f64, sr as f64);
+    let z = comb_z(novelty, period, mean, sd);
+    // At least eight observed pulses, and a peak three standard errors above
+    // the envelope mean. Sparse hits cannot establish a mixable pulse train.
+    if novelty.len() as f64 / period < 8.0 || z < 3.0 { return false; }
+    let mut best = z;
+    let mut candidate = target / 3.0;
+    while candidate <= target * 2.0 {
+        best = best.max(comb_z(novelty,
+            bpm_to_period_hops(candidate, HOP as f64, sr as f64), mean, sd));
+        candidate += BPM_SEARCH_STEP;
+    }
+    let half = comb_z(novelty, period * 2.0, mean, sd);
+    // The candidate may differ slightly from the wide sweep's sampling of the
+    // same peak. A half-time peak must be clearly weaker, not merely in-band.
+    z >= best * 0.95 && half < z * 0.9
+}
+
+/// Inspect every part of an intended overlap, including future material.
+/// Returns the observed tempo envelope, not just an average over the request
+/// position. Callers use the extremes to bound fixed-speed deck drift.
+pub(crate) fn local_sync_span(
+    samples: &[f32], start: u64, end: u64, sr: u32, target: f64,
+) -> Option<(f64, f64)> {
+    if sr == 0 || start >= end || end > (samples.len() / 2) as u64
+        || !target.is_finite() || target <= 0.0 { return None; }
+    let window = (8.0 * sr as f64) as u64;
+    let span = end - start;
+    let mut offset = 0;
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    loop {
+        let a = start + offset;
+        let b = (a + window).min(end);
+        let segment = &samples[a as usize * 2..b as usize * 2];
+        let tempo = analyze_local_tempo(segment, (b - a) / 2, sr, target)?;
+        if !tempo.in_transition_range { return None; }
+        lo = lo.min(tempo.bpm);
+        hi = hi.max(tempo.bpm);
+        if b == end { break; }
+        offset = (offset + window / 2).min(span.saturating_sub(window));
+    }
+    // Tiles measure tempo; a single reference phase covers their seams.
+    local_grid_continuous(samples, start, end, sr, (lo + hi) / 2.0)
+        .then_some((lo, hi))
+}
+
+/// Preserve an existing beat count only across an unbroken audible pulse.
+/// This never creates bar/phrase identity from repetitive kicks. The first
+/// pulse's small residual is held constant across the corridor; a gap or a
+/// cumulative phase change invalidates propagation of the structural marker.
+pub(crate) fn local_grid_continuous(
+    samples: &[f32], anchor: u64, end: u64, sr: u32, target: f64,
+) -> bool {
+    if sr == 0 || !target.is_finite() || target <= 0.0 || anchor >= end
+        || end > (samples.len() / 2) as u64 { return false; }
+    let beat = 60.0 * sr as f64 / target;
+    if !beat.is_finite() || beat < (HOP * 8) as f64 || beat * 8.0 > (end - anchor) as f64 {
+        return false;
+    }
+    // Filter overlapping four-bar chunks once. Resetting the low-pass at
+    // every beat produces artificial attacks when a kick crosses a slice edge.
+    let mut position = anchor as f64;
+    let mut reference = None;
+    let mut checked = 0;
+    while position + beat <= end as f64 {
+        let core_end = (position + 16.0 * beat).min(end as f64);
+        let a = (position - beat).max(0.0).floor() as usize;
+        let b = (core_end + beat).min(end as f64).ceil() as usize;
+        let mono: Vec<f32> = samples[a * 2..b * 2].chunks_exact(2)
+            .map(|s| (s[0] + s[1]) * 0.5).collect();
+        let Ok(onset) = onset_envelope(&mono, sr, HOP) else { return false; };
+        while position + beat <= core_end + 0.5 {
+            let expected = position + reference.unwrap_or(beat / 2.0);
+            let lo = ((expected - beat / 2.0 - a as f64).max(0.0) / HOP as f64).floor() as usize;
+            let hi = (((expected + beat / 2.0 - a as f64) / HOP as f64).ceil() as usize)
+                .min(onset.energy.len());
+            if lo >= hi { return false; }
+            let values = &onset.energy[lo..hi];
+            let (offset, peak) = values.iter().enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            if *peak <= SILENCE_EPS || *peak < mean * 2.0 {
+                return false;
+            }
+            let observed = a as f64 + (lo + offset) as f64 * HOP as f64;
+            let phase = *reference.get_or_insert(observed - position);
+            if (observed - position - phase).abs() > beat * 0.125 {
+                return false;
+            }
+            checked += 1;
+            position += beat;
+        }
+        // Floating rounding must never leave an unprocessed sub-beat tail
+        // spinning forever; such a tail cannot establish another pulse.
+        if position + beat > end as f64 { break; }
+    }
+    checked >= 8
 }
 
 /// Analyze a fully decoded track. `file_name` is stored for human reference.
