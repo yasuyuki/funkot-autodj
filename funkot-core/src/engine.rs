@@ -607,7 +607,7 @@ struct ActiveTransition {
     fade_in_end: u64,
     fade_out_start: u64,
     fade_out_end: u64,
-    /// Sequential bounded de-click handoff without HPF / phase alignment.
+    /// Simultaneous linear crossfade without HPF / phase-align (local BPM out of range).
     simple: bool,
 }
 
@@ -659,8 +659,7 @@ pub struct ManualPlanDiagnostic {
     pub start: u64,
     pub entry: u64,
     pub prev_nudge: u64,
-    /// Target main marker relative to transition start. For a sequential
-    /// fallback this includes the old deck's bounded fade before target audio.
+    /// Target main marker relative to its actual corrected entry.
     pub next_main: u64,
     pub fade_in_end: u64,
     pub fade_out_start: u64,
@@ -684,16 +683,6 @@ struct ManualRequest {
 #[derive(Clone, Copy)]
 struct ManualDemand { generation: u64, action: NavAction }
 
-/// A bounded de-click handoff for manual navigation when structural sync is
-/// unavailable. The decks never have non-zero gain on the same frame: finish
-/// the old deck first, then begin the target from its marker.
-#[inline]
-fn manual_fallback_shape(old_available: u64, target_available: u64, sample_rate: u32) -> (u64, u64, u64) {
-    let old_fade = head_fade_frames(sample_rate).min(old_available);
-    let target_fade = head_fade_frames(sample_rate).min(target_available);
-    (old_fade.saturating_add(target_fade), 0, old_fade)
-}
-
 fn manual_key(action: NavAction, active: &PreparedTrack, target: &PreparedTrack) -> ManualKey {
     ManualKey {
         action, active_path: active.path.clone(), active_index: active.playlist_index,
@@ -710,13 +699,12 @@ fn manual_key(action: NavAction, active: &PreparedTrack, target: &PreparedTrack)
 /// propagation from an existing structural marker, but never invents one.
 fn build_manual_plan(request: ManualRequest) -> ManualPlan {
     let simple = |reason| {
-        let old_available = request.key.active_frames.saturating_sub(request.playhead);
-        let target_available = request.key.target_frames.saturating_sub(request.key.target_first);
-        let (fade_in_end, fade_out_start, fade_out_end) =
-            manual_fallback_shape(old_available, target_available, request.sample_rate);
+        let available = request.key.active_frames.saturating_sub(request.playhead)
+            .min(request.key.target_frames.saturating_sub(request.key.target_first));
+        let fade = bar_to_frames(request.fade_bars.max(1), request.bar_frames).min(available);
         ManualPlan { generation: request.generation, key: request.key.clone(),
             start: request.playhead, entry: request.key.target_first, prev_nudge: 0,
-            fade_in_end, fade_out_start, fade_out_end,
+            fade_in_end: fade, fade_out_start: 0, fade_out_end: fade,
             simple: true, reason }
     };
     let beat = request.bar_frames / BEATS_PER_BAR as f64;
@@ -853,18 +841,6 @@ fn retire_prepared(track: PreparedTrack) {
 ///
 /// 10連打に2本の余裕。1本あたり 20 秒 head ≈ 7.7 MB（48 kHz ステレオ f32）。
 pub const HEAD_ONLY_PREFETCH: usize = 12;
-
-/// Keep short head-only preview tails and manual fallback handoffs equally
-/// bounded. This is intentionally not musical timing: it only removes a
-/// discontinuity when structural timing is unavailable.
-const HEAD_FADE_MILLIS: u64 = 10;
-
-#[inline]
-fn head_fade_frames(sample_rate: u32) -> u64 {
-    u64::from(sample_rate)
-        .saturating_mul(HEAD_FADE_MILLIS)
-        .saturating_div(1_000)
-}
 
 /// nav コマンドの容量。通常モードが持っていた 8 に、ラベリング中の
 /// 一斉連打ぶんを足しただけ。
@@ -1218,9 +1194,7 @@ impl Engine {
     pub fn last_manual_plan_diagnostic(&self) -> Option<ManualPlanDiagnostic> {
         self.last_manual_plan.as_ref().map(|p| ManualPlanDiagnostic { generation: p.generation,
             start: p.start, entry: p.entry, prev_nudge: p.prev_nudge,
-            next_main: p.key.target_first.saturating_add(bar_to_frames(p.key.target_intro, self.bar_frames))
-                .saturating_sub(p.entry)
-                .saturating_add(if p.simple { p.fade_out_end } else { 0 }),
+            next_main: p.key.target_first.saturating_add(bar_to_frames(p.key.target_intro, self.bar_frames)).saturating_sub(p.entry),
             fade_in_end: p.fade_in_end,
             fade_out_start: p.fade_out_start, fade_out_end: p.fade_out_end,
             simple: p.simple, reason: p.reason })
@@ -1633,16 +1607,12 @@ impl Engine {
             NavAction::TransitionToNext => self.next_track.as_ref()?,
             _ => return None,
         };
-        let old_available = active.track.frames.saturating_sub(active.playhead);
-        let target_available = target.frames.saturating_sub(target.first_downbeat_out);
-        let (fade_in_end, fade_out_start, fade_out_end) = manual_fallback_shape(
-            old_available,
-            target_available,
-            self.options.output_sample_rate,
-        );
+        let available = active.track.frames.saturating_sub(active.playhead)
+            .min(target.frames.saturating_sub(target.first_downbeat_out));
+        let fade = bar_to_frames(self.options.fade_bars.max(1), self.bar_frames).min(available);
         Some(ManualPlan { generation: self.nav_gen, key: manual_key(action, &active.track, target),
             start: active.playhead, entry: target.first_downbeat_out, prev_nudge: 0,
-            fade_in_end, fade_out_start, fade_out_end, simple: true, reason })
+            fade_in_end: fade, fade_out_start: 0, fade_out_end: fade, simple: true, reason })
     }
 
     fn abort_active_transition(&mut self) {
@@ -2188,16 +2158,18 @@ impl Engine {
     }
 
     fn render_one_frame(&mut self) -> (f32, f32) {
-        // Only a sequential fallback outlives its previous deck. Existing
-        // normal transitions still complete at their fade-out boundary.
-        let past_fade_out = self.transition.as_ref().and_then(|t| {
-            (t.frames_into >= t.fade_out_end).then_some(t.simple)
-        });
-        if past_fade_out.is_some() || (self.transition.is_none() && self.prev.is_some()) {
+        // Invariant: `prev` exists only during an active transition and only
+        // while `frames_into < fade_out_end`. Any other state is stale and
+        // would replay the previous track at full gain (default envelope).
+        let past_fade_out = self
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.frames_into >= t.fade_out_end);
+        if past_fade_out || (self.transition.is_none() && self.prev.is_some()) {
             self.drop_prev();
-        }
-        if past_fade_out == Some(false) {
-            self.transition = None;
+            if past_fade_out {
+                self.transition = None;
+            }
         }
 
         let (in_trans, frames_into, fade_in_end, fade_out_start, fade_out_end, simple) =
@@ -2252,21 +2224,8 @@ impl Engine {
         }
 
         if let Some(deck) = self.active.as_mut() {
-            // A simple plan is a sequential fallback, not a crossfade. Keep
-            // the target marker frozen during the old deck's de-click fade.
-            let target_started = !in_trans || !simple || frames_into >= fade_out_end;
             let gain_env = if in_trans && frames_into < fade_in_end {
-                let fade_index = if simple {
-                    frames_into.saturating_sub(fade_out_end)
-                } else {
-                    frames_into
-                };
-                let fade_span = if simple {
-                    fade_in_end.saturating_sub(fade_out_end)
-                } else {
-                    fade_in_end
-                };
-                fade_in_gain(fade_index, fade_span)
+                fade_in_gain(frames_into, fade_in_end)
             } else {
                 1.0
             };
@@ -2274,7 +2233,7 @@ impl Engine {
                 deck.highpass_enabled = !simple && frames_into < fade_in_end;
             }
 
-            if target_started && deck.playhead < deck.track.frames {
+            if deck.playhead < deck.track.frames {
                 let (mut l, mut r) = read_deck_frame(deck);
                 // Active HPF is on from transition start (incl. silent first
                 // fade-in frame), so drive it whenever enabled.
@@ -2292,26 +2251,16 @@ impl Engine {
         }
 
         if in_trans {
-            let (should_drop_prev, should_finish) = if let Some(t) = self.transition.as_mut() {
+            let should_drop = if let Some(t) = self.transition.as_mut() {
                 t.frames_into += 1;
                 // After the final zero-gain fade-out frame (`frames_into` was
-                // `fade_out_end - 1`), retire prev. Only the sequential
-                // fallback stays alive until its target reaches full gain.
-                (
-                    t.frames_into >= t.fade_out_end,
-                    if t.simple {
-                        t.frames_into >= t.fade_in_end.max(t.fade_out_end)
-                    } else {
-                        t.frames_into >= t.fade_out_end
-                    },
-                )
+                // `fade_out_end - 1`), drop `prev` and end the transition.
+                t.frames_into >= t.fade_out_end
             } else {
-                (false, false)
+                false
             };
-            if should_drop_prev {
+            if should_drop {
                 self.drop_prev();
-            }
-            if should_finish {
                 self.transition = None;
             }
         }
@@ -2753,7 +2702,7 @@ fn finish_prepare(
     )?;
 
     if head_only {
-        fade_out_tail(&mut rendered, head_fade_frames(options.output_sample_rate) as usize);
+        fade_out_tail(&mut rendered, (0.010 * options.output_sample_rate as f64) as usize);
     }
 
     let out_frames = (rendered.len() / 2) as u64;
@@ -3272,31 +3221,6 @@ mod tests {
                 assert_ne!(right, 0.0, "silent active gap I={intro}, sr={sample_rate}");
             }
         }
-    }
-
-    #[test]
-    fn normal_zero_fade_short_intro_starts_target_at_full_gain() {
-        let mut engine = phase_test_engine(true, 8, 44_100);
-        engine.phase_align_rx = None;
-        engine.bar_frames = 2.0;
-        engine.active.as_mut().unwrap().track.samples = Arc::new(
-            (0..512).flat_map(|_| [1.0, 0.0]).collect(),
-        );
-        engine.next_track.as_mut().unwrap().samples = Arc::new(
-            (0..512).flat_map(|_| [0.0, 1.0]).collect(),
-        );
-        assert_eq!(plan_transition(4, 8, 8).fadeout_end, 0);
-        let mut expected_filter = StereoHighPass::new(
-            engine.options.output_sample_rate,
-            engine.options.highpass_hz,
-        );
-        let (mut expected_left, mut expected_right) = (0.0, 1.0);
-        expected_filter.process_frame(&mut expected_left, &mut expected_right);
-        engine.begin_transition(0);
-        let (left, right) = engine.render_one_frame();
-        assert_eq!((left, right), (expected_left, expected_right));
-        assert!(engine.prev.is_none());
-        assert!(engine.transition.is_none());
     }
 
     #[test]
@@ -4153,85 +4077,6 @@ mod tests {
     }
 
     #[test]
-    fn manual_fallback_planner_and_deadline_share_bounded_sequential_shape() {
-        let engine = phase_test_engine(true, 8, 44_100);
-        let active = engine.active.as_ref().expect("active");
-        let target = engine.next_track.as_ref().expect("next");
-        let request = ManualRequest {
-            generation: engine.nav_gen,
-            key: manual_key(NavAction::TransitionToNext, &active.track, target),
-            playhead: active.playhead,
-            active: Arc::clone(&active.track.samples),
-            target: Arc::clone(&target.samples),
-            bar_frames: engine.bar_frames,
-            sample_rate: 44_100,
-            target_bpm: engine.options.target_bpm(),
-            fade_bars: engine.options.fade_bars,
-        };
-        // The preview flag selects the planner's structural fallback path.
-        let mut request = request;
-        request.key.target_preview = true;
-        let planner = build_manual_plan(request);
-        let deadline = engine
-            .manual_simple_plan(NavAction::TransitionToNext, "deadline fallback")
-            .expect("deadline fallback");
-        assert!(planner.simple && deadline.simple);
-        assert_eq!(planner.fade_in_end, deadline.fade_in_end);
-        assert_eq!(planner.fade_out_start, deadline.fade_out_start);
-        assert_eq!(planner.fade_out_end, deadline.fade_out_end);
-        assert_eq!(planner.fade_out_end, head_fade_frames(44_100));
-        assert_eq!(planner.fade_in_end, head_fade_frames(44_100) * 2);
-        assert_eq!(manual_fallback_shape(0, 0, 1_000), (0, 0, 0));
-        assert_eq!(manual_fallback_shape(1, 0, 1_000), (1, 0, 1));
-        assert_eq!(manual_fallback_shape(0, 1, 1_000), (1, 0, 0));
-        assert_eq!(manual_fallback_shape(3, 2, 1_000), (5, 0, 3));
-    }
-
-    #[test]
-    fn manual_fallback_renders_decks_sequentially_and_finishes_across_chunks() {
-        let mut engine = phase_test_engine(true, 8, 1_000);
-        engine.active.as_mut().expect("active").playhead = 0;
-        engine.active.as_mut().expect("active").track.samples = Arc::new(
-            (0..512).flat_map(|_| [1.0, 0.0]).collect(),
-        );
-        engine.next_track.as_mut().expect("next").samples = Arc::new(
-            (0..512).flat_map(|_| [0.0, 1.0]).collect(),
-        );
-        engine.next_track.as_mut().expect("next").first_downbeat_out = 7;
-        let plan = engine
-            .manual_simple_plan(NavAction::TransitionToNext, "test fallback")
-            .expect("fallback plan");
-        assert_eq!((plan.fade_in_end, plan.fade_out_start, plan.fade_out_end), (20, 0, 10));
-        engine.commit_manual_plan(plan);
-
-        let mut first = vec![0.0; 7 * 2];
-        assert_eq!(engine.render(&mut first), 7);
-        assert_eq!(engine.active.as_ref().unwrap().playhead, 7, "target marker remains frozen");
-        let mut old_tail = vec![0.0; 3 * 2];
-        assert_eq!(engine.render(&mut old_tail), 3);
-        assert_eq!(engine.active.as_ref().unwrap().playhead, 7, "marker is still frozen at old fade end");
-        assert!(engine.prev.is_none(), "previous deck retires at old fade end");
-        assert!(engine.transition.is_some(), "target fade continues after previous retirement");
-
-        let mut target_head = vec![0.0; 3 * 2];
-        assert_eq!(engine.render(&mut target_head), 3);
-        assert_eq!(engine.active.as_ref().unwrap().playhead, 10, "target starts from its marker");
-        let mut target_tail = vec![0.0; 7 * 2];
-        assert_eq!(engine.render(&mut target_tail), 7);
-        assert!(engine.transition.is_none(), "fallback completes after target fade");
-        assert_eq!(engine.active.as_ref().unwrap().playhead, 17);
-
-        let all = [first, old_tail, target_head, target_tail].concat();
-        for frame in all.chunks_exact(2) {
-            assert!(frame[0].is_finite() && frame[1].is_finite());
-            assert!(frame[0] == 0.0 || frame[1] == 0.0, "decks must never have concurrent non-zero audio");
-        }
-        assert_eq!(all[9 * 2], 0.0, "old fade has an exact silent endpoint");
-        assert_eq!(all[10 * 2 + 1], 0.0, "target fade starts at silence");
-        assert_eq!(all[19 * 2 + 1], 1.0, "target fade reaches full gain");
-    }
-
-    #[test]
     fn manual_reply_commits_only_on_the_exact_frame() {
         let mut engine = phase_test_engine(true, 8, 44_100);
         let start = engine.active.as_ref().unwrap().playhead + 2;
@@ -4355,16 +4200,10 @@ mod tests {
         target[19 * 2 + 1] = -0.5;
         engine.next_track.as_mut().unwrap().samples = Arc::new(target);
         let now = engine.active.as_ref().unwrap().playhead;
-        let mut plan = controlled_manual_plan(&engine, NavAction::TransitionToNext, now, 19);
-        // This proves a synchronized reply's corrected entry, not a fallback
-        // handoff (which deliberately holds the target during old fade-out).
-        plan.simple = false;
-        engine.pending_nav = Some(PendingNav::Planned(plan));
+        engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, now, 19)));
         engine.tick_pending_nav();
         assert_eq!(engine.active.as_ref().unwrap().playhead, 19);
-        let (mut left, mut right) = (0.25, -0.5);
-        StereoHighPass::new(engine.options.output_sample_rate, engine.options.highpass_hz)
-            .process_frame(&mut left, &mut right);
-        assert_eq!(engine.render_one_frame(), (left, right));
+        assert_eq!(engine.render_one_frame(), (0.25, -0.5));
     }
 }

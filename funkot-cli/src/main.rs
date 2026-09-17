@@ -262,14 +262,14 @@ impl LiveTiming {
 enum LiveEvent {
     Engine(EngineEvent),
     NavSent { action: NavAction, elapsed: Duration },
-    TransitionObserved { output_frame: Option<u64>, elapsed: Duration, diagnostic: Option<funkot_core::engine::ManualPlanDiagnostic>, attribution: &'static str },
+    TransitionObserved { output_frame: u64, elapsed: Duration, diagnostic: Option<funkot_core::engine::ManualPlanDiagnostic>, attribution: &'static str },
 }
 
 #[derive(Clone, Copy)]
 struct TimingNav { action: NavAction, elapsed: Duration }
 
 struct TimingTransition {
-    output_frame: Option<u64>,
+    output_frame: u64,
     elapsed: Duration,
     diagnostic: Option<funkot_core::engine::ManualPlanDiagnostic>,
     attribution: &'static str,
@@ -1323,8 +1323,7 @@ fn run_live(
                     n = engine.render(stereo);
                     render_elapsed = render_started.map(|started| started.elapsed()).unwrap_or(Duration::ZERO);
 
-                    let transition_into = engine.transition_frames_into();
-                    let into = transition_into.unwrap_or(0);
+                    let into = engine.transition_frames_into().unwrap_or(0);
                     let events = engine.poll_events();
                     let transition_count = timing_cb.as_ref().map_or(0, |_| events.iter().filter(|event| matches!(event, EngineEvent::TransitionStarted { .. })).count());
                     if let Some(gate) = transition_gate.as_mut() {
@@ -1355,12 +1354,9 @@ fn run_live(
                     for event in events {
                         if matches!(event, EngineEvent::TransitionStarted { .. }) {
                             if let Some(timing_started) = timing_started {
-                                // A transition that ended inside this callback no
-                                // longer exposes its offset; do not invent frame zero.
-                                let output_frame = transition_into.filter(|_| transition_count == 1)
-                                    .map(|into| output_start + n.saturating_sub(into as usize) as u64);
+                                let start_offset = if into == 0 { 0 } else { n.saturating_sub(into as usize) };
                                 let _ = event_tx.send(LiveEvent::TransitionObserved {
-                                    output_frame,
+                                    output_frame: output_start + start_offset as u64,
                                     elapsed: timing_started.elapsed(), diagnostic, attribution,
                                 });
                             }
@@ -1628,7 +1624,7 @@ fn write_live_timing_report(path: &Path, timing: &LiveTiming, sample_rate: u32, 
             "manual_plan_diagnostic": manual_plan_json(transition.diagnostic),
             "attribution": transition.attribution
         })).collect::<Vec<_>>(),
-        "limits": "Callback timing includes this callback's engine render, event handling, format conversion, and optional dump try-lock attempt. output_frame is null when the transition offset cannot be recovered from this callback. Transition timestamps are callback observations; the latest earlier successful channel enqueue is chronological only and is not guaranteed to be the transition's generation. Neither timestamp measures hardware audible latency."
+        "limits": "Callback timing includes this callback's engine render, event handling, format conversion, and optional dump try-lock attempt. Transition timestamps are callback observations; the latest earlier successful channel enqueue is chronological only and is not guaranteed to be the transition's generation. Neither timestamp measures hardware audible latency."
     });
     std::fs::write(path, serde_json::to_vec_pretty(&report)?)
         .with_context(|| format!("write timing report {}", path.display()))
