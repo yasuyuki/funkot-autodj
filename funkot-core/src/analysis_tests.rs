@@ -80,6 +80,76 @@ fn classic_180_16_32_16() {
 }
 
 #[test]
+fn local_tempo_rejects_slow_and_empty_material() {
+    let sr = 44_100;
+    for bpm in [90.0, 120.0, 140.0, 150.0] {
+        let buf = synth_track(bpm, 8, 8, 8, sr);
+        let local = analyze_local_tempo(&buf.samples, 6 * sr as u64, sr, 180.0);
+        assert!(!local.is_some_and(|t| t.in_transition_range),
+            "slow source {bpm} accepted: {local:?}");
+    }
+    assert!(!analyze_local_tempo(&vec![0.0; sr as usize * 16], 4 * sr as u64, sr, 180.0)
+        .is_some_and(|t| t.in_transition_range));
+}
+
+#[test]
+fn local_sync_span_covers_future_break_and_tempo_excursion() {
+    use crate::analysis::{local_grid_continuous, local_sync_span};
+    for sr in [44_100, 48_000] {
+        let buf = synth_track(180.0, 16, 16, 16, sr);
+        let start = 4 * sr as u64;
+        let end = 16 * sr as u64;
+        assert!(local_sync_span(&buf.samples, start, end, sr, 180.0).is_some(), "normal span {sr}");
+        assert!(local_grid_continuous(&buf.samples, 0, end, sr, 180.0));
+        let mut broken = buf.samples.clone();
+        broken[10 * sr as usize * 2..11 * sr as usize * 2].fill(0.0);
+        assert!(local_sync_span(&broken, start, end, sr, 180.0).is_none());
+        assert!(!local_grid_continuous(&broken, 0, end, sr, 180.0));
+        // Same starting/ending tempo, but a slower middle followed by recovery.
+        let slow = synth_track(120.0, 2, 0, 0, sr);
+        broken = buf.samples.clone();
+        broken[8 * sr as usize * 2..12 * sr as usize * 2]
+            .copy_from_slice(&slow.samples[..4 * sr as usize * 2]);
+        assert!(local_sync_span(&broken, start, end, sr, 180.0).is_none());
+    }
+}
+
+#[test]
+fn local_tempo_normal_and_band_edges() {
+    for sr in [44_100, 48_000] {
+        for (bpm, target, accepted) in [
+            (180.0, 180.0, true), (198.0, 198.0, true),
+            (174.0, 180.0, true), (186.0, 180.0, true),
+            (169.0, 180.0, false), (191.0, 180.0, false),
+        ] {
+            let buf = synth_track(bpm, 8, 0, 0, sr);
+            let local = analyze_local_tempo(&buf.samples, 4 * sr as u64, sr, target);
+            assert_eq!(local.is_some_and(|t| t.in_transition_range), accepted,
+                "{sr}Hz {bpm}/{target}: {local:?}");
+        }
+    }
+}
+
+#[test]
+fn local_tempo_sparse_hits_and_half_time_are_not_sync_evidence() {
+    let sr = 44_100;
+    let pulse = synth_track(180.0, 8, 0, 0, sr);
+    let beat = sr as usize / 3;
+    for spacing in [2, 4, 16] {
+        let mut samples = pulse.samples.clone();
+        for (i, frame) in samples.chunks_exact_mut(2).enumerate() {
+            if (i / beat) % spacing != 0 { frame.fill(0.0); }
+        }
+        let t = analyze_local_tempo(&samples, 4 * sr as u64, sr, 180.0);
+        assert!(!t.is_some_and(|t| t.in_transition_range), "spacing {spacing}: {t:?}");
+    }
+    let mut clustered = pulse.samples.clone();
+    clustered[3 * sr as usize * 2..].fill(0.0);
+    assert!(!analyze_local_tempo(&clustered, 4 * sr as u64, sr, 180.0)
+        .is_some_and(|t| t.in_transition_range));
+}
+
+#[test]
 fn local_tempo_near_target_in_range() {
     let sr = 44_100u32;
     let source_bpm = 180.0;
