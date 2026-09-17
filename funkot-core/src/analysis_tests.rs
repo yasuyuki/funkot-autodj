@@ -1015,3 +1015,241 @@ fn starmine_intro_48_outro_32_if_testdata_present() {
         a.outro_bars, a.outro_bars_low_confidence
     );
 }
+
+// The observed intro groove has bar heads and offbeat kicks, not a kick on
+// every beat. A structural continuity check must not equate missing on-beats
+// with a tempo change.
+pub(crate) fn syncopated_pulse_track(bpm: f64, bars: u32, sr: u32) -> AudioBuffer {
+    pulse_pattern_track(bpm, bars, sr, &[0.0, 1.5, 2.5])
+}
+
+fn pulse_pattern_track(bpm: f64, bars: u32, sr: u32, offsets: &[f64]) -> AudioBuffer {
+    let beat = sr as f64 * 60.0 / bpm;
+    let frames = (bars as f64 * 4.0 * beat).round() as usize;
+    let mut samples = vec![0.0f32; frames * 2];
+    for bar in 0..bars {
+        for &offset in offsets {
+            let start = ((bar as f64 * 4.0 + offset) * beat).round() as usize;
+            for i in 0..(0.060 * sr as f64) as usize {
+                if start + i >= frames { break; }
+                let t = i as f64 / sr as f64;
+                let value = ((-t / 0.015).exp()
+                    * (2.0 * std::f64::consts::PI * 60.0 * t).sin()) as f32;
+                samples[(start + i) * 2] += value;
+                samples[(start + i) * 2 + 1] += value;
+            }
+        }
+    }
+    AudioBuffer { sample_rate: sr, frames: frames as u64, samples }
+}
+
+#[test]
+fn structural_grid_preserves_syncopated_bars_without_every_beat_kicks() {
+    use crate::analysis::{local_grid_continuous, local_sync_span};
+    for sr in [44_100, 48_000] {
+        let audio = syncopated_pulse_track(198.0, 16, sr);
+        let bar = sr as f64 * 60.0 / 198.0 * 4.0;
+        assert!(local_grid_continuous(&audio.samples, 0, audio.frames, sr, 198.0));
+        assert!(local_sync_span(&audio.samples, (4.0 * bar).round() as u64,
+            (12.0 * bar).round() as u64, sr, 198.0).is_some());
+        let mut broken = audio.samples.clone();
+        broken[(4.0 * bar).round() as usize * 2..(5.0 * bar).round() as usize * 2].fill(0.0);
+        assert!(!local_grid_continuous(&broken, 0, audio.frames, sr, 198.0));
+        let boundary = (4.0 * bar).round() as usize * 2;
+        let shift = (bar / 16.0).round() as usize * 2; // one quarter beat
+        let mut shifted = audio.samples.clone();
+        shifted.copy_within(boundary..audio.samples.len() - shift, boundary + shift);
+        shifted[boundary..boundary + shift].fill(0.0);
+        assert!(!local_grid_continuous(&shifted, 0, audio.frames, sr, 198.0));
+    }
+}
+
+#[test]
+fn structural_sync_rejects_slow_and_three_to_four_aliases() {
+    use crate::analysis::local_sync_span;
+    for bpm in [90.0, 120.0, 135.0, 140.0, 150.0] {
+        let audio = synth_track(bpm, 16, 0, 0, 44_100);
+        assert!(local_sync_span(&audio.samples, 0, 12 * 44_100, 44_100, 180.0).is_none(),
+            "slow or 3:4 alias {bpm} was accepted");
+    }
+}
+
+#[test]
+fn structural_sync_rejects_weighted_aliases_sparse_pulses_and_noise() {
+    use crate::analysis::local_sync_span;
+    for sr in [44_100, 48_000] {
+        for (bpm, target) in [(90.0, 180.0), (120.0, 180.0), (135.0, 180.0),
+            (140.0, 180.0), (150.0, 180.0), (148.5, 198.0), (360.0, 180.0)] {
+            let mut audio = synth_track(bpm, 16, 0, 0, sr);
+            let beat = sr as f64 * 60.0 / bpm;
+            for (i, frame) in audio.samples.chunks_exact_mut(2).enumerate() {
+                let gain = if (i as f64 / beat).floor() as u64 % 3 == 0 { 1.0 } else { 0.35 };
+                frame[0] *= gain; frame[1] *= gain;
+            }
+            assert!(local_sync_span(&audio.samples, 0, 8 * sr as u64, sr, target).is_none(),
+                "weighted {bpm}/{target} alias at {sr}Hz");
+        }
+        let pulse = synth_track(180.0, 8, 0, 0, sr);
+        for spacing in [2, 4, 16] {
+            let mut samples = pulse.samples.clone();
+            for (i, frame) in samples.chunks_exact_mut(2).enumerate() {
+                if (i as u64 * 3 / sr as u64) % spacing != 0 { frame.fill(0.0); }
+            }
+            assert!(local_sync_span(&samples, 0, 8 * sr as u64, sr, 180.0).is_none(),
+                "sparse spacing {spacing} at {sr}Hz");
+        }
+        let mut state = 1u32;
+        let noise: Vec<f32> = (0..8 * sr as usize * 2).map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state as f64 / u32::MAX as f64 - 0.5) as f32
+        }).collect();
+        assert!(local_sync_span(&noise, 0, 8 * sr as u64, sr, 180.0).is_none());
+    }
+}
+
+#[test]
+fn syncopated_half_beat_phase_jump_does_not_preserve_structure() {
+    use crate::analysis::local_grid_continuous;
+    for sr in [44_100, 48_000] {
+        let audio = syncopated_pulse_track(198.0, 16, sr);
+        let beat = sr as f64 * 60.0 / 198.0;
+        let boundary = (16.0 * beat).round() as usize * 2;
+        let shift = (beat / 2.0).round() as usize * 2;
+        let mut samples = audio.samples.clone();
+        samples.copy_within(boundary..audio.samples.len() - shift, boundary + shift);
+        samples[boundary..boundary + shift].fill(0.0);
+        assert!(!local_grid_continuous(&samples, 0, audio.frames, sr, 198.0));
+    }
+}
+
+#[test]
+fn syncopated_continuity_checks_partial_tail_and_nonzero_marker() {
+    use crate::analysis::local_grid_continuous;
+    for sr in [44_100, 48_000] {
+        let audio = syncopated_pulse_track(198.0, 16, sr);
+        let beat = sr as f64 * 60.0 / 198.0;
+        let lead = sr as usize / 10;
+        let mut samples = vec![0.0; lead * 2];
+        samples.extend_from_slice(&audio.samples);
+        let end = lead as u64 + (18.5 * beat).round() as u64;
+        assert!(local_grid_continuous(&samples, lead as u64, end, sr, 198.0));
+        let boundary = lead + (16.0 * beat).round() as usize;
+        let shift = (beat * 0.25).round() as usize;
+        let mut shifted = samples.clone();
+        shifted.copy_within(boundary * 2..samples.len() - shift * 2, (boundary + shift) * 2);
+        shifted[boundary * 2..(boundary + shift) * 2].fill(0.0);
+        assert!(!local_grid_continuous(&shifted, lead as u64, end, sr, 198.0));
+        samples[(lead + (16.5 * beat).round() as usize) * 2..end as usize * 2].fill(0.0);
+        assert!(!local_grid_continuous(&samples, lead as u64, end, sr, 198.0));
+    }
+}
+
+#[test]
+fn syncopated_phase_jump_is_not_absorbed_into_reference_context() {
+    use crate::analysis::local_grid_continuous;
+    let sr = 44_100;
+    let audio = syncopated_pulse_track(198.0, 16, sr);
+    let beat = sr as f64 * 60.0 / 198.0;
+    for bar in [2.0, 4.0, 7.0, 11.0, 15.0] {
+        for fraction in [0.25, 0.5] {
+            let boundary = (bar * 4.0 * beat).round() as usize * 2;
+            let shift = (beat * fraction).round() as usize * 2;
+            let mut samples = audio.samples.clone();
+            samples.copy_within(boundary..audio.samples.len() - shift, boundary + shift);
+            samples[boundary..boundary + shift].fill(0.0);
+            assert!(!local_grid_continuous(&samples, 0, audio.frames, sr, 198.0),
+                "phase jump bar={bar} fraction={fraction} was absorbed into reference");
+        }
+    }
+}
+
+#[test]
+fn syncopated_marker_does_not_bridge_a_slow_middle_that_recovers() {
+    use crate::analysis::{local_grid_continuous, local_sync_span};
+    let sr = 44_100;
+    let audio = syncopated_pulse_track(180.0, 24, sr);
+    let begin = 8 * sr as usize;
+    let stop = 16 * sr as usize;
+    for bpm in [60.0, 90.0, 120.0, 135.0, 150.0, 360.0] {
+        let slow = if bpm == 360.0 { syncopated_pulse_track(bpm, 16, sr) }
+            else { synth_track(bpm, 16, 0, 0, sr) };
+        let mut samples = audio.samples.clone();
+        samples[begin * 2..stop * 2].copy_from_slice(&slow.samples[..(stop-begin) * 2]);
+        assert!(!local_grid_continuous(&samples, 0, audio.frames, sr, 180.0),
+            "marker incorrectly propagated through {bpm} BPM middle");
+        assert!(local_sync_span(&samples, 0, audio.frames, sr, 180.0).is_none(),
+            "overlap incorrectly authorized through {bpm} BPM middle");
+    }
+    let start_inside_groove = (4.0 * sr as f64 * 60.0 / 180.0).round() as u64;
+    assert!(local_grid_continuous(&audio.samples, start_inside_groove, audio.frames, sr, 180.0));
+}
+
+#[test]
+fn marker_continuity_cannot_authorize_a_half_ambiguous_overlap() {
+    use crate::analysis::{local_grid_continuous, local_sync_span};
+    for sr in [44_100, 48_000] {
+        let audio = pulse_pattern_track(198.0, 16, sr, &[0.0, 1.5, 2.5, 3.5]);
+        assert!(local_grid_continuous(&audio.samples, 0, audio.frames, sr, 198.0));
+        assert!(!analyze_local_tempo(&audio.samples, 4 * sr as u64, sr, 198.0)
+            .is_some_and(|t| t.in_transition_range));
+        assert!(local_sync_span(&audio.samples, 0, 8 * sr as u64, sr, 198.0).is_none());
+    }
+}
+
+#[test]
+fn groove_continuity_allows_density_changes_but_rejects_missing_pulses() {
+    use crate::analysis::local_grid_continuous;
+    for sr in [44_100, 48_000] {
+        let audio = syncopated_pulse_track(198.0, 16, sr);
+        let bar = sr as f64 * 60.0 / 198.0 * 4.0;
+        let dense = pulse_pattern_track(198.0, 1, sr, &[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]);
+        for gain in [0.1, 1.0] {
+            let mut samples = audio.samples.clone();
+            for (dst, src) in samples.iter_mut().zip(&dense.samples) { *dst = *src * gain; }
+            assert!(local_grid_continuous(&samples, 0, audio.frames, sr, 198.0),
+                "one dense reference bar at gain {gain}, {sr}Hz erased the groove");
+        }
+        // A dropout anywhere must reject, including gaps inside the phase
+        // reference context and gaps that cross a bar boundary.
+        for index in [0, 1, 2, 3, 4, 5, 6, 7, 12] {
+            for phase in [0.0, 0.5, 2.0, 3.5] {
+                let start = ((index as f64 + phase / 4.0) * bar).round() as usize;
+                let mut samples = audio.samples.clone();
+                samples[start * 2..(start + sr as usize) * 2].fill(0.0);
+                assert!(!local_grid_continuous(&samples, 0, audio.frames, sr, 198.0),
+                    "dropout absorbed into reference at bar {index}, beat {phase}, {sr}Hz");
+            }
+        }
+    }
+}
+
+#[test]
+fn regular_marker_cannot_count_quiet_subdivisions_through_a_slow_middle() {
+    use crate::analysis::{local_grid_continuous, local_sync_span};
+    for sr in [44_100, 48_000] {
+        let normal = synth_track(180.0, 24, 0, 0, sr);
+        let begin = 8 * sr as usize;
+        let end = 16 * sr as usize;
+        for bpm in [90.0, 120.0, 135.0, 150.0] {
+            let slow = synth_track(bpm, 16, 0, 0, sr);
+            let mut samples = normal.samples.clone();
+            samples[begin * 2..end * 2].copy_from_slice(&slow.samples[..(end - begin) * 2]);
+            assert!(!local_grid_continuous(&samples, 0, normal.frames, sr, 180.0),
+                "regular 180 -> {bpm} -> 180 marker corridor at {sr}Hz");
+            assert!(local_sync_span(&samples, 0, normal.frames, sr, 180.0).is_none(),
+                "slow middle accepted as a safe overlap at {sr}Hz");
+        }
+    }
+}
+
+#[test]
+fn observed_groove_gaps_must_be_shorter_than_half_time_at_both_rates() {
+    use crate::analysis::local_grid_continuous;
+    for sr in [44_100, 48_000] {
+        for (gap, supported) in [(1.9, true), (2.0, false), (2.1, false)] {
+            let audio = pulse_pattern_track(198.0, 16, sr, &[0.0, gap, 3.0]);
+            assert_eq!(local_grid_continuous(&audio.samples, 0, audio.frames, sr, 198.0),
+                supported, "observed gap {gap} beats at {sr}Hz");
+        }
+    }
+}

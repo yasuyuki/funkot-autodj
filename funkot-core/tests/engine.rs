@@ -1492,15 +1492,15 @@ fn normal_mode_keeps_a_single_prepared_next() {
         tracks.push(prepare_track(&options, &p, i as usize).expect("prepare"));
     }
 
+    let first_frames = tracks[0].frames;
     let mut engine = Engine::from_prepared(options, tracks).expect("engine");
     engine.set_realtime(true);
 
     let mut buf = vec![0.0f32; 1024 * 2];
-    // Bounded well under the ~1.5M frames the 6 six-second tracks hold in
-    // total (no `loop_playlist` for `from_prepared`'s finite `rest` list) --
-    // this only needs to stay inside track 0's own playback to observe the
-    // single-slot cap.
-    for _ in 0..300 {
+    // Stay inside track 0: crossing its end consumes the ready next track
+    // and turns this slot-cap check into a race with the replacement loader.
+    let chunk_frames = (buf.len() / 2) as u64;
+    for _ in 0..first_frames.saturating_sub(1) / chunk_frames {
         let n = engine.render(&mut buf);
         assert!(n > 0, "render stalled");
         assert!(
