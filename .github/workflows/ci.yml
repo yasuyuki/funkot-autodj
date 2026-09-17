@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      audit_only:
+        description: Run dependency policy without tests or packaging
+        type: boolean
+        default: true
   schedule:
     - cron: "0 */12 * * *"
 
@@ -30,7 +35,9 @@ jobs:
       - id: check
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.audit_only }}" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" != "schedule" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           elif git log master --since="12 hours ago" -1 --pretty=%H | grep -q .; then
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -51,8 +58,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with: { toolchain: "${{ env.RUST_VERSION }}" }
       - uses: Swatinem/rust-cache@v2
-      - name: Check event gate
-        run: python3 scripts/test-ci-gate.py
       - name: Check README cache-version claims
         run: ./scripts/check-readme-cache-version.sh
       - name: cargo test --locked --workspace --release
@@ -87,12 +92,12 @@ jobs:
 
   dependency-policy:
     name: dependency policy
-    needs: [gate]
-    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: Check CI conditions and toolchain alignment
+        run: python3 scripts/test-ci-gate.py
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check

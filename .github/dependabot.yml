@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      symphonia:
+        patterns: ["symphonia*"]
+      general-patches:
+        patterns: ["*"]
+        exclude-patterns: ["symphonia*", "cpal", "rubato", "signalsmith-stretch", "rustfft", "cc", "bindgen", "clang-sys", "cmake"]
+        # In particular, 0.x minor updates need their own review.
+        update-types: [patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
