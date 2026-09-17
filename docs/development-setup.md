@@ -55,7 +55,34 @@ Notes:
 
 ## Host cargo exception
 
-Only checks that need a live audio device should use host `cargo` (outside Docker). See [README.md § Development](../README.md#development) / Debug helpers. On Linux that path needs `libasound2-dev` and `pkg-config`. Everything else stays in `./dev.sh`.
+Checks that need a live audio device use host `cargo` (outside Docker). See [README.md § Development](../README.md#development) / Debug helpers. On Linux that path needs `libasound2-dev` and `pkg-config`. Builds and tests otherwise stay in `./dev.sh`. Dependency inspection below needs no native build dependencies.
+
+## Dependency maintenance
+
+Weekly proposals cover Cargo, Actions and the root Dockerfiles via
+[Dependabot](../.github/dependabot.yml). Review updates separately; 0.x minor
+updates can break compatibility. Docker proposals do not update the Android
+NDK/API constants or CI's LLVM installer. Rust changes must keep all Dockerfiles
+and CI aligned; the dependency-policy job checks this before merge.
+
+For candidates without compiling or building a container, use an installed
+Cargo matching CI's `RUST_VERSION`, from the repository root:
+
+```sh
+cargo update --dry-run
+```
+
+This reports resolution within current manifest constraints, not every newer
+major version. To adopt a reviewed candidate, use
+`cargo update -p <package> --precise <version>`, inspect the lockfile diff, and
+run the existing tests with `--locked` (plus Android validation for dependency
+changes, as required in [AGENTS.md](../AGENTS.md)).
+
+The CI workflow's manual **Run workflow** defaults to **audit_only**, running
+`cargo deny --locked check advisories licenses sources` without tests or
+packaging. Scheduled audits also run when there are no recent commits.
+An audit or database-fetch failure fails the job; inspect its log before
+changing dependencies or policy.
 
 ## Optional real-audio tests
 
