@@ -151,7 +151,10 @@ fn run() -> Result<(), String> {
             if matches!(event, EngineEvent::TransitionStarted { .. }) {
                 if request_wall.is_none() { automatic_before_request = true; }
                 if request_wall.is_some() && transition_frame.is_none() {
-                    transition_frame = engine.transition_frames_into().map(|into| frame_end.saturating_sub(into));
+                    // A short fallback can finish within this render call. Its
+                    // diagnostic still identifies the first deck's exact start.
+                    transition_frame = engine.last_manual_plan_diagnostic().map(|plan| plan.start)
+                        .or_else(|| engine.transition_frames_into().map(|into| frame_end.saturating_sub(into)));
                     transition_wall = Some(Instant::now());
                 }
             }
