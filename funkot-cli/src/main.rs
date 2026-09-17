@@ -2,7 +2,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,6 +24,7 @@ use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent, NavActio
 use funkot_core::labels::{upsert_label, SectionLabel};
 use funkot_core::{cache, EngineOptions, PitchMode};
 use log::warn;
+use serde_json::json;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -94,6 +95,11 @@ struct Args {
     /// While playing live, also write the stereo mix bus to WAV (debug)
     #[arg(long, value_name = "OUT.wav")]
     dump_wav: Option<PathBuf>,
+
+    /// Write live audio-callback and manual-navigation timing measurements as JSON.
+    /// This observes callback completion, not hardware audible latency.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["render", "gen_test_fixtures", "purge_auto_cache", "fill_missing_cache", "label_sections", "survey", "render_clips"])]
+    timing_report: Option<PathBuf>,
 
     /// Per-transition clip length (seconds) emitted during `--render`.
     /// Clips start 8 bars before each `TransitionStarted` and run for this
@@ -209,6 +215,81 @@ struct Args {
     click_duck_db: f32,
 }
 
+struct LiveTiming {
+    callback_count: AtomicU64,
+    callback_total_ns: AtomicU64,
+    callback_max_ns: AtomicU64,
+    callback_over_period: AtomicU64,
+    engine_render_total_ns: AtomicU64,
+    engine_render_max_ns: AtomicU64,
+    engine_output_frames: AtomicU64,
+    emitted_output_frames: AtomicU64,
+    callback_min_frames: AtomicU64,
+    callback_max_frames: AtomicU64,
+    backend_error_count: AtomicU64,
+}
+
+impl LiveTiming {
+    fn new() -> Self {
+        Self {
+            callback_count: AtomicU64::new(0), callback_total_ns: AtomicU64::new(0),
+            callback_max_ns: AtomicU64::new(0), callback_over_period: AtomicU64::new(0),
+            engine_render_total_ns: AtomicU64::new(0), engine_render_max_ns: AtomicU64::new(0),
+            engine_output_frames: AtomicU64::new(0), emitted_output_frames: AtomicU64::new(0),
+            callback_min_frames: AtomicU64::new(u64::MAX), callback_max_frames: AtomicU64::new(0),
+            backend_error_count: AtomicU64::new(0),
+        }
+    }
+
+    fn observe_callback(&self, callback: Duration, engine_render: Duration, frames: u64, engine_frames: u64, sample_rate: u32) {
+        let callback_ns = nanos(callback);
+        let render_ns = nanos(engine_render);
+        self.callback_count.fetch_add(1, Ordering::Relaxed);
+        self.callback_total_ns.fetch_add(callback_ns, Ordering::Relaxed);
+        self.engine_render_total_ns.fetch_add(render_ns, Ordering::Relaxed);
+        self.callback_max_ns.fetch_max(callback_ns, Ordering::Relaxed);
+        self.engine_render_max_ns.fetch_max(render_ns, Ordering::Relaxed);
+        if callback > Duration::from_secs_f64(frames as f64 / sample_rate as f64) {
+            self.callback_over_period.fetch_add(1, Ordering::Relaxed);
+        }
+        self.engine_output_frames.fetch_add(engine_frames, Ordering::Relaxed);
+        self.emitted_output_frames.fetch_add(frames, Ordering::Relaxed);
+        self.callback_min_frames.fetch_min(frames, Ordering::Relaxed);
+        self.callback_max_frames.fetch_max(frames, Ordering::Relaxed);
+    }
+}
+
+enum LiveEvent {
+    Engine(EngineEvent),
+    NavSent { action: NavAction, elapsed: Duration },
+    TransitionObserved { output_frame: u64, elapsed: Duration, diagnostic: Option<funkot_core::engine::ManualPlanDiagnostic>, attribution: &'static str },
+}
+
+#[derive(Clone, Copy)]
+struct TimingNav { action: NavAction, elapsed: Duration }
+
+struct TimingTransition {
+    output_frame: u64,
+    elapsed: Duration,
+    diagnostic: Option<funkot_core::engine::ManualPlanDiagnostic>,
+    attribution: &'static str,
+}
+
+fn nanos(duration: Duration) -> u64 { duration.as_nanos().min(u64::MAX as u128) as u64 }
+
+fn fresh_manual_plan_diagnostic(
+    before: Option<funkot_core::engine::ManualPlanDiagnostic>,
+    after: Option<funkot_core::engine::ManualPlanDiagnostic>,
+    transition_count: usize,
+) -> Option<funkot_core::engine::ManualPlanDiagnostic> {
+    let after = after?;
+    if transition_count == 1 && before.is_none_or(|before| before.generation != after.generation) {
+        Some(after)
+    } else {
+        None
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
@@ -311,6 +392,9 @@ fn run() -> Result<()> {
     if args.render.is_some() && args.dump_wav.is_some() {
         bail!("cannot combine --render and --dump-wav (use one)");
     }
+    if args.render.is_some() && args.timing_report.is_some() {
+        bail!("--timing-report is available only for live playback, not --render");
+    }
 
     if args.transitions_only {
         let ok = args.transition_clip_seconds.is_finite()
@@ -350,6 +434,7 @@ fn run() -> Result<()> {
             args.wav_format,
             args.transition_clip_seconds,
             args.transitions_only,
+            args.timing_report.as_deref(),
             &stop,
         )?;
     }
@@ -1140,6 +1225,7 @@ fn run_live(
     wav_format: WavFormat,
     transition_clip_seconds: f64,
     transitions_only: bool,
+    timing_report: Option<&Path>,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
     let playlist_len = playlist.len();
@@ -1189,7 +1275,12 @@ fn run_live(
     };
     let dump_cb = dump.clone();
 
-    let (event_tx, event_rx) = mpsc::channel::<EngineEvent>();
+    let (event_tx, event_rx) = mpsc::channel::<LiveEvent>();
+    let key_event_tx = event_tx.clone();
+    let timing_started = timing_report.map(|_| Instant::now());
+    let timing = timing_report.map(|_| Arc::new(LiveTiming::new()));
+    let timing_cb = timing.clone();
+    let timing_error = timing.clone();
     let mut stereo_scratch = Vec::<f32>::new();
     // Skip engine.render while paused so playheads / transitions stay put.
     let paused = Arc::new(AtomicBool::new(false));
@@ -1209,56 +1300,72 @@ fn run_live(
         .build_output_stream(
             config,
             move |data: &mut [f32], _| {
+                // Start before every callback work, including paused zero-fill,
+                // channel publication, and conversion into the device layout.
+                let callback_started = timing_cb.as_ref().map(|_| Instant::now());
+                let frames = data.len() / channels as usize;
+                let output_start = timing_cb.as_ref().map_or(0, |timing| timing.emitted_output_frames.load(Ordering::Relaxed));
+                let mut n = 0usize;
+                let mut render_elapsed = Duration::ZERO;
                 if paused_cb.load(Ordering::SeqCst) {
                     data.fill(0.0);
-                    return;
-                }
+                } else {
+                    let need = frames * 2;
+                    if stereo_scratch.len() < need {
+                        stereo_scratch.resize(need, 0.0);
+                    }
+                    let stereo = &mut stereo_scratch[..need];
+                    stereo.fill(0.0);
+                    let diagnostic_before = if timing_cb.is_some() {
+                        engine.last_manual_plan_diagnostic()
+                    } else { None };
+                    let render_started = timing_cb.as_ref().map(|_| Instant::now());
+                    n = engine.render(stereo);
+                    render_elapsed = render_started.map(|started| started.elapsed()).unwrap_or(Duration::ZERO);
 
-                let frames = data.len() / channels as usize;
-                let need = frames * 2;
-                if stereo_scratch.len() < need {
-                    stereo_scratch.resize(need, 0.0);
-                }
-                let stereo = &mut stereo_scratch[..need];
-                stereo.fill(0.0);
-                let n = engine.render(stereo);
-
-                let into = engine.transition_frames_into().unwrap_or(0);
-                let events = engine.poll_events();
-                if let Some(gate) = transition_gate.as_mut() {
-                    let mut offsets = Vec::new();
-                    for e in &events {
-                        if matches!(e, EngineEvent::TransitionStarted { .. }) {
-                            let start_offset = if into == 0 {
-                                0
-                            } else {
-                                n.saturating_sub(into as usize)
-                            };
-                            offsets.push(start_offset);
+                    let into = engine.transition_frames_into().unwrap_or(0);
+                    let events = engine.poll_events();
+                    let transition_count = timing_cb.as_ref().map_or(0, |_| events.iter().filter(|event| matches!(event, EngineEvent::TransitionStarted { .. })).count());
+                    if let Some(gate) = transition_gate.as_mut() {
+                        let mut offsets = Vec::new();
+                        for e in &events {
+                            if matches!(e, EngineEvent::TransitionStarted { .. }) {
+                                let start_offset = if into == 0 { 0 } else { n.saturating_sub(into as usize) };
+                                offsets.push(start_offset);
+                            }
                         }
+                        gate.process(&mut stereo[..n * 2], n, &offsets);
                     }
-                    gate.process(&mut stereo[..n * 2], n, &offsets);
-                }
 
-                for i in 0..frames {
-                    let (l, r) = if i < n {
-                        (stereo[i * 2], stereo[i * 2 + 1])
-                    } else {
-                        (0.0, 0.0)
-                    };
-                    write_frame(data, i, channels, l, r);
-                }
+                    for i in 0..frames {
+                        let (l, r) = if i < n { (stereo[i * 2], stereo[i * 2 + 1]) } else { (0.0, 0.0) };
+                        write_frame(data, i, channels, l, r);
+                    }
 
-                // Same stereo bus that fed write_frame (zeros already filled past n).
-                // try_lock: never block the audio thread on dump I/O.
-                if let Some(dump) = &dump_cb {
-                    if let Ok(mut w) = dump.try_lock() {
-                        let _ = w.write_interleaved(stereo);
+                    // Same stereo bus that fed write_frame (zeros already filled past n).
+                    // try_lock: never block the audio thread on dump I/O.
+                    if let Some(dump) = &dump_cb {
+                        if let Ok(mut w) = dump.try_lock() { let _ = w.write_interleaved(stereo); }
+                    }
+                    let diagnostic = if timing_cb.is_some() && transition_count == 1 {
+                        fresh_manual_plan_diagnostic(diagnostic_before, engine.last_manual_plan_diagnostic(), transition_count)
+                    } else { None };
+                    let attribution = if diagnostic.is_some() { "manual_plan_generation_changed" } else { "automatic_or_ambiguous" };
+                    for event in events {
+                        if matches!(event, EngineEvent::TransitionStarted { .. }) {
+                            if let Some(timing_started) = timing_started {
+                                let start_offset = if into == 0 { 0 } else { n.saturating_sub(into as usize) };
+                                let _ = event_tx.send(LiveEvent::TransitionObserved {
+                                    output_frame: output_start + start_offset as u64,
+                                    elapsed: timing_started.elapsed(), diagnostic, attribution,
+                                });
+                            }
+                        }
+                        let _ = event_tx.send(LiveEvent::Engine(event));
                     }
                 }
-
-                for event in events {
-                    let _ = event_tx.send(event);
+                if let (Some(timing), Some(callback_started)) = (&timing_cb, callback_started) {
+                    timing.observe_callback(callback_started.elapsed(), render_elapsed, frames as u64, n as u64, sample_rate);
                 }
             },
             // Same throttle as `--label-sections`: cpal's ALSA worker retries a
@@ -1269,6 +1376,7 @@ fn run_live(
             {
                 let mut throttle = StreamErrorThrottle::new(stream_error::DEFAULT_SUMMARY_INTERVAL);
                 move |err| {
+                    if let Some(timing) = &timing_error { timing.backend_error_count.fetch_add(1, Ordering::Relaxed); }
                     if let Some(report) = throttle.record_with(Instant::now(), || err.to_string()) {
                         eprintln!("\r{}\r", report.to_line());
                     }
@@ -1290,6 +1398,7 @@ fn run_live(
     let paused_keys = Arc::clone(&paused);
     let play_elapsed_keys = Arc::clone(&play_elapsed);
     let stop_keys = Arc::clone(stop);
+    let timing_event_tx = timing.as_ref().map(|_| key_event_tx);
     let key_join = thread::spawn(move || {
         if let Err(e) = enable_raw_mode() {
             eprintln!("warn: raw mode unavailable ({e}); skip/rewind keys disabled");
@@ -1321,6 +1430,8 @@ fn run_live(
                             &paused_keys,
                             &play_elapsed_keys,
                             &nav_tx,
+                            timing_event_tx.as_ref(),
+                            timing_started,
                             &mut agg,
                             &stop_keys,
                         );
@@ -1330,25 +1441,33 @@ fn run_live(
                 },
                 Ok(false) => {
                     if let Some(action) = agg.poll_timeout(Instant::now()) {
-                        let _ = nav_tx.try_send(action);
+                        send_nav(action, &nav_tx, timing_event_tx.as_ref(), timing_started);
                     }
                 }
                 Err(_) => break,
             }
         }
-        let _ = agg.flush();
+        if let Some(action) = agg.flush() {
+            send_nav(action, &nav_tx, timing_event_tx.as_ref(), timing_started);
+        }
     });
 
     let mut finished = false;
+    let mut nav_sends: Vec<TimingNav> = Vec::new();
+    let mut transition_observations = Vec::new();
     while !stop.load(Ordering::SeqCst) && !finished {
         match event_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(event) => {
-                if matches!(event, EngineEvent::Finished) {
-                    finished = true;
-                }
+            Ok(LiveEvent::Engine(event)) => {
+                if matches!(event, EngineEvent::Finished) { finished = true; }
                 let mut clock = play_elapsed.lock().unwrap_or_else(|e| e.into_inner());
                 print_event(&event, playlist_len, &mut clock, &mut analysis);
                 analysis.poll();
+            }
+            Ok(LiveEvent::NavSent { action, elapsed }) => {
+                nav_sends.push(TimingNav { action, elapsed });
+            }
+            Ok(LiveEvent::TransitionObserved { output_frame, elapsed, diagnostic, attribution }) => {
+                transition_observations.push(TimingTransition { output_frame, elapsed, diagnostic, attribution });
             }
             Err(RecvTimeoutError::Timeout) => {
                 analysis.poll();
@@ -1360,6 +1479,17 @@ fn run_live(
     stop.store(true, Ordering::SeqCst);
     let _ = key_join.join();
     drop(stream);
+    // The stream is stopped and the key sender has joined, so this captures
+    // observations queued just before Ctrl+C without touching callback state.
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            LiveEvent::NavSent { action, elapsed } => nav_sends.push(TimingNav { action, elapsed }),
+            LiveEvent::TransitionObserved { output_frame, elapsed, diagnostic, attribution } => {
+                transition_observations.push(TimingTransition { output_frame, elapsed, diagnostic, attribution });
+            }
+            LiveEvent::Engine(_) => {}
+        }
+    }
     if let (Some(dump), Some(path)) = (dump, dump_path) {
         let w = Arc::try_unwrap(dump)
             .map_err(|_| anyhow::anyhow!("dump writer still held after stream stop"))?
@@ -1372,6 +1502,10 @@ fn run_live(
             wav_format,
             stats.peak
         );
+    }
+    if let (Some(path), Some(timing), Some(timing_started)) = (timing_report, timing, timing_started) {
+        write_live_timing_report(path, &timing, sample_rate, timing_started.elapsed(), nav_sends, transition_observations)?;
+        println!("wrote live timing report");
     }
     Ok(())
 }
@@ -1402,6 +1536,8 @@ fn handle_key(
     paused: &AtomicBool,
     play_elapsed: &Mutex<PlayElapsed>,
     nav_tx: &mpsc::SyncSender<NavAction>,
+    timing_event_tx: Option<&mpsc::Sender<LiveEvent>>,
+    timing_started: Option<Instant>,
     agg: &mut MultiPressAggregator,
     stop: &AtomicBool,
 ) {
@@ -1419,15 +1555,116 @@ fn handle_key(
         KeyCode::Enter => toggle_pause(paused, play_elapsed),
         KeyCode::Left => {
             if let Some(action) = agg.press(NavDir::Left, Instant::now()) {
-                let _ = nav_tx.try_send(action);
+                send_nav(action, nav_tx, timing_event_tx, timing_started);
             }
         }
         KeyCode::Right => {
             if let Some(action) = agg.press(NavDir::Right, Instant::now()) {
-                let _ = nav_tx.try_send(action);
+                send_nav(action, nav_tx, timing_event_tx, timing_started);
             }
         }
         _ => {}
+    }
+}
+
+fn send_nav(action: NavAction, nav_tx: &mpsc::SyncSender<NavAction>, timing_event_tx: Option<&mpsc::Sender<LiveEvent>>, timing_started: Option<Instant>) {
+    let elapsed = timing_started.map(|started| started.elapsed());
+    if nav_tx.try_send(action).is_ok() {
+        if let (Some(tx), Some(elapsed)) = (timing_event_tx, elapsed) {
+            let _ = tx.send(LiveEvent::NavSent { action, elapsed });
+        }
+    }
+}
+
+fn nav_action_name(action: NavAction) -> &'static str {
+    match action {
+        NavAction::RestartCurrent => "restart_current",
+        NavAction::TransitionToPrev => "transition_to_prev",
+        NavAction::JumpToPrevIntro => "jump_to_prev_intro",
+        NavAction::TransitionToNext => "transition_to_next",
+        NavAction::JumpToNextIntro => "jump_to_next_intro",
+    }
+}
+
+fn manual_plan_json(diagnostic: Option<funkot_core::engine::ManualPlanDiagnostic>) -> serde_json::Value {
+    match diagnostic {
+        Some(d) => json!({"generation": d.generation, "start": d.start, "entry": d.entry,
+            "prev_nudge": d.prev_nudge, "next_main": d.next_main, "fade_in_end": d.fade_in_end,
+            "fade_out_start": d.fade_out_start, "fade_out_end": d.fade_out_end,
+            "simple": d.simple, "reason": d.reason}),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn latest_prior_nav_elapsed(navs: &[TimingNav], transition: Duration) -> Option<Duration> {
+    navs.iter().filter(|nav| nav.elapsed <= transition).map(|nav| nav.elapsed).max()
+}
+
+fn write_live_timing_report(path: &Path, timing: &LiveTiming, sample_rate: u32, elapsed: Duration, nav_sends: Vec<TimingNav>, transitions: Vec<TimingTransition>) -> Result<()> {
+    let count = timing.callback_count.load(Ordering::Relaxed);
+    let min_frames = timing.callback_min_frames.load(Ordering::Relaxed);
+    let report = json!({
+        "sample_rate": sample_rate,
+        "elapsed_monotonic_ms": elapsed.as_secs_f64() * 1000.0,
+        "callback": {"count": count, "total_ns": timing.callback_total_ns.load(Ordering::Relaxed),
+            "max_ns": timing.callback_max_ns.load(Ordering::Relaxed),
+            "count_exceeding_actual_frames_period": timing.callback_over_period.load(Ordering::Relaxed),
+            "frames_min": if count == 0 { None } else { Some(min_frames) },
+            "frames_max": timing.callback_max_frames.load(Ordering::Relaxed)},
+        "engine_render": {"total_ns": timing.engine_render_total_ns.load(Ordering::Relaxed),
+            "max_ns": timing.engine_render_max_ns.load(Ordering::Relaxed)},
+        "frames": {"emitted_output": timing.emitted_output_frames.load(Ordering::Relaxed),
+            "engine_rendered": timing.engine_output_frames.load(Ordering::Relaxed)},
+        "backend_error_count": timing.backend_error_count.load(Ordering::Relaxed),
+        "manual_navigation_sends": nav_sends.iter().map(|nav| json!({"action": nav_action_name(nav.action), "monotonic_ms": nav.elapsed.as_secs_f64() * 1000.0})).collect::<Vec<_>>(),
+        "transition_observations": transitions.iter().map(|transition| json!({
+            "output_frame": transition.output_frame,
+            "monotonic_ms": transition.elapsed.as_secs_f64() * 1000.0,
+            "latest_prior_nav_send_to_observation_ms": if transition.diagnostic.is_some() { latest_prior_nav_elapsed(&nav_sends, transition.elapsed).and_then(|sent| transition.elapsed.checked_sub(sent)).map(|d| d.as_secs_f64() * 1000.0) } else { None },
+            "manual_plan_diagnostic": manual_plan_json(transition.diagnostic),
+            "attribution": transition.attribution
+        })).collect::<Vec<_>>(),
+        "limits": "Callback timing includes this callback's engine render, event handling, format conversion, and optional dump try-lock attempt. Transition timestamps are callback observations; the latest earlier successful channel enqueue is chronological only and is not guaranteed to be the transition's generation. Neither timestamp measures hardware audible latency."
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&report)?)
+        .with_context(|| format!("write timing report {}", path.display()))
+}
+
+#[cfg(test)]
+mod live_timing_tests {
+    use super::*;
+
+    fn diagnostic(generation: u64) -> funkot_core::engine::ManualPlanDiagnostic {
+        funkot_core::engine::ManualPlanDiagnostic {
+            generation, start: 0, entry: 0, prev_nudge: 0, next_main: 0,
+            fade_in_end: 0, fade_out_start: 0, fade_out_end: 0, simple: false, reason: "test",
+        }
+    }
+
+    #[test]
+    fn latest_prior_nav_uses_timestamps_not_channel_arrival_order() {
+        let navs = [
+            TimingNav { action: NavAction::TransitionToNext, elapsed: Duration::from_millis(100) },
+            TimingNav { action: NavAction::RestartCurrent, elapsed: Duration::from_millis(300) },
+        ];
+        assert_eq!(latest_prior_nav_elapsed(&navs, Duration::from_millis(250)), Some(Duration::from_millis(100)));
+        assert_eq!(latest_prior_nav_elapsed(&navs, Duration::from_millis(400)), Some(Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn timing_report_rejects_offline_render_mode() {
+        assert!(Args::try_parse_from([
+            "funkot-autodj", "track.wav", "--render", "out.wav", "--timing-report", "timing.json",
+        ]).is_err());
+    }
+
+    #[test]
+    fn diagnostic_attribution_requires_new_generation_and_one_transition() {
+        let stale = diagnostic(7);
+        let fresh = diagnostic(8);
+        assert_eq!(fresh_manual_plan_diagnostic(Some(stale), Some(stale), 1), None);
+        assert_eq!(fresh_manual_plan_diagnostic(Some(stale), Some(fresh), 2), None);
+        assert_eq!(fresh_manual_plan_diagnostic(Some(stale), Some(fresh), 1), Some(fresh));
     }
 }
 
