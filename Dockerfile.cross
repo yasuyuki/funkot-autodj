@@ -4,7 +4,7 @@
 #   docker build -f Dockerfile.cross -t funkot-autodj-cross .
 # Prefer:
 #   ./cross-build.sh
-FROM rust:1.93-slim-trixie
+FROM rust:1.98-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Host C++ + libclang for bindgen (signalsmith-stretch)
