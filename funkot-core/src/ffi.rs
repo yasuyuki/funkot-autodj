@@ -110,7 +110,7 @@ fn fill_event(out: &mut FunkotEvent, event: EngineEvent) {
             copy_utf8_c_array(&mut out.path, &path_to_utf8(&to));
             copy_utf8_c_array(&mut out.detail, &path_to_utf8(&from));
         }
-        EngineEvent::TrackFailed { path, message } => {
+        EngineEvent::TrackFailed { path, message, .. } => {
             out.type_ = FunkotEventType::TrackFailed;
             out.track_index = -1;
             copy_utf8_c_array(&mut out.path, &path_to_utf8(&path));

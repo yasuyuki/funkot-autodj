@@ -49,7 +49,7 @@ pub enum NavAction {
 pub enum EngineEvent {
     TrackStarted { index: usize, path: PathBuf },
     TransitionStarted { from: PathBuf, to: PathBuf },
-    TrackFailed { path: PathBuf, message: String },
+    TrackFailed { index: usize, path: PathBuf, message: String },
     Finished,
 }
 
@@ -658,6 +658,7 @@ enum LoaderMsg {
     /// Replace the playing (or queued) first-track preview with the full stretch.
     Upgrade(PreparedTrack),
     Failed {
+        index: usize,
         path: PathBuf,
         message: String,
     },
@@ -1002,9 +1003,76 @@ fn prefetch_depth_for(options: &EngineOptions) -> usize {
     }
 }
 
+/// Why a future-source transaction cannot start without disturbing playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutureUpdateBusy {
+    UpdateInProgress,
+    Transition,
+    Navigation,
+    PreviewUpgrade,
+    NoRunway,
+    Stopped,
+}
+
+/// A fence owned by one engine. Resolve it with commit or abort after host I/O.
+/// The occurrence index is authoritative even if TrackStarted is still queued.
+#[derive(Debug)]
+pub struct FutureUpdate {
+    identity: Arc<()>,
+    generation: u64,
+    current_index: Option<usize>,
+}
+impl FutureUpdate {
+    pub fn current_index(&self) -> Option<usize> { self.current_index }
+    pub fn generation(&self) -> u64 { self.generation }
+}
+
+/// Construct outside the render lock. The parked thread does not call the
+/// source until commit, and dropping an unused replacement cancels it.
+/// Replacement sources must use occurrence indexes unique across this engine's
+/// lifetime. Hosts must reconcile pending old events by index; paths can repeat.
+pub struct PreparedSourceReplacement {
+    activate: SyncSender<EngineOptions>,
+    shutdown: Arc<AtomicBool>,
+    rx: Receiver<LoaderMsg>,
+    permit_tx: SyncSender<()>,
+    join: JoinHandle<()>,
+}
+impl PreparedSourceReplacement {
+    pub fn new(source: Box<dyn TrackSource>) -> Result<Self> {
+        let (activate, start) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (permit_tx, permit_rx) = mpsc::sync_channel(3 + HEAD_ONLY_PREFETCH);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let join = thread::Builder::new().name("funkot-replacement".into())
+            .stack_size(8 * 1024 * 1024).spawn(move || {
+                if let Ok(options) = start.recv() {
+                    // Future tracks must be complete: a queued preview cannot
+                    // rely on an Upgrade that races its eventual adoption.
+                    loader_main_mode(options, source, tx, permit_rx, flag, false);
+                }
+            }).map_err(|e| Error::Engine(format!("spawn replacement loader: {e}")))?;
+        Ok(Self { activate, shutdown, rx, permit_tx, join })
+    }
+}
+
+/// Old future buffers and channels. Drop this value OUTSIDE the render lock.
+/// The old worker is cancelled and detached, never joined while decoding.
+#[must_use = "drop retired future outside the render lock"]
+pub struct RetiredFuture {
+    _rx: Receiver<LoaderMsg>,
+    _next: Option<PreparedTrack>,
+    _heads: VecDeque<PreparedTrack>,
+    _join: Option<JoinHandle<()>>,
+}
+
 /// Pull-based auto-DJ engine.
 pub struct Engine {
     options: EngineOptions,
+    future_fence: Option<Arc<()>>,
+    source_generation: u64,
+    replacement_current_slot_reserved: bool,
     bar_frames: f64,
     shutdown: Arc<AtomicBool>,
     loader_rx: Receiver<LoaderMsg>,
@@ -1048,6 +1116,7 @@ pub struct Engine {
     /// Host → engine nav commands (audio thread drains in [`Self::render`]).
     nav_tx: SyncSender<NavAction>,
     nav_rx: Receiver<NavAction>,
+    deferred_nav: VecDeque<NavAction>,
     pending_nav: Option<PendingNav>,
     nav_gen: u64,
     /// One long-lived local planner.  The request channel is capacity one;
@@ -1116,6 +1185,9 @@ impl Engine {
         }).map_err(|e| Error::Engine(format!("spawn local sync worker: {e}")))?;
         Ok(Self {
             options,
+            future_fence: None,
+            source_generation: 0,
+            replacement_current_slot_reserved: false,
             bar_frames,
             shutdown,
             loader_rx: msg_rx,
@@ -1140,6 +1212,7 @@ impl Engine {
             phase_align_rx: None,
             nav_tx,
             nav_rx,
+            deferred_nav: VecDeque::new(),
             pending_nav: None,
             nav_gen: 0,
             manual_tx, manual_rx, manual_pending: None, manual_in_flight: false, manual_deadline: None, manual_action: None, last_manual_plan: None,
@@ -1202,6 +1275,9 @@ impl Engine {
         }).map_err(|e| Error::Engine(format!("spawn local sync worker: {e}")))?;
         let mut engine = Self {
             options,
+            future_fence: None,
+            source_generation: 0,
+            replacement_current_slot_reserved: false,
             bar_frames,
             shutdown,
             loader_rx: msg_rx,
@@ -1226,6 +1302,7 @@ impl Engine {
             phase_align_rx: None,
             nav_tx,
             nav_rx,
+            deferred_nav: VecDeque::new(),
             pending_nav: None,
             nav_gen: 0,
             manual_tx, manual_rx, manual_pending: None, manual_in_flight: false, manual_deadline: None, manual_action: None, last_manual_plan: None,
@@ -1237,6 +1314,98 @@ impl Engine {
         }
         engine.kick_phase_align_if_needed();
         Ok(engine)
+    }
+
+    /// Currently committed occurrence, independent of event polling latency.
+    pub fn current_index(&self) -> Option<usize> {
+        self.active.as_ref().map(|d| d.track.playlist_index)
+    }
+
+    /// Authoritative end state, independent of queued Finished events.
+    pub fn is_finished(&self) -> bool { self.finished }
+
+    /// Generation of the currently installed source (incremented at commit).
+    pub fn source_generation(&self) -> u64 { self.source_generation }
+
+    /// Freeze future adoption during host persistence. Refusal changes nothing.
+    /// The current audio advances; if it ends before resolution it stays silent
+    /// at its end rather than consuming the old future.
+    pub fn begin_future_update(&mut self) -> std::result::Result<FutureUpdate, FutureUpdateBusy> {
+        // Preserve queued commands in order while inspecting them. A refusal
+        // must not lose an already-requested old-source navigation action.
+        if self.future_fence.is_none() { self.defer_nav_commands(); }
+        let busy = if self.future_fence.is_some() { Some(FutureUpdateBusy::UpdateInProgress) }
+            else if self.stopped { Some(FutureUpdateBusy::Stopped) }
+            else if self.transition.is_some() { Some(FutureUpdateBusy::Transition) }
+            else if self.pending_nav.is_some() || self.manual_action.is_some() || !self.deferred_nav.is_empty() { Some(FutureUpdateBusy::Navigation) }
+            else if self.active.as_ref().is_some_and(|d| d.track.preview && !d.track.head_only) { Some(FutureUpdateBusy::PreviewUpgrade) }
+            else if self.active.as_ref().is_some_and(|d| !d.track.head_only && d.playhead >= d.track.outro_start_out)
+                && !(self.loader_exhausted && self.ready_ahead() == 0) { Some(FutureUpdateBusy::NoRunway) }
+            else { None };
+        if let Some(reason) = busy { return Err(reason); }
+        let identity = Arc::new(());
+        self.future_fence = Some(identity.clone());
+        Ok(FutureUpdate { identity, generation: self.source_generation, current_index: self.current_index() })
+    }
+
+    fn check_future_token(&self, token: &FutureUpdate) {
+        assert!(self.future_fence.as_ref().is_some_and(|id| Arc::ptr_eq(id, &token.identity)),
+            "future update token belongs to another engine or resolved transaction");
+    }
+
+    pub fn abort_future_update(&mut self, token: FutureUpdate) {
+        self.check_future_token(&token);
+        self.future_fence = None;
+    }
+
+    /// Infallible for this engine's live token. No filesystem work, thread
+    /// creation, or decoder join occurs here. Old worker results and permits
+    /// belong to disconnected channels and can never affect this generation.
+    pub fn commit_future_update(&mut self, token: FutureUpdate, replacement: PreparedSourceReplacement) -> RetiredFuture {
+        self.check_future_token(&token);
+        // This empty observation linearizes the source change for the shared
+        // navigation sender. Commands submitted before it belong to the old
+        // future; subsequent sends are commands for the replacement.
+        self.deferred_nav.clear();
+        while self.nav_rx.try_recv().is_ok() {}
+        let PreparedSourceReplacement { activate, shutdown, rx, permit_tx, join } = replacement;
+        self.shutdown.store(true, Ordering::SeqCst);
+        let retired = RetiredFuture {
+            _rx: std::mem::replace(&mut self.loader_rx, rx),
+            _next: self.next_track.take(),
+            _heads: std::mem::take(&mut self.head_queue),
+            _join: self.loader_join.replace(join),
+        };
+        self.shutdown = shutdown;
+        self.permit_tx = permit_tx;
+        self.loader_exhausted = false;
+        self.source_generation = self.source_generation.wrapping_add(1);
+        self.future_fence = None;
+        self.awaiting_next_at_outro = false;
+        self.clear_phase_align();
+        self.cancel_pending_nav();
+        // Account for retained decks/history against the NEW permit pool.
+        self.third_permit_armed = self.last_track.is_some();
+        // While finished, poll_events may accept a next track long before
+        // resume adopts it. Reserve the vacant current slot until then so a
+        // second Ready cannot be discarded as surplus in the single next slot.
+        self.replacement_current_slot_reserved = self.active.is_none();
+        let occupied = 1 + usize::from(self.last_track.is_some());
+        for _ in 0..(2 + self.prefetch_depth() + usize::from(self.third_permit_armed)).saturating_sub(occupied) {
+            self.release_permit();
+        }
+        // Receiver exists on the parked thread until this activation arrives.
+        let _ = activate.try_send(self.options.clone());
+        retired
+    }
+
+    /// Restart a naturally finished finite source after a committed update.
+    /// Source replacement itself never restarts finished playback. stop() is terminal.
+    pub fn resume(&mut self) -> bool {
+        if self.stopped || self.future_fence.is_some() { return false; }
+        self.finished = false;
+        self.finished_emitted = false;
+        true
     }
 
     /// Realtime hosts (cpal / FFI audio callbacks): never sleep inside [`Self::render`].
@@ -1271,6 +1440,7 @@ impl Engine {
 
         // Still waiting for the first track (or between tracks): silence.
         if self.active.is_none() && self.prev.is_none() {
+            if self.future_fence.is_some() { out.fill(0.0); return want_frames; }
             self.drain_loader();
             if let Some(track) = self.take_next() {
                 self.start_first(track);
@@ -1388,6 +1558,7 @@ impl Engine {
     /// transition. Either way there is nothing for the host to hand back to
     /// its queue.
     pub fn revoke_next(&mut self) -> Option<PathBuf> {
+        if self.future_fence.is_some() { return None; }
         let track = self.take_next()?;
         let path = track.path.clone();
         self.cancel_pending_nav();
@@ -1413,9 +1584,9 @@ impl Engine {
         self.stopped = true;
         self.shutdown.store(true, Ordering::SeqCst);
         while let Ok(msg) = self.loader_rx.try_recv() {
-            if let LoaderMsg::Failed { path, message } = msg {
+            if let LoaderMsg::Failed { index, path, message } = msg {
                 self.pending_events
-                    .push(EngineEvent::TrackFailed { path, message });
+                    .push(EngineEvent::TrackFailed { index, path, message });
             }
         }
         // Unblock loader waiting on a permit.
@@ -1528,23 +1699,34 @@ impl Engine {
     /// Normal mode coalesces a burst of taps into the last one (the single
     /// `next_track` slot has no runway for more). Labeling mode has the head
     /// queue for exactly this burst, so every tap is applied in order instead.
+    fn defer_nav_commands(&mut self) {
+        while let Ok(action) = self.nav_rx.try_recv() {
+            self.deferred_nav.push_back(action);
+        }
+    }
+
     fn drain_nav_commands(&mut self) {
+        if self.future_fence.is_some() { return; }
+        self.defer_nav_commands();
         if self.prefetch_depth() == 0 {
-            let mut last = None;
-            while let Ok(action) = self.nav_rx.try_recv() {
-                last = Some(action);
-            }
+            let last = self.deferred_nav.pop_back();
+            self.deferred_nav.clear();
             if let Some(action) = last {
                 self.begin_nav(action);
             }
             return;
         }
-        while let Ok(action) = self.nav_rx.try_recv() {
+        while let Some(action) = self.deferred_nav.pop_front() {
             self.begin_nav(action);
         }
     }
 
     fn begin_nav(&mut self, action: NavAction) {
+        if self.future_fence.is_some() {
+            self.defer_nav_commands();
+            self.deferred_nav.push_back(action);
+            return;
+        }
         // Labeling mode: a head-only deck has no fade material and no outro to
         // schedule a bar-grid transition against, so any nav is a hard cut.
         let action = match self.active.as_ref() {
@@ -1959,6 +2141,7 @@ impl Engine {
     }
 
     fn drain_loader(&mut self) {
+        if self.future_fence.is_some() { return; }
         loop {
             match self.loader_rx.try_recv() {
                 Ok(LoaderMsg::Ready(track)) => {
@@ -1984,9 +2167,9 @@ impl Engine {
                 Ok(LoaderMsg::Upgrade(track)) => {
                     self.apply_upgrade(track);
                 }
-                Ok(LoaderMsg::Failed { path, message }) => {
+                Ok(LoaderMsg::Failed { index, path, message }) => {
                     self.pending_events
-                        .push(EngineEvent::TrackFailed { path, message });
+                        .push(EngineEvent::TrackFailed { index, path, message });
                     // Failed prep consumed a permit; allow another attempt.
                     self.release_permit();
                 }
@@ -2005,7 +2188,7 @@ impl Engine {
     /// Swap preview samples/markers for the full first track without restarting.
     fn apply_upgrade(&mut self, track: PreparedTrack) {
         if let Some(deck) = self.active.as_mut() {
-            if deck.track.path == track.path {
+            if deck.track.path == track.path && deck.track.playlist_index == track.playlist_index {
                 // A second Upgrade is not normally emitted, but do not leave
                 // its already-retained preview to drop on this callback.
                 retire_upgrade_fade(deck.upgrade_fade.take());
@@ -2023,7 +2206,7 @@ impl Engine {
             }
         }
         if let Some(next) = self.next_track.as_mut() {
-            if next.path == track.path {
+            if next.path == track.path && next.playlist_index == track.playlist_index {
                 let old = std::mem::replace(next, track);
                 retire_prepared(old);
                 self.clear_phase_align();
@@ -2049,6 +2232,7 @@ impl Engine {
     /// instead of falling into the Upgrade-wait or outro-transition paths,
     /// which assume a full-length track is coming.
     fn tick_head_only(&mut self) {
+        if self.future_fence.is_some() { return; }
         let Some(active) = self.active.as_ref() else {
             return;
         };
@@ -2128,6 +2312,10 @@ impl Engine {
     }
 
     fn start_first(&mut self, track: PreparedTrack) {
+        if self.replacement_current_slot_reserved {
+            self.replacement_current_slot_reserved = false;
+            self.release_permit();
+        }
         self.cancel_pending_nav();
         let path = track.path.clone();
         let index = track.playlist_index;
@@ -2146,6 +2334,7 @@ impl Engine {
     }
 
     fn maybe_start_or_update_transition(&mut self) {
+        if self.future_fence.is_some() { return; }
         if self.transition.is_some() || self.pending_nav.is_some() {
             return;
         }
@@ -2425,7 +2614,7 @@ impl Engine {
             .as_ref()
             .map(|d| d.playhead >= d.track.frames && !d.track.preview && d.upgrade_fade.is_none())
             .unwrap_or(true);
-        if active_done && self.transition.is_none() {
+        if active_done && self.transition.is_none() && self.future_fence.is_none() {
             if self.active.is_some() {
                 self.retire_active();
             }
@@ -2585,13 +2774,22 @@ impl TrackSource for PlaylistSource {
 
 fn loader_main(
     options: EngineOptions,
-    mut source: Box<dyn TrackSource>,
+    source: Box<dyn TrackSource>,
     tx: SyncSender<LoaderMsg>,
     permit_rx: Receiver<()>,
     shutdown: Arc<AtomicBool>,
 ) {
-    // First live track: head stretch → play, then full stretch upgrades in place.
-    let mut first_live = true;
+    loader_main_mode(options, source, tx, permit_rx, shutdown, true);
+}
+
+fn loader_main_mode(
+    options: EngineOptions,
+    mut source: Box<dyn TrackSource>,
+    tx: SyncSender<LoaderMsg>,
+    permit_rx: Receiver<()>,
+    shutdown: Arc<AtomicBool>,
+    mut first_live: bool,
+) {
     // Fixed for the life of the loader (no live labeling switch): read once.
     let head_secs = options.head_only_secs;
 
@@ -2634,6 +2832,7 @@ fn loader_main(
                 }
                 Err(e) => {
                     let msg = LoaderMsg::Failed {
+                        index: idx,
                         path: path.clone(),
                         message: e.to_string(),
                     };
@@ -2746,6 +2945,7 @@ fn prepare_first_live(
             return send_msg(
                 tx,
                 LoaderMsg::Failed {
+                    index,
                     path: path.to_path_buf(),
                     message: e.to_string(),
                 },
@@ -2761,6 +2961,7 @@ fn prepare_first_live(
                 return send_msg(
                     tx,
                     LoaderMsg::Failed {
+                        index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
                     },
@@ -2790,6 +2991,7 @@ fn prepare_first_live(
                 return send_msg(
                     tx,
                     LoaderMsg::Failed {
+                        index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
                     },
@@ -2810,6 +3012,7 @@ fn prepare_first_live(
                 return send_msg(
                     tx,
                     LoaderMsg::Failed {
+                        index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
                     },
@@ -2830,6 +3033,7 @@ fn prepare_first_live(
             return send_msg(
                 tx,
                 LoaderMsg::Failed {
+                    index,
                     path: path.to_path_buf(),
                     message: e.to_string(),
                 },
@@ -3271,6 +3475,222 @@ mod tests {
     use crate::testutil::synth_track;
     use crate::PitchMode;
     use std::f32::consts::PI;
+
+    fn future_track(index: usize) -> PreparedTrack {
+        let mut track = upgrade_test_track("same.wav", 64, 0.25 + index as f32 / 100.0, 1.0, false);
+        track.playlist_index = index;
+        track
+    }
+
+    fn future_engine(indices: &[usize]) -> Engine {
+        let mut engine = Engine::from_prepared(EngineOptions::default(), indices.iter().map(|i| future_track(*i)).collect()).unwrap();
+        engine.set_realtime(true);
+        engine
+    }
+
+    // Private controlled decoder seam: production activation/channels/permits,
+    // synthetic PCM instead of filesystem decode.
+    fn future_replacement(tracks: Vec<PreparedTrack>) -> PreparedSourceReplacement {
+        let (activate, start) = mpsc::sync_channel::<EngineOptions>(1);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (permit_tx, permit_rx) = mpsc::sync_channel(3 + HEAD_ONLY_PREFETCH);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let join = thread::spawn(move || {
+            if start.recv().is_ok() { prepared_loader_main(tracks, tx, permit_rx, flag); }
+        });
+        PreparedSourceReplacement { activate, shutdown, rx, permit_tx, join }
+    }
+
+    fn wait_future(engine: &mut Engine) {
+        for _ in 0..200 {
+            engine.drain_loader();
+            if engine.ready_ahead() > 0 { return; }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("replacement not delivered");
+    }
+
+    #[test]
+    fn future_append_after_exhaustion_preserves_audio_and_playhead() {
+        let mut engine = future_engine(&[1]);
+        engine.render(&mut [0.0; 20]);
+        let samples = engine.active.as_ref().unwrap().track.samples.clone();
+        let token = engine.begin_future_update().unwrap();
+        assert_eq!(token.current_index(), Some(1));
+        assert_eq!(token.generation(), 0);
+        let retired = engine.commit_future_update(token, future_replacement(vec![future_track(2)]));
+        drop(retired);
+        assert_eq!(engine.active.as_ref().unwrap().playhead, 10);
+        assert!(Arc::ptr_eq(&samples, &engine.active.as_ref().unwrap().track.samples));
+        wait_future(&mut engine);
+        engine.render(&mut [0.0; 110]);
+        assert_eq!(engine.current_index(), Some(2));
+        assert!(engine.poll_events().iter().any(|e| matches!(e, EngineEvent::TrackStarted { index: 2, .. })));
+    }
+
+    #[test]
+    fn future_finished_requires_explicit_resume() {
+        let mut engine = future_engine(&[1]);
+        engine.render(&mut [0.0; 128]);
+        assert!(engine.finished);
+        let token = engine.begin_future_update().unwrap();
+        drop(engine.commit_future_update(token, future_replacement(vec![future_track(2), future_track(3)])));
+        wait_future(&mut engine);
+        // Polling while stopped must not consume and discard the second future.
+        for _ in 0..10 {
+            engine.poll_events();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(engine.render(&mut [0.0; 2]), 0);
+        assert_eq!(engine.current_index(), None);
+        assert!(engine.resume());
+        let mut audio = [0.0; 2];
+        assert_eq!(engine.render(&mut audio), 1);
+        assert!(audio[0] > 0.0);
+        assert_eq!(engine.current_index(), Some(2));
+        wait_future(&mut engine);
+        assert_eq!(engine.next_track.as_ref().unwrap().playlist_index, 3);
+    }
+
+    #[test]
+    fn future_commit_retires_prepared_preparing_and_old_messages_and_permits() {
+        for late in [LoaderMsg::Ready(future_track(3)), LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "old failure".into() }, LoaderMsg::Exhausted] {
+            let mut engine = future_engine(&[1, 2]);
+            let (old_tx, old_rx) = mpsc::sync_channel(1);
+            engine.loader_rx = old_rx;
+            let (old_permits, old_permit_rx) = mpsc::sync_channel(8);
+            engine.permit_tx = old_permits;
+            engine.head_queue.push_back(future_track(4));
+            let token = engine.begin_future_update().unwrap();
+            let retired = engine.commit_future_update(token, future_replacement(vec![future_track(5)]));
+            old_tx.try_send(late).unwrap();
+            engine.release_permit();
+            assert!(old_permit_rx.try_recv().is_err());
+            wait_future(&mut engine);
+            assert_eq!(engine.next_track.as_ref().unwrap().playlist_index, 5);
+            assert!(engine.head_queue.is_empty());
+            assert!(!engine.poll_events().iter().any(|e| matches!(e, EngineEvent::TrackFailed { .. })));
+            drop(retired);
+            assert!(old_tx.try_send(LoaderMsg::Ready(future_track(3))).is_err());
+        }
+    }
+
+    #[test]
+    fn future_abort_keeps_old_runway_after_audio_passes_end() {
+        let mut engine = future_engine(&[1, 2]);
+        let (old_tx, old_rx) = mpsc::sync_channel(1);
+        engine.loader_rx = old_rx;
+        let token = engine.begin_future_update().unwrap();
+        old_tx.try_send(LoaderMsg::Exhausted).unwrap();
+        engine.render(&mut [0.0; 200]);
+        assert_eq!(engine.current_index(), Some(1));
+        assert_eq!(engine.ready_ahead(), 1);
+        assert!(!engine.finished);
+        engine.abort_future_update(token);
+        engine.render(&mut [0.0; 2]);
+        assert_eq!(engine.current_index(), Some(2));
+    }
+
+    #[test]
+    fn future_busy_refusal_is_atomic_and_preview_upgrade_is_protected() {
+        let mut engine = future_engine(&[1, 2]);
+        engine.active.as_mut().unwrap().track.preview = true;
+        assert_eq!(engine.begin_future_update().unwrap_err(), FutureUpdateBusy::PreviewUpgrade);
+        assert_eq!(engine.current_index(), Some(1));
+        assert_eq!(engine.ready_ahead(), 1);
+        assert!(engine.future_fence.is_none());
+        engine.active.as_mut().unwrap().track.preview = false;
+        engine.manual_action = Some(NavAction::TransitionToNext);
+        assert_eq!(engine.begin_future_update().unwrap_err(), FutureUpdateBusy::Navigation);
+        engine.manual_action = None;
+        engine.active.as_mut().unwrap().playhead = 64;
+        assert_eq!(engine.begin_future_update().unwrap_err(), FutureUpdateBusy::NoRunway);
+        engine.active.as_mut().unwrap().track.head_only = true;
+        let token = engine.begin_future_update().unwrap();
+        assert_eq!(engine.begin_future_update().unwrap_err(), FutureUpdateBusy::UpdateInProgress);
+        engine.abort_future_update(token);
+    }
+
+    #[test]
+    fn future_same_path_upgrade_matches_occurrence_and_failure_reports_index() {
+        let mut engine = future_engine(&[1, 2]);
+        engine.apply_upgrade(future_track(2));
+        assert_eq!(engine.current_index(), Some(1));
+        let (tx, rx) = mpsc::sync_channel(1);
+        engine.loader_rx = rx;
+        tx.try_send(LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "bad".into() }).unwrap();
+        engine.drain_loader();
+        let token = engine.begin_future_update().unwrap();
+        drop(engine.commit_future_update(token, future_replacement(vec![future_track(4)])));
+        // A failure already published before the fence remains identifiable
+        // as the old occurrence, even with the same path in the new source.
+        assert!(engine.poll_events().iter().any(|e| matches!(e, EngineEvent::TrackFailed { index: 3, .. })));
+    }
+
+    #[test]
+    fn future_queued_navigation_refuses_without_losing_the_command() {
+        let mut engine = future_engine(&[1, 2]);
+        engine.nav_sender().try_send(NavAction::JumpToNextIntro).unwrap();
+        assert_eq!(engine.begin_future_update().unwrap_err(), FutureUpdateBusy::Navigation);
+        assert_eq!(engine.current_index(), Some(1));
+        assert_eq!(engine.ready_ahead(), 1);
+        engine.render(&mut [0.0; 2]);
+        assert_eq!(engine.current_index(), Some(2));
+    }
+
+    #[test]
+    fn future_navigation_during_fence_is_retained_on_abort_and_discarded_on_commit() {
+        for commit in [false, true] {
+            let mut engine = future_engine(&[1, 2]);
+            let nav = engine.nav_sender();
+            let token = engine.begin_future_update().unwrap();
+            nav.try_send(NavAction::JumpToNextIntro).unwrap();
+            engine.request_nav(NavAction::JumpToNextIntro);
+            // Direct requests retain their action even with a full channel.
+            for _ in 0..NAV_QUEUE_CAP { nav.try_send(NavAction::JumpToNextIntro).unwrap(); }
+            engine.request_nav(NavAction::JumpToNextIntro);
+            engine.render(&mut [0.0; 2]);
+            assert_eq!(engine.current_index(), Some(1));
+            if commit {
+                drop(engine.commit_future_update(token, future_replacement(vec![future_track(3)])));
+                wait_future(&mut engine);
+                engine.render(&mut [0.0; 2]);
+                assert_eq!(engine.current_index(), Some(1));
+                nav.try_send(NavAction::JumpToNextIntro).unwrap();
+                engine.render(&mut [0.0; 2]);
+                assert_eq!(engine.current_index(), Some(3));
+            } else {
+                engine.abort_future_update(token);
+                engine.render(&mut [0.0; 2]);
+                assert_eq!(engine.current_index(), Some(2));
+            }
+        }
+    }
+
+    #[test]
+    fn future_parked_source_is_not_consumed_before_commit_and_nav_sender_survives() {
+        struct Empty(Arc<AtomicUsize>);
+        impl TrackSource for Empty {
+            fn next(&mut self) -> Option<(usize, PathBuf)> { self.0.fetch_add(1, Ordering::SeqCst); None }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let replacement = PreparedSourceReplacement::new(Box::new(Empty(calls.clone()))).unwrap();
+        let mut engine = future_engine(&[1, 2]);
+        let nav = engine.nav_sender();
+        let token = engine.begin_future_update().unwrap();
+        engine.render(&mut [0.0; 8]);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(engine.commit_future_update(token, replacement));
+        for _ in 0..200 {
+            engine.drain_loader();
+            if engine.loader_exhausted { break; }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(engine.loader_exhausted);
+        assert!(nav.try_send(NavAction::RestartCurrent).is_ok());
+    }
 
     fn phase_test_track(index: usize, intro_bars: u32, outro_at: u64) -> PreparedTrack {
         let frames = 512u64;
