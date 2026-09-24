@@ -716,7 +716,7 @@ fn print_event(
         EngineEvent::TransitionStarted { from, to } => {
             println!("~ transition: {} -> {}", file_name(from), file_name(to));
         }
-        EngineEvent::TrackFailed { path, message } => {
+        EngineEvent::TrackFailed { path, message, .. } => {
             warn!("track failed: {} ({message})", path.display());
             println!("x failed: {} ({message})", file_name(path));
         }
