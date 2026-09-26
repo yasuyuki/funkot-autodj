@@ -118,6 +118,9 @@ fn read_entry(path: &Path) -> std::result::Result<CacheLookup, ReadError> {
     if let Some(ref scores) = analysis.classify_scores {
         analysis.is_funkot = scores.verdict();
     }
+    if automatic_both_low_geometry_is_impossible(&analysis) {
+        analysis.needs_reanalysis = true;
+    }
     Ok(CacheLookup::Hit(analysis))
 }
 
@@ -416,6 +419,26 @@ fn track_bars_or_estimate(a: &TrackAnalysis) -> u32 {
         return a.track_bars;
     }
     (a.total_frames.saturating_sub(a.first_downbeat) / outro_bar_len(a)) as u32
+}
+
+/// Legacy v14 entries may contain the old automatic 64/80 fallback even when
+/// that pair cannot fit in the track. Preserve every manual or confident
+/// result; only route an impossible automatic both-low result through the
+/// existing reanalysis and persistence path.
+fn automatic_both_low_geometry_is_impossible(a: &TrackAnalysis) -> bool {
+    if a.intro_bars_manual || a.outro_bars_manual || a.outro_structure_bars_manual
+        || !a.intro_bars_low_confidence || !a.outro_bars_low_confidence {
+        return false;
+    }
+    let track_bars = if a.track_bars > 0 {
+        Some(a.track_bars)
+    } else if a.sample_rate > 0 && a.outro_bpm.is_finite() && a.outro_bpm > 0.0
+        && a.total_frames >= a.first_downbeat {
+        Some(track_bars_or_estimate(a))
+    } else {
+        None
+    };
+    track_bars.is_some_and(|bars| a.intro_bars.saturating_add(a.outro_bars) > bars)
 }
 
 /// Re-derive the mix trigger (and `outro_start`) from the structural boundary,
@@ -1084,6 +1107,68 @@ mod tests {
         fs::create_dir(&path).unwrap();
         assert!(load_checked(dir.path(), TEST_HASH).unwrap_err().to_string().contains("cannot read cache"));
         assert!(store(dir.path(), TEST_HASH, &sample_analysis()).is_err());
+    }
+
+    #[test]
+    fn v14_impossible_auto_both_low_cache_reanalyzes_and_persists_repaired_geometry() {
+        let dir = TempDir::new("v14-short-geometry");
+        let buffer = crate::testutil::synth_track_with_options(crate::testutil::SynthOptions {
+            bpm: 180.0, intro_bars: 16, main_bars: 58, outro_bars: 16,
+            sample_rate: 44_100, intro_outro_midhigh: true,
+            ..crate::testutil::SynthOptions::default()
+        });
+        for (label, stored_track_bars, stored_outro) in [("pixel", 90, 64), ("unknown-duration", 0, 80)] {
+            let source = dir.path().join(format!("{label}.wav"));
+            fs::write(&source, format!("synthetic source identity {label}")).unwrap();
+            let hash = content_hash(&source).unwrap();
+            let mut stale = sample_analysis();
+            stale.outro_bpm = 180.0;
+            stale.total_frames = 90 * outro_bar_len(&stale);
+            stale.track_bars = stored_track_bars;
+            stale.intro_bars = 64;
+            stale.outro_structure_bars = 64;
+            stale.outro_bars = stored_outro;
+            store(dir.path(), &hash, &stale).unwrap();
+            assert!(load(dir.path(), &hash).unwrap().needs_reanalysis, "{label}");
+
+            let repaired = get_or_analyze(&source, dir.path(), &buffer).unwrap();
+            assert_eq!((repaired.intro_bars, repaired.outro_structure_bars, repaired.outro_bars), (32, 32, 48), "{label}");
+            assert!(!repaired.needs_reanalysis);
+            assert!(repaired.intro_bars + repaired.outro_bars <= repaired.track_bars);
+            assert_eq!(load(dir.path(), &hash).unwrap(), repaired);
+        }
+    }
+
+    #[test]
+    fn protected_or_partly_confident_v14_entries_are_read_without_geometry_repair() {
+        let dir = TempDir::new("v14-protected-geometry");
+        for (number, label) in ["intro_manual", "outro_manual", "structure_manual",
+            "intro_confident", "outro_confident"].into_iter().enumerate() {
+            let mut protected = sample_analysis();
+            protected.track_bars = 90;
+            protected.intro_bars = 64;
+            protected.outro_structure_bars = 64;
+            protected.outro_bars = 80;
+            match label {
+                "intro_manual" => protected.intro_bars_manual = true,
+                "outro_manual" => protected.outro_bars_manual = true,
+                "structure_manual" => protected.outro_structure_bars_manual = true,
+                "intro_confident" => protected.intro_bars_low_confidence = false,
+                "outro_confident" => protected.outro_bars_low_confidence = false,
+                _ => unreachable!(),
+            }
+            protected.bars_estimated_low_confidence =
+                protected.intro_bars_low_confidence || protected.outro_bars_low_confidence;
+            let hash = format!("{number:064x}");
+            let path = cache_path(dir.path(), &hash).unwrap();
+            let bytes = serde_json::to_vec_pretty(&protected).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let loaded = load_checked(dir.path(), &hash).unwrap();
+            let CacheLookup::Hit(loaded) = loaded else { panic!("{label} entry was not a hit"); };
+            assert_eq!(loaded, protected, "{label} semantics");
+            assert!(!loaded.needs_reanalysis, "{label} entry must remain complete");
+            assert_eq!(fs::read(path).unwrap(), bytes, "{label} bytes");
+        }
     }
 
     #[cfg(unix)]
