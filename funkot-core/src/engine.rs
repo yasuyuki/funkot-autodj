@@ -57,6 +57,22 @@ pub enum EngineEvent {
     Finished,
 }
 
+/// Most recent replacement of a playing head preview with its full buffer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PreviewUpgrade {
+    pub playlist_index: usize,
+    pub playhead: u64,
+    pub preview_frames: u64,
+}
+
+/// Cumulative per-engine diagnostics for first-track preview rendering.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderDiagnostics {
+    pub preview_wait_frames: u64,
+    pub preview_upgrades: u64,
+    pub last_preview_upgrade: Option<PreviewUpgrade>,
+}
+
 /// Offline-rendered track ready for the mix bus.
 ///
 /// Samples are interleaved stereo f32 at [`EngineOptions::output_sample_rate`],
@@ -1119,6 +1135,7 @@ pub struct Engine {
     /// ends before Upgrade (CPU-speed pulls / offline). Realtime hosts set
     /// this false via [`Self::set_realtime`] so the audio callback never sleeps.
     block_on_preview_upgrade: bool,
+    render_diagnostics: RenderDiagnostics,
     /// Background phase-align result: `(prev_start, next_entry, prev_nudge)`.
     phase_align_ready: Option<(u64, u64, u64)>,
     phase_align_rx: Option<Receiver<(u64, u64, u64)>>,
@@ -1218,6 +1235,7 @@ impl Engine {
             third_permit_armed: false,
             loader_exhausted: false,
             block_on_preview_upgrade: true,
+            render_diagnostics: RenderDiagnostics::default(),
             phase_align_ready: None,
             phase_align_rx: None,
             nav_tx,
@@ -1309,6 +1327,7 @@ impl Engine {
             third_permit_armed: false,
             loader_exhausted: rest_empty,
             block_on_preview_upgrade: true,
+            render_diagnostics: RenderDiagnostics::default(),
             phase_align_ready: None,
             phase_align_rx: None,
             nav_tx,
@@ -1431,6 +1450,11 @@ impl Engine {
         self.block_on_preview_upgrade = !realtime;
     }
 
+    /// Cumulative per-engine observations; reading it does not change PCM timing.
+    pub fn render_diagnostics(&self) -> RenderDiagnostics {
+        self.render_diagnostics
+    }
+
     /// Fill `out` (interleaved stereo at `options.output_sample_rate`).
     /// Returns frames written; 0 means playback finished.
     /// Outputs silence while the first track is being prepared. If a head
@@ -1500,6 +1524,12 @@ impl Engine {
                 break;
             }
 
+            if !self.block_on_preview_upgrade && self.preview_exhausted_awaiting_upgrade() {
+                self.render_diagnostics.preview_wait_frames = self
+                    .render_diagnostics
+                    .preview_wait_frames
+                    .saturating_add(1);
+            }
             let (l, r) = self.render_one_frame();
             out[frames_done * 2] = l;
             out[frames_done * 2 + 1] = r;
@@ -2215,8 +2245,22 @@ impl Engine {
                 // its already-retained preview to drop on this callback.
                 retire_upgrade_fade(deck.upgrade_fade.take());
                 let old_playhead = deck.playhead;
+                let preview_upgrade = deck.track.preview && !track.preview;
+                let preview_frames = deck.track.frames;
+                let playlist_index = deck.track.playlist_index;
                 let playhead = old_playhead.min(track.frames);
                 let old = std::mem::replace(&mut deck.track, track);
+                if preview_upgrade {
+                    self.render_diagnostics.preview_upgrades = self
+                        .render_diagnostics
+                        .preview_upgrades
+                        .saturating_add(1);
+                    self.render_diagnostics.last_preview_upgrade = Some(PreviewUpgrade {
+                        playlist_index,
+                        playhead: old_playhead,
+                        preview_frames,
+                    });
+                }
                 deck.playhead = playhead;
                 deck.upgrade_fade = Some(UpgradeFade { track: old, playhead: old_playhead,
                     frames_into: 0, frames: declick_frames(self.options.output_sample_rate) });
@@ -3980,6 +4024,63 @@ mod tests {
         assert_eq!((l, r), (expected, expected));
         assert!(!engine.prev.as_ref().unwrap().highpass_enabled);
         assert!(!engine.active.as_ref().unwrap().highpass_enabled);
+    }
+
+    #[test]
+    fn render_diagnostics_counts_realtime_preview_wait_frames_until_upgrade() {
+        let preview = upgrade_test_track("preview.wav", 2, 0.25, 1.0, true);
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview]).unwrap();
+        engine.set_realtime(true);
+        let (tx, rx) = mpsc::sync_channel(1);
+        engine.loader_rx = rx;
+        engine.loader_exhausted = false;
+
+        assert_eq!(engine.render(&mut [0.0; 4]), 2);
+        let mut waiting = [1.0; 6];
+        assert_eq!(engine.render(&mut waiting), 3);
+        assert_eq!(waiting, [0.0; 6]);
+        assert_eq!(engine.render_diagnostics().preview_wait_frames, 3);
+
+        tx.send(LoaderMsg::Upgrade(upgrade_test_track("preview.wav", 600, 0.5, 1.0, false))).unwrap();
+        let mut resumed = [0.0; 1024];
+        assert_eq!(engine.render(&mut resumed), 512);
+        assert_eq!(engine.render_diagnostics().preview_wait_frames, 3);
+        assert!(resumed.iter().any(|sample| *sample != 0.0));
+    }
+
+    #[test]
+    fn render_diagnostics_records_only_active_preview_to_full_upgrade() {
+        let mut preview = upgrade_test_track("same.wav", 8, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview]).unwrap();
+        engine.active.as_mut().unwrap().playhead = 3;
+
+        let mut full = upgrade_test_track("same.wav", 20, 0.5, 1.0, false);
+        full.playlist_index = 7;
+        engine.apply_upgrade(full.clone());
+        assert_eq!(engine.render_diagnostics(), RenderDiagnostics {
+            preview_wait_frames: 0,
+            preview_upgrades: 1,
+            last_preview_upgrade: Some(PreviewUpgrade {
+                playlist_index: 7,
+                playhead: 3,
+                preview_frames: 8,
+            }),
+        });
+
+        engine.apply_upgrade(full.clone());
+        let mut wrong_occurrence = full.clone();
+        wrong_occurrence.playlist_index = 8;
+        engine.apply_upgrade(wrong_occurrence);
+        assert_eq!(engine.render_diagnostics().preview_upgrades, 1);
+
+        let mut next_preview = upgrade_test_track("next.wav", 8, 0.25, 1.0, true);
+        next_preview.playlist_index = 9;
+        engine.next_track = Some(next_preview);
+        let mut next_full = upgrade_test_track("next.wav", 20, 0.5, 1.0, false);
+        next_full.playlist_index = 9;
+        engine.apply_upgrade(next_full);
+        assert_eq!(engine.render_diagnostics().preview_upgrades, 1);
     }
 
     #[test]
