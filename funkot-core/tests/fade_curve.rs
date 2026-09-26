@@ -70,6 +70,29 @@ fn constant_tone_track(
     }
 }
 
+/// Stereo constant tone fixture with an independently chosen frequency per
+/// channel.  This keeps the known low (196/247 Hz) and high (784/988 Hz)
+/// transition inputs distinct while avoiding marker kicks in the boundary probe.
+fn stereo_tone_track(
+    sr: u32,
+    bars: u32,
+    bpm: f64,
+    left_hz: f64,
+    right_hz: f64,
+    amp: f32,
+) -> funkot_core::decode::AudioBuffer {
+    use std::f64::consts::PI;
+    let beat_frames = (f64::from(sr) * 60.0 / bpm).round() as usize;
+    let frames = bars as usize * beat_frames * BEATS_PER_BAR as usize;
+    let mut samples = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        let t = i as f64 / f64::from(sr);
+        samples.push((f64::from(amp) * (2.0 * PI * left_hz * t).sin()) as f32);
+        samples.push((f64::from(amp) * (2.0 * PI * right_hz * t).sin()) as f32);
+    }
+    funkot_core::decode::AudioBuffer { sample_rate: sr, frames: frames as u64, samples }
+}
+
 /// Stereo fixture with tone (+ soft kicks) on exactly one channel.
 /// `left_only = true` → L has content, R is silence; otherwise the reverse.
 fn channel_tone_track(
@@ -540,4 +563,115 @@ fn prev_deck_hard_stop_no_residual_after_fade_out() {
 
     engine.stop();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+fn adjacent_delta(samples: &[f32], frame: usize) -> f32 {
+    let i = frame * 2;
+    (samples[i] - samples[i - 2]).abs().max((samples[i + 1] - samples[i - 1]).abs())
+}
+
+fn handoff_metrics(samples: &[f32], center: usize, span: usize) -> (f32, f32, f32, f32, f32, f32, bool) {
+    let window = 4096usize;
+    let ordinary_start = center.saturating_sub(span + window);
+    let ordinary_end = center.saturating_sub(span + 1);
+    let mut ordinary = Vec::with_capacity(ordinary_end.saturating_sub(ordinary_start));
+    let mut peak = 0.0f32;
+    let mut over = 0usize;
+    let mut finite = true;
+    for (i, &sample) in samples.iter().enumerate() {
+        if !sample.is_finite() { finite = false; }
+        let a = sample.abs();
+        peak = peak.max(a);
+        if a > 1.0 { over += 1; }
+        if i % 2 == 0 && i / 2 > ordinary_start && i / 2 <= ordinary_end {
+            ordinary.push(adjacent_delta(samples, i / 2));
+        }
+    }
+    ordinary.sort_by(|a, b| a.total_cmp(b));
+    let normal_max = *ordinary.last().expect("ordinary samples");
+    let p99 = ordinary[((ordinary.len() - 1) * 99) / 100];
+    let start = adjacent_delta(samples, center - span);
+    let central = adjacent_delta(samples, center);
+    let end = adjacent_delta(samples, center + 1);
+    let handoff_max = ((center - span + 1)..=center)
+        .map(|frame| adjacent_delta(samples, frame))
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "handoff span={span} start={start:.7} central={central:.7} end={end:.7} handoff_max={handoff_max:.7} normal_p99={p99:.7} normal_max={normal_max:.7} peak={peak:.7} over={over} finite={finite}",
+    );
+    (start, central, end, handoff_max, p99, normal_max, finite && over == 0)
+}
+
+/// The complex transition used the HPF on the opposite routes immediately on
+/// either side of `fade_in_end`.  A 10 ms complementary handoff must keep the
+/// central, start, and end adjacent deltas within ordinary waveform deltas for
+/// both bass-to-treble and treble-to-bass source orders.
+#[test]
+fn hpf_route_handoff_has_no_central_step_and_is_chunk_independent() {
+    let dir = temp_dir("hpf-handoff");
+    let cache = dir.join("cache");
+    let sr = 48_000u32;
+    let bpm = 198.0;
+    let intro = 32u32;
+    let outro = 48u32;
+    let total_bars = 90u32;
+    let main = total_bars - intro - outro;
+    let amp = 0.15f32; // two decks together remain below full scale.
+    let low = stereo_tone_track(sr, total_bars, bpm, 196.0, 247.0, amp);
+    let high = stereo_tone_track(sr, total_bars, bpm, 784.0, 988.0, amp);
+    let low_path = dir.join("low-196.wav");
+    let high_path = dir.join("high-784.wav");
+    write_wav(&low_path, &low).expect("write low");
+    write_wav(&high_path, &high).expect("write high");
+    seed_constant_analysis(&low_path, &cache, &low, intro, main, outro, bpm);
+    seed_constant_analysis(&high_path, &cache, &high, intro, main, outro, bpm);
+
+    let options = EngineOptions {
+        rate: 1.10,
+        pitch_mode: PitchMode::Preserve,
+        fade_bars: 4,
+        highpass_hz: 300.0,
+        gain_normalize: false,
+        random: false,
+        loop_playlist: false,
+        output_sample_rate: sr,
+        cache_dir: cache,
+        head_only_secs: None,
+    };
+    let prepared = prepare_tracks_parallel(&options, &[low_path, high_path], 1).expect("prepare once");
+    let handoff_span = (0.010 * f64::from(sr)).round() as usize;
+    assert!(handoff_span >= 2);
+
+    let mut violations = Vec::new();
+    for (name, tracks) in [
+        ("low-to-high", vec![prepared[0].clone(), prepared[1].clone()]),
+        ("high-to-low", vec![prepared[1].clone(), prepared[0].clone()]),
+    ] {
+        let mut one = Engine::from_prepared(options.clone(), tracks.clone()).expect("1-frame engine");
+        let (one_raw, one_t) = render_with_transition_mark(&mut one, 1);
+        let mut block = Engine::from_prepared(options.clone(), tracks).expect("block engine");
+        let (block_raw, block_t) = render_with_transition_mark(&mut block, 4096);
+        assert_eq!(one_t, block_t, "{name}: transition frame");
+        assert_eq!(one_raw, block_raw, "{name}: render must be chunk independent");
+
+        let center = one_t + (4.0 * options.bar_frames()).round() as usize;
+        assert!(center > handoff_span && center + 2 < one_raw.len() / 2, "{name}: boundary in output");
+        let (start, central, end, handoff_max, p99, normal_max, healthy) =
+            handoff_metrics(&one_raw, center, handoff_span);
+        // The ordinary window is directly before the handoff and has the same
+        // routes/gains.  The blend can add at most 2*amp/(span-1) per deck:
+        // one weight increment times the maximum raw-vs-HPF gap (2*amp).
+        let blend_slope_allowance = 4.0 * amp / (handoff_span - 1) as f32;
+        let bound = normal_max + blend_slope_allowance;
+        if !healthy { violations.push(format!("{name}: non-finite or clipping output")); }
+        if central > bound { violations.push(format!("{name}: central delta={central} exceeds ordinary max={normal_max}, p99={p99}")); }
+        if start > bound { violations.push(format!("{name}: handoff-start delta={start} exceeds bound={bound}")); }
+        if end > bound { violations.push(format!("{name}: handoff-end delta={end} exceeds bound={bound}")); }
+        if handoff_max > bound { violations.push(format!("{name}: handoff max delta={handoff_max} exceeds ordinary max={normal_max}")); }
+        one.stop();
+        block.stop();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(violations.is_empty(), "{}", violations.join("; "));
 }

@@ -197,7 +197,7 @@ const PHASE_ALIGN_HAT_WEIGHT: f64 = 0.40;
 const PHASE_ALIGN_FINE_BEATS: f64 = 0.5;
 /// Ignore the adjustment when the best normalized correlation is below this.
 const PHASE_ALIGN_MIN_CORR: f64 = 0.45;
-/// Shared preview/upgrade de-click duration.
+/// Shared preview/upgrade/transition-route de-click duration.
 const HEAD_DECLICK_SECS: f64 = 0.010;
 /// Bars before file end used as the sparse outro-tail phase anchor.
 const OUTRO_TAIL_ANCHOR_BARS: u32 = 4;
@@ -685,6 +685,8 @@ struct UpgradeFade {
 struct ActiveTransition {
     frames_into: u64,
     fade_in_end: u64,
+    /// Start of the cached 10 ms raw/HPF handoff before `fade_in_end`.
+    handoff_start: u64,
     fade_out_start: u64,
     fade_out_end: u64,
     /// Simultaneous linear crossfade without HPF / phase-align (local BPM out of range).
@@ -2027,6 +2029,7 @@ impl Engine {
 
         let (fade_in_end, fade_out_start, fade_out_end) =
             (plan.fade_in_end, plan.fade_out_start, plan.fade_out_end);
+        let handoff_start = hpf_handoff_start(fade_in_end, self.options.output_sample_rate);
 
         self.pending_events.push(EngineEvent::TransitionStarted {
             from: from_path,
@@ -2044,6 +2047,7 @@ impl Engine {
         self.transition = Some(ActiveTransition {
             frames_into: 0,
             fade_in_end,
+            handoff_start,
             fade_out_start,
             fade_out_end,
             simple: plan.simple,
@@ -2491,9 +2495,11 @@ impl Engine {
 
         self.prev = Some(prev_deck);
         self.active = Some(next_deck);
+        let handoff_start = hpf_handoff_start(fade_in_end, self.options.output_sample_rate);
         self.transition = Some(ActiveTransition {
             frames_into: 0,
             fade_in_end,
+            handoff_start,
             fade_out_start,
             fade_out_end,
             simple: false,
@@ -2516,22 +2522,32 @@ impl Engine {
             }
         }
 
-        let (in_trans, frames_into, fade_in_end, fade_out_start, fade_out_end, simple) =
+        let (in_trans, frames_into, fade_in_end, handoff_start, fade_out_start, fade_out_end, simple) =
             if let Some(t) = self.transition.as_ref() {
                 (
                     true,
                     t.frames_into,
                     t.fade_in_end,
+                    t.handoff_start,
                     t.fade_out_start,
                     t.fade_out_end,
                     t.simple,
                 )
             } else {
-                (false, 0, 0, 0, 0, false)
+                (false, 0, 0, 0, 0, 0, false)
             };
 
         let mut mix_l = 0.0f32;
         let mut mix_r = 0.0f32;
+        // Move each deck onto its post-fade-in route over the existing shared
+        // de-click span.  The last handoff frame is already fully on that
+        // route, so the original `fade_in_end` boundary has no route step.
+        let handoff_weight = if in_trans && !simple
+            && frames_into >= handoff_start && frames_into < fade_in_end {
+            Some(fade_in_gain(frames_into - handoff_start, fade_in_end - handoff_start))
+        } else {
+            None
+        };
 
         if let Some(deck) = self.prev.as_mut() {
             // Prev is only reachable while in_trans && frames_into < fade_out_end.
@@ -2555,7 +2571,10 @@ impl Engine {
                 let mut fr = r;
                 deck.filter.process_frame(&mut fl, &mut fr);
                 if gain_env > 0.0 {
-                    if deck.highpass_enabled {
+                    if let Some(w) = handoff_weight {
+                        l = l * (1.0 - w) + fl * w;
+                        r = r * (1.0 - w) + fr * w;
+                    } else if deck.highpass_enabled {
                         l = fl;
                         r = fr;
                     }
@@ -2579,6 +2598,8 @@ impl Engine {
 
             if deck.playhead < deck.track.frames || deck.upgrade_fade.is_some() {
                 let (mut l, mut r) = read_deck_frame(deck);
+                let raw_l = l;
+                let raw_r = r;
                 // Active HPF is on from transition start (incl. silent first
                 // fade-in frame), so drive it whenever enabled.
                 if deck.highpass_enabled {
@@ -2586,6 +2607,10 @@ impl Engine {
                 }
                 // First fade-in frame is bit-exact 0: do not touch the mix bus.
                 if gain_env > 0.0 {
+                    if let Some(w) = handoff_weight {
+                        l = l * (1.0 - w) + raw_l * w;
+                        r = r * (1.0 - w) + raw_r * w;
+                    }
                     let g = gain_env * deck.track.gain_linear;
                     mix_l += l * g;
                     mix_r += r * g;
@@ -3176,6 +3201,12 @@ fn declick_frames(sample_rate: u32) -> u64 {
     (HEAD_DECLICK_SECS * f64::from(sample_rate)).round().max(2.0) as u64
 }
 
+/// Start the shared 10 ms raw/HPF handoff before the existing fade-in end.
+#[inline]
+fn hpf_handoff_start(fade_in_end: u64, sample_rate: u32) -> u64 {
+    fade_in_end.saturating_sub(declick_frames(sample_rate).min(fade_in_end))
+}
+
 /// Prepare every playlist path, optionally in parallel.
 ///
 /// `jobs == 0` uses the host CPU count. Does not change decode/analysis/stretch
@@ -3736,6 +3767,53 @@ mod tests {
             outro_end_anchored_out: frames as u64, intro_bars: 0, outro_bars: 0,
             gain_linear: gain, preview, head_only: false,
         }
+    }
+
+    #[test]
+    fn hpf_handoff_weights_are_complementary_and_clamp_to_short_fade() {
+        let end = 10_000u64;
+        let span = declick_frames(48_000);
+        let start = hpf_handoff_start(end, 48_000);
+        assert_eq!(start, end - span);
+        assert_eq!(fade_in_gain(0, end - start), 0.0);
+        assert_eq!(fade_in_gain(end - 1 - start, end - start), 1.0);
+        for frame in [start, start + span / 2, end - 1] {
+            let w = fade_in_gain(frame - start, end - start);
+            assert_eq!(w + (1.0 - w), 1.0, "frame={frame}");
+        }
+
+        // A fade shorter than the normal 10 ms span uses every available
+        // frame and retains bit-exact 0/1 endpoints.
+        let short_start = hpf_handoff_start(2, 48_000);
+        assert_eq!(short_start, 0);
+        assert_eq!(fade_in_gain(0, 2), 0.0);
+        assert_eq!(fade_in_gain(1, 2), 1.0);
+    }
+
+    #[test]
+    fn simple_transition_keeps_raw_mix_bit_exact() {
+        let sr = 48_000;
+        let mut engine = phase_test_engine(false, 8, sr);
+        let prev = upgrade_test_track("simple-prev.wav", 32, 0.25, 1.0, false);
+        let active = upgrade_test_track("simple-active.wav", 32, -0.5, 1.0, false);
+        engine.prev = Some(Deck {
+            track: prev, playhead: 0, highpass_enabled: true,
+            filter: StereoHighPass::new(sr, 300.0), upgrade_fade: None,
+        });
+        engine.active = Some(Deck {
+            track: active, playhead: 0, highpass_enabled: true,
+            filter: StereoHighPass::new(sr, 300.0), upgrade_fade: None,
+        });
+        engine.transition = Some(ActiveTransition {
+            frames_into: 3, fade_in_end: 8, handoff_start: 0,
+            fade_out_start: 8, fade_out_end: 16, simple: true,
+        });
+
+        let (l, r) = engine.render_one_frame();
+        let expected = 0.25 + -0.5 * fade_in_gain(3, 8);
+        assert_eq!((l, r), (expected, expected));
+        assert!(!engine.prev.as_ref().unwrap().highpass_enabled);
+        assert!(!engine.active.as_ref().unwrap().highpass_enabled);
     }
 
     #[test]
