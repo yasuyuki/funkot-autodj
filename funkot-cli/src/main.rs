@@ -3553,10 +3553,14 @@ fn run_survey(
 
 fn gen_test_fixtures(dir: &Path) -> Result<()> {
     use funkot_core::analysis::analyze;
+    use funkot_core::owned_wav::Checkout;
     use funkot_core::testutil::{synth_track, synth_track_with_options, write_wav, SynthOptions};
     use serde_json::json;
+    use std::time::SystemTime;
 
     std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let checkout = Checkout::this();
+    let owned = checkout.open(SystemTime::now());
     let sr = 44_100u32;
 
     // Short sections: enough for 8/16 detection, small enough for optional on-disk WAV.
@@ -3635,7 +3639,9 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
     for (name, opt, expect) in specs {
         let path = dir.join(name);
         let buf = synth_track_with_options(opt.clone());
-        write_wav(&path, &buf).with_context(|| format!("write {}", path.display()))?;
+        owned
+            .write_owned(dir, name, SystemTime::now(), |p| write_wav(p, &buf))
+            .with_context(|| format!("write {}", path.display()))?;
         let a = analyze(&buf, name).map_err(|e| anyhow::anyhow!("analyze {name}: {e}"))?;
         println!(
             "wrote {} ({} bytes, fd={} bars={}/{} bpm={:.3})",
@@ -3661,7 +3667,11 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
     }
 
     let demo = dir.join("synth_classic_short.wav");
-    write_wav(&demo, &synth_track(180.0, 8, 8, 8, sr))?;
+    owned
+        .write_owned(dir, "synth_classic_short.wav", SystemTime::now(), |p| {
+            write_wav(p, &synth_track(180.0, 8, 8, 8, sr))
+        })
+        .with_context(|| format!("write {}", demo.display()))?;
     println!("wrote {}", demo.display());
 
     let golden_path = dir.join("golden.json");

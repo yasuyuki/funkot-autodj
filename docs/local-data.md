@@ -8,9 +8,9 @@
 
 | クラス | 対象 | 扱い |
 |---|---|---|
-| A 再生成可能 | `target*/`、`dist/`、`funkot-core/tests/fixtures/*.wav` | 消してよい。下のコマンドで戻る |
+| A 再生成可能 | `target*/`、`dist/`、`funkot-core/tests/fixtures/*.wav` | 消してよい。下のコマンドで戻る。ツール所有の合成 WAV は 8 日（`RECLAIM_AFTER`）で回収され、`.owned` sidecar を消すとその WAV は残る |
 | B 外部から再取得 | 原盤（実音源） | **リポジトリに置かない。** `FUNKOT_TESTDATA_DIR` で音楽ライブラリを指す |
-| C 高コストな派生 | `testdata/phase_ab/`、`testdata/click_*/`、`testdata/opus_s1/`、`testdata/synth/`、`whitelabel2022fall-b_transitions/` | 消してよい。再生成には原盤が要る |
+| C 高コストな派生 | `testdata/phase_ab/`、`testdata/click_*/`、`testdata/opus_s1/`、`testdata/synth/`、`whitelabel2022fall-b_transitions/` | 消してよい。`synth/` 以外の再生成には原盤が要る。`synth/` は `gen_synth` だけで戻る |
 | D 自動キャッシュ（manual 値は下記を参照） | `funkot-cache/`、`testdata/cache/`、`testdata/real-cache-v*/` | 消してよい。温め直す |
 | E **再生成不可** | `testdata/labels.tsv`、`testdata/survey.tsv`、`testdata/relabel_*.txt`、実耳評価の `*.md`、サーベイ生出力、`testdata/rekey_result.tsv`、`HANDOFF.md` | **公開リポジトリの外の private store が正。** 所在は `HANDOFF.md` |
 

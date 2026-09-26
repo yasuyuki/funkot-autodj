@@ -3,6 +3,9 @@
 //! Usage (inside the dev container):
 //!   cargo run -p funkot-core --example gen_synth --features testutil --release -- testdata/synth
 
+use std::time::SystemTime;
+
+use funkot_core::owned_wav::Checkout;
 use funkot_core::testutil::{synth_track, write_wav};
 
 fn main() {
@@ -15,6 +18,9 @@ fn main() {
         std::process::exit(1);
     }
 
+    let checkout = Checkout::this();
+    let owned = checkout.open(SystemTime::now());
+
     // (name, bpm, intro_bars, main_bars, outro_bars)
     let specs = [
         ("track_a_180_i16_o16.wav", 180.0, 16u32, 48u32, 16u32),
@@ -23,15 +29,14 @@ fn main() {
     ];
 
     for (name, bpm, intro, main, outro) in specs {
-        let path = dir.join(name);
         let buf = synth_track(bpm, intro, main, outro, 44_100);
-        match write_wav(&path, &buf) {
-            Ok(()) => println!(
-                "wrote {} ({bpm} BPM, intro {intro} / main {main} / outro {outro} bars)",
-                path.display()
+        match owned.write_owned(&dir, name, SystemTime::now(), |path| write_wav(path, &buf)) {
+            Ok(((), claimed)) => println!(
+                "wrote {} ({bpm} BPM, intro {intro} / main {main} / outro {outro} bars) [{claimed}]",
+                dir.join(name).display()
             ),
             Err(e) => {
-                eprintln!("failed to write {}: {e}", path.display());
+                eprintln!("failed to write {}: {e}", dir.join(name).display());
                 std::process::exit(1);
             }
         }
