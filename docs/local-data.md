@@ -144,7 +144,9 @@ task 連携のない通常の CLI レンダーは既存ファイルへ従来ど�
 以前の所有世代の受入・利用終了を完了させる。
 原盤との重なり、symlink、checkout 内の別 mount・nested repository は所有対象外。
 hardlink、内容または inode の変化、実行中 writer は回収を拒否する。
-Linux 以外は安全な native owner が未実装のため、出力を保持して診断する。
+Linux 以外は安全な native owner が未実装のため、task 連携のない生成は従来どおり
+実行して出力を保持する。owner 連携を要求する managed task は生成前に拒否し、
+所有されていない出力を成功として返さない。
 
 通常の task lifecycle が owner receipt の登録先と callback を提供すると、receipt は
 checkout 外へ保存され、task の受入・最終利用終了時に owner callback が回収する。
