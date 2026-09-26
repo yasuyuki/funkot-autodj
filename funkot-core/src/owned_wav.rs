@@ -1,1329 +1,650 @@
-//! Claimed development WAVs: written by gen_synth / phase_ab / --gen-test-fixtures,
-//! reclaimed by those same tools once RECLAIM_AFTER has passed since the write.
-//!
-//! A WAV `x.wav` is claimed iff a sidecar `.x.wav.owned` sits next to it and describes the
-//! exact file (dev, ino, len, mtime_ns). Only `write_owned` creates sidecars, and only inside a
-//! resolved `Root`. Sweep acts on sidecars only. A WAV with no sidecar is unknown and is never
-//! touched. This covers every legacy WAV, every `--render` output, and anything a human placed
-//! there.
-//!
-//! To keep a claimed WAV: delete its `.owned` sidecar. Rerunning the generator renews the lease.
-
+//! Durable exact-generation WAV ownership. Rendering never implies acceptance.
+//! New output is claimed before any bytes; only acceptance plus last-use release
+//! can make it pending. Legacy, manual, held, modified and linked files survive.
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// How long a claimed WAV survives after it was written. The only retention knob.
-///
-/// 8 days. Weak, single-episode evidence (phase_ab, 2026-08): render 08-03, last recorded
-/// reuse 08-04, manual deletion 08-11. Observed reuse under a day. 8 d matches the human's
-/// own disposable judgment. Too short costs a regeneration, never data.
-pub const RECLAIM_AFTER: Duration = Duration::from_secs(8 * 24 * 60 * 60);
-
-/// The only directories that may hold claims, relative to the checkout root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Root {
-    Synth,
-    PhaseAb,
-    Fixtures,
-}
-
+pub enum Root { Synth, PhaseAb, Fixtures }
 impl Root {
-    pub const ALL: [Root; 3] = [Root::Synth, Root::PhaseAb, Root::Fixtures];
-
-    fn rel(self) -> &'static str {
-        match self {
-            Root::Synth => "testdata/synth",
-            Root::PhaseAb => "testdata/phase_ab",
-            Root::Fixtures => "funkot-core/tests/fixtures",
-        }
-    }
-
-    fn tag(self) -> &'static str {
-        match self {
-            Root::Synth => "synth",
-            Root::PhaseAb => "phase_ab",
-            Root::Fixtures => "fixtures",
-        }
-    }
-
-    fn from_tag(tag: &str) -> Option<Root> {
-        match tag {
-            "synth" => Some(Root::Synth),
-            "phase_ab" => Some(Root::PhaseAb),
-            "fixtures" => Some(Root::Fixtures),
-            _ => None,
-        }
-    }
+    pub const ALL: [Self; 3] = [Self::Synth, Self::PhaseAb, Self::Fixtures];
+    fn rel(self) -> &'static str { match self { Self::Synth => "testdata/synth", Self::PhaseAb => "testdata/phase_ab", Self::Fixtures => "funkot-core/tests/fixtures" } }
 }
-
-/// A checkout whose roots may be claimed and swept.
-pub struct Checkout {
-    base: Result<Base, Refusal>,
-}
-
-struct Base {
-    repo: PathBuf,
-    dev: u64,
-    masters: Option<PathBuf>,
-}
-
-/// Handle returned by [`Checkout::open`]: sweeps once, then allows [`Opened::write_owned`].
-pub struct Opened<'a> {
-    checkout: &'a Checkout,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Refusal {
-    #[allow(dead_code)] // constructed on non-unix targets
-    Unsupported,
-    Symlink(PathBuf),
-    OtherMount(PathBuf),
-    NestedRepo(PathBuf),
-    OverlapsMasters(PathBuf),
-    Io(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RootState {
-    Absent,
-    Refused(Refusal),
-}
-
-struct Resolved {
-    root: Root,
-    path: PathBuf,
-}
-
-/// Outcome of `write_owned`, displayed next to "wrote …".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Claimed {
-    Yes { root: Root },
-    No(NotClaimed),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NotClaimed {
-    OutsideRoots,
-    RootRefused(String),
-    NotRegularAfterWrite,
-}
-
+pub struct Checkout { repo: PathBuf }
+pub struct Opened<'a> { checkout: &'a Checkout }
+#[derive(Debug, Clone)]
+pub enum Claimed { Yes { generation: String, receipt: PathBuf }, No(String) }
 impl fmt::Display for Claimed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Claimed::Yes { root } => write!(f, "claimed ({})", root.tag()),
-            Claimed::No(NotClaimed::OutsideRoots) => write!(f, "unclaimed (outside roots)"),
-            Claimed::No(NotClaimed::RootRefused(r)) => write!(f, "unclaimed ({r})"),
-            Claimed::No(NotClaimed::NotRegularAfterWrite) => {
-                write!(f, "unclaimed (not a regular file)")
-            }
-        }
+        match self { Self::Yes { generation, receipt } => write!(f, "held generation={generation} receipt={}", receipt.display()), Self::No(why) => write!(f, "unclaimed ({why})") }
     }
 }
-
 impl Checkout {
-    /// The checkout this binary was built from (`CARGO_MANIFEST_DIR/..`).
-    pub fn this() -> Checkout {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        Checkout::at(&repo)
-    }
-
-    /// A checkout rooted at `repo`. For tests with a temp tree.
-    pub fn at(repo: &Path) -> Checkout {
-        Checkout::at_inner(repo, masters_from_env())
-    }
-
-    fn at_inner(repo: &Path, masters: Option<PathBuf>) -> Checkout {
-        #[cfg(not(unix))]
-        {
-            let _ = (repo, masters);
-            return Checkout {
-                base: Err(Refusal::Unsupported),
-            };
-        }
-        #[cfg(unix)]
-        {
-            match open_base(repo, masters) {
-                Ok(b) => Checkout { base: Ok(b) },
-                Err(r) => Checkout { base: Err(r) },
-            }
-        }
-    }
-
-    /// Sweep once (one stderr summary line), then return a handle for writes.
-    pub fn open(&self, now: SystemTime) -> Opened<'_> {
-        let report = sweep(self, now);
-        eprintln!("{report}");
+    pub fn this() -> Self { Self::at(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")) }
+    pub fn at(repo: &Path) -> Self { Self { repo: fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf()) } }
+    pub fn open(&self, _now: SystemTime) -> Opened<'_> {
+        for root in Root::ALL { retry_directory(&self.repo.join(root.rel()), &self.repo); }
+        if let Ok(Some(context)) = context() { retry_directory(&context.owner_receipt_dir, &self.repo); }
         Opened { checkout: self }
     }
-
-    fn resolve(&self, root: Root) -> Result<Resolved, RootState> {
-        let base = match &self.base {
-            Ok(b) => b,
-            Err(r) => return Err(RootState::Refused(r.clone())),
-        };
-        resolve_root(base, root)
-    }
-
-    /// Which root `dir` names, even when that root is currently refused.
-    fn root_of(&self, dir: &Path) -> Option<Root> {
-        let base = self.base.as_ref().ok()?;
-        for root in Root::ALL {
-            if dir_matches_root(base, root, dir) {
-                return Some(root);
-            }
-        }
-        None
-    }
 }
-
 impl Opened<'_> {
-    /// Write `dir/name` through `write` (temp+rename) and claim it when `dir` is a resolved root.
-    pub fn write_owned<T, E>(
-        &self,
-        dir: &Path,
-        name: &str,
-        now: SystemTime,
-        write: impl FnOnce(&Path) -> Result<T, E>,
-    ) -> Result<(T, Claimed), E>
-    where
-        E: From<io::Error>,
-    {
-        write_owned(self.checkout, dir, name, now, write)
-    }
+    pub fn write_owned<T, E>(&self, dir: &Path, name: &str, now: SystemTime, write: impl FnOnce(&Path) -> Result<T, E>) -> Result<(T, Claimed), E>
+    where E: From<io::Error> { write_owned(self.checkout, dir, name, now, write) }
 }
-
-/// Write `dir/name` through `write` and claim it when `dir` is a resolved root.
-///
-/// Order:
-///   1. remove `.name.owned` if present (disown)
-///   2. write via temp path, rename into place
-///   3. if `root_of(dir)` resolves: lstat the file, write sidecar via temp+rename
-pub fn write_owned<T, E>(
-    checkout: &Checkout,
-    dir: &Path,
-    name: &str,
-    now: SystemTime,
-    write: impl FnOnce(&Path) -> Result<T, E>,
-) -> Result<(T, Claimed), E>
-where
-    E: From<io::Error>,
-{
-    if name.contains('/') || name.contains('\\') || name.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "owned_wav: bad name").into());
+pub fn write_owned<T, E>(checkout: &Checkout, dir: &Path, name: &str, _now: SystemTime, write: impl FnOnce(&Path) -> Result<T, E>) -> Result<(T, Claimed), E>
+where E: From<io::Error> {
+    valid_name(name).map_err(E::from)?;
+    let mut owned = Generation::begin_at(&dir.join(name), &checkout.repo).map_err(E::from)?;
+    if owned.owned.is_none() {
+        return Err(invalid(&format!("owned generator refused protected output: {}", owned.reason)).into());
     }
-
-    let final_path = dir.join(name);
-    let side = dir.join(sidecar_name(name));
-    let _ = std::fs::remove_file(&side);
-
-    let tmp = dir.join(format!(".{name}.partial"));
-    let _ = std::fs::remove_file(&tmp);
-    let value = match write(&tmp) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-    };
-    std::fs::rename(&tmp, &final_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e
-    })?;
-
-    let claimed = claim_after_write(checkout, dir, name, &final_path, now);
-    Ok((value, claimed))
+    let value = write(owned.write_path())?;
+    Ok((value, owned.finish().map_err(E::from)?))
 }
-
-fn claim_after_write(
-    checkout: &Checkout,
-    dir: &Path,
-    name: &str,
-    final_path: &Path,
-    now: SystemTime,
-) -> Claimed {
-    let Some(root) = checkout.root_of(dir) else {
-        return Claimed::No(NotClaimed::OutsideRoots);
-    };
-    match checkout.resolve(root) {
-        Err(RootState::Absent) => Claimed::No(NotClaimed::OutsideRoots),
-        Err(RootState::Refused(r)) => Claimed::No(NotClaimed::RootRefused(refusal_tag(&r))),
-        Ok(resolved) => {
-            #[cfg(not(unix))]
-            {
-                let _ = (final_path, name, now, resolved);
-                return Claimed::No(NotClaimed::RootRefused(refusal_tag(&Refusal::Unsupported)));
-            }
-            #[cfg(unix)]
-            {
-                match observe_path(final_path) {
-                    None => Claimed::No(NotClaimed::NotRegularAfterWrite),
-                    Some(obs) if !obs.regular => Claimed::No(NotClaimed::NotRegularAfterWrite),
-                    Some(obs) => {
-                        let claim = Claim {
-                            root,
-                            file: name.to_string(),
-                            claimed: now,
-                            id: obs.id,
-                        };
-                        match write_sidecar(&resolved.path, &claim) {
-                            Ok(()) => Claimed::Yes { root },
-                            Err(e) => Claimed::No(NotClaimed::RootRefused(format!("io: {e}"))),
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn dir_matches_root(base: &Base, root: Root, dir: &Path) -> bool {
-    let expected = base.repo.join(root.rel());
-    if dir == expected {
-        return true;
-    }
-    match (canonical_existing(dir), canonical_existing(&expected)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
-fn refusal_tag(r: &Refusal) -> String {
-    match r {
-        Refusal::Unsupported => "unsupported".into(),
-        Refusal::Symlink(_) => "symlink".into(),
-        Refusal::OtherMount(_) => "other-mount".into(),
-        Refusal::NestedRepo(_) => "nested-repo".into(),
-        Refusal::OverlapsMasters(_) => "overlaps-masters".into(),
-        Refusal::Io(s) => format!("io: {s}"),
-    }
-}
-
-fn sweep(checkout: &Checkout, now: SystemTime) -> SweepReport {
-    let mut report = SweepReport::default();
-    for root in Root::ALL {
-        match checkout.resolve(root) {
-            Err(RootState::Absent) => report.roots.push((root, RootReport::Absent)),
-            Err(RootState::Refused(r)) => report.roots.push((root, RootReport::Refused(r))),
-            Ok(resolved) => {
-                let swept = sweep_resolved(&resolved, now);
-                report.roots.push((root, RootReport::Swept(swept)));
-            }
-        }
-    }
-    report
-}
-
-#[derive(Debug, Default)]
-struct SweepReport {
-    roots: Vec<(Root, RootReport)>,
-}
-
-#[derive(Debug)]
-enum RootReport {
-    Absent,
-    Refused(Refusal),
-    Swept(SweptRoot),
-}
-
-#[derive(Debug, Default)]
-struct SweptRoot {
-    reclaimed: Vec<(String, u64)>,
-    kept: Vec<(String, KeepReason)>,
-    orphan_claims_dropped: u32,
-    unknown_wavs: u32,
-    unknown_bytes: u64,
-    errors: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeepReason {
-    InWindow,
-    ClockBehind,
-    Mismatch,
-    NotRegular,
-    Hardlinked,
-    WrongRoot,
-}
-
-impl SweepReport {
-    #[cfg(test)]
-    fn reclaimed(&self) -> Vec<&str> {
-        let mut out = Vec::new();
-        for (_, rr) in &self.roots {
-            if let RootReport::Swept(s) = rr {
-                for (name, _) in &s.reclaimed {
-                    out.push(name.as_str());
-                }
-            }
-        }
-        out
-    }
-
-    /// True when nothing was reclaimed, dropped, or errored.
-    #[cfg(test)]
-    fn is_noop(&self) -> bool {
-        for (_, rr) in &self.roots {
-            if let RootReport::Swept(s) = rr {
-                if !s.reclaimed.is_empty()
-                    || s.orphan_claims_dropped > 0
-                    || !s.errors.is_empty()
-                    || s.kept.iter().any(|(_, k)| *k == KeepReason::Mismatch)
-                {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-}
-
-impl fmt::Display for SweepReport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut reclaimed_n = 0u64;
-        let mut reclaimed_bytes = 0u64;
-        let mut kept_in = 0u64;
-        let mut unknown_n = 0u64;
-        let mut unknown_bytes = 0u64;
-        let mut refused: Vec<String> = Vec::new();
-        for (root, rr) in &self.roots {
-            match rr {
-                RootReport::Refused(r) => {
-                    refused.push(format!("{}:{}", root.tag(), refusal_tag(r)));
-                }
-                RootReport::Absent => {}
-                RootReport::Swept(s) => {
-                    reclaimed_n += s.reclaimed.len() as u64;
-                    reclaimed_bytes += s.reclaimed.iter().map(|(_, b)| *b).sum::<u64>();
-                    kept_in += s
-                        .kept
-                        .iter()
-                        .filter(|(_, k)| *k == KeepReason::InWindow)
-                        .count() as u64;
-                    unknown_n += s.unknown_wavs as u64;
-                    unknown_bytes += s.unknown_bytes;
-                }
-            }
-        }
-        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
-        write!(
-            f,
-            "owned_wav: reclaimed {reclaimed_n} ({:.1} MB) older than 8d; kept {kept_in} in-window, {unknown_n} unknown ({:.1} MB)",
-            mb(reclaimed_bytes),
-            mb(unknown_bytes)
-        )?;
-        if !refused.is_empty() {
-            write!(f, "; refused: {}", refused.join(","))?;
-        }
-        Ok(())
-    }
-}
-
-fn sweep_resolved(resolved: &Resolved, now: SystemTime) -> SweptRoot {
-    let mut out = SweptRoot::default();
-    let entries = match std::fs::read_dir(&resolved.path) {
-        Ok(e) => e,
-        Err(e) => {
-            out.errors
-                .push((".".into(), format!("read_dir: {e}")));
-            return out;
-        }
-    };
-
-    let mut sidecars: Vec<PathBuf> = Vec::new();
-    let mut wavs: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.file_type().is_file() && !meta.file_type().is_symlink() {
-            // Still consider regular-file metadata via symlink_metadata for type.
-        }
-        if name.starts_with('.') && name.ends_with(".owned") {
-            if meta.file_type().is_file() {
-                sidecars.push(path);
-            }
-            continue;
-        }
-        if name.ends_with(".wav") && !name.starts_with('.') && meta.file_type().is_file() {
-            wavs.push(path);
-        }
-    }
-
-    let mut claimed_wavs = std::collections::HashSet::new();
-    for side in sidecars {
-        let side_name = side
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        let body = match std::fs::read_to_string(&side) {
-            Ok(b) => b,
-            Err(e) => {
-                out.errors.push((side_name, e.to_string()));
-                continue;
-            }
-        };
-        let Some(claim) = parse_claim(&side_name, &body) else {
-            // Garbage sidecar: not a claim. Leave it; count WAV as unknown below.
-            continue;
-        };
-        claimed_wavs.insert(claim.file.clone());
-        let wav_path = resolved.path.join(&claim.file);
-        let observed = observe_path(&wav_path);
-        let verdict = decide(&claim, resolved.root, observed, now);
-        match verdict {
-            Verdict::Reclaim => {
-                let bytes = observed.map(|o| o.id.len).unwrap_or(0);
-                match apply_reclaim(&wav_path, &side, &claim) {
-                    Ok(true) => out.reclaimed.push((claim.file, bytes)),
-                    Ok(false) => out.kept.push((claim.file, KeepReason::Mismatch)),
-                    Err(e) => out.errors.push((claim.file, e.to_string())),
-                }
-            }
-            Verdict::DropOrphanClaim => {
-                let _ = std::fs::remove_file(&side);
-                out.orphan_claims_dropped += 1;
-            }
-            Verdict::Keep(KeepReason::Mismatch) => {
-                let _ = std::fs::remove_file(&side);
-                out.kept.push((claim.file, KeepReason::Mismatch));
-            }
-            Verdict::Keep(reason) => {
-                out.kept.push((claim.file, reason));
-            }
-        }
-    }
-
-    for wav in wavs {
-        let name = wav
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        if claimed_wavs.contains(&name) {
-            continue;
-        }
-        // Still claimed if a valid sidecar survived for it.
-        let side = wav
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(sidecar_name(&name));
-        if side.is_file() {
-            if let Ok(body) = std::fs::read_to_string(&side) {
-                if parse_claim(
-                    side.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-                    &body,
-                )
-                .is_some()
-                {
-                    continue;
-                }
-            }
-        }
-        let len = std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0);
-        out.unknown_wavs += 1;
-        out.unknown_bytes += len;
-    }
-
-    out
-}
-
-/// Tombstone rename, restat, unlink only on identity match, else rename back. Then drop sidecar.
-fn apply_reclaim(wav_path: &Path, side: &Path, claim: &Claim) -> io::Result<bool> {
-    #[cfg(not(unix))]
-    {
-        let _ = (wav_path, side, claim);
-        return Ok(false);
-    }
-    #[cfg(unix)]
-    {
-        if !wav_path.exists() {
-            let _ = std::fs::remove_file(side);
-            return Ok(true);
-        }
-        let tomb = wav_path.with_file_name(format!(
-            ".{}.reclaiming",
-            wav_path.file_name().and_then(|n| n.to_str()).unwrap_or("wav")
-        ));
-        let _ = std::fs::remove_file(&tomb);
-        std::fs::rename(wav_path, &tomb)?;
-        let deleted = match observe_path(&tomb) {
-            Some(obs) if obs.regular && obs.id == claim.id => match std::fs::remove_file(&tomb) {
-                Ok(()) => true,
-                Err(e) => {
-                    let _ = std::fs::rename(&tomb, wav_path);
-                    return Err(e);
-                }
-            },
-            _ => {
-                let _ = std::fs::rename(&tomb, wav_path);
-                false
-            }
-        };
-        if deleted {
-            let _ = std::fs::remove_file(side);
-        }
-        Ok(deleted)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Identity { dev: u64, ino: u64, len: u64, mtime: i64, mtime_ns: i64 }
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct Claim {
-    root: Root,
-    file: String,
-    claimed: SystemTime,
-    id: FileId,
+    version: u32, owner: String, generation: String, output: PathBuf, receipt: PathBuf,
+    directory_dev: u64, directory_ino: u64, state: String, hold: bool,
+    source_revision: String, inputs: Vec<String>, identity: Option<Identity>,
+    sha256: Option<String>, allocated_bytes: Option<u64>, accepted_proof: Option<String>,
+    released_proof: Option<String>, result: Option<String>,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileId {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mtime_ns: i128,
+#[derive(Deserialize)]
+struct Context {
+    owner_receipt_dir: PathBuf,
+    owner_receipt_argv: Vec<String>,
+    owner_completion_argv: Option<Vec<String>>,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Observed {
-    regular: bool,
-    nlink: u64,
-    id: FileId,
+fn context() -> io::Result<Option<Context>> {
+    let Some(value) = std::env::var_os("WORKSPACE_LIFECYCLE_CONTEXT") else { return Ok(None) };
+    let value: serde_json::Value = serde_json::from_str(&value.to_string_lossy()).map_err(|e| invalid(&format!("invalid lifecycle context: {e}")))?;
+    // Older context versions advertise no owner integration.
+    if value.get("owner_receipt_dir").is_none() { return Ok(None) }
+    serde_json::from_value(value).map(Some).map_err(|e| invalid(&format!("invalid owner context: {e}")))
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Verdict {
-    Reclaim,
-    DropOrphanClaim,
-    Keep(KeepReason),
-}
-
-fn decide(claim: &Claim, here: Root, observed: Option<Observed>, now: SystemTime) -> Verdict {
-    if claim.root != here {
-        return Verdict::Keep(KeepReason::WrongRoot);
+/// Holds the cooperative owner lock and the exact output inode for its lifetime.
+/// Abrupt termination leaves durable held/writing evidence, never an aged lease.
+pub struct Generation { write_path: PathBuf, owned: Option<Owned>, reason: String, _unclaimed_lock: Vec<File> }
+struct Owned { dir: Directory, receipts: Directory, _lock: File, file: File, side: String, claim: Claim }
+impl Generation {
+    pub fn begin(output: &Path) -> io::Result<Self> { Self::begin_at(output, &Checkout::this().repo) }
+    fn unclaimed(path: &Path, reason: String) -> Self { Self { write_path: path.into(), owned: None, reason, _unclaimed_lock: Vec::new() } }
+    fn begin_at(output: &Path, repo: &Path) -> io::Result<Self> {
+        Self::begin_with_context(output, repo, context()?)
     }
-    let Some(obs) = observed else {
-        return Verdict::DropOrphanClaim;
-    };
-    if !obs.regular {
-        return Verdict::Keep(KeepReason::NotRegular);
-    }
-    if obs.id != claim.id {
-        return Verdict::Keep(KeepReason::Mismatch);
-    }
-    if obs.nlink > 1 {
-        return Verdict::Keep(KeepReason::Hardlinked);
-    }
-    if now < claim.claimed {
-        return Verdict::Keep(KeepReason::ClockBehind);
-    }
-    match now.duration_since(claim.claimed) {
-        Ok(age) if age <= RECLAIM_AFTER => Verdict::Keep(KeepReason::InWindow),
-        Ok(_) => Verdict::Reclaim,
-        Err(_) => Verdict::Keep(KeepReason::ClockBehind),
-    }
-}
-
-fn sidecar_name(wav: &str) -> String {
-    format!(".{wav}.owned")
-}
-
-fn wav_name_from_sidecar(sidecar_name: &str) -> Option<&str> {
-    let s = sidecar_name.strip_prefix('.')?;
-    s.strip_suffix(".owned")
-}
-
-fn parse_claim(sidecar_fname: &str, body: &str) -> Option<Claim> {
-    let file_from_name = wav_name_from_sidecar(sidecar_fname)?;
-    let line = body.trim();
-    let rest = line.strip_prefix("funkot-owned-wav v1 ")?;
-    let mut root = None;
-    let mut file = None;
-    let mut claimed = None;
-    let mut dev = None;
-    let mut ino = None;
-    let mut len = None;
-    let mut mtime_ns = None;
-    for part in rest.split_whitespace() {
-        let (k, v) = part.split_once('=')?;
-        match k {
-            "root" => root = Root::from_tag(v),
-            "file" => {
-                if v.contains('/') || v.contains('\\') {
-                    return None;
-                }
-                file = Some(v.to_string());
-            }
-            "claimed" => {
-                let secs: u64 = v.parse().ok()?;
-                claimed = Some(UNIX_EPOCH + Duration::from_secs(secs));
-            }
-            "dev" => dev = v.parse().ok(),
-            "ino" => ino = v.parse().ok(),
-            "len" => len = v.parse().ok(),
-            "mtime_ns" => mtime_ns = v.parse().ok(),
-            _ => return None,
-        }
-    }
-    let file = file?;
-    if file != file_from_name {
-        return None;
-    }
-    Some(Claim {
-        root: root?,
-        file,
-        claimed: claimed?,
-        id: FileId {
-            dev: dev?,
-            ino: ino?,
-            len: len?,
-            mtime_ns: mtime_ns?,
-        },
-    })
-}
-
-fn render_claim(claim: &Claim) -> String {
-    let claimed = claim
-        .claimed
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!(
-        "funkot-owned-wav v1 root={} file={} claimed={} dev={} ino={} len={} mtime_ns={}\n",
-        claim.root.tag(),
-        claim.file,
-        claimed,
-        claim.id.dev,
-        claim.id.ino,
-        claim.id.len,
-        claim.id.mtime_ns
-    )
-}
-
-fn write_sidecar(dir: &Path, claim: &Claim) -> io::Result<()> {
-    let final_side = dir.join(sidecar_name(&claim.file));
-    let tmp = dir.join(format!(".{}.owned.partial", claim.file));
-    let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&tmp, render_claim(claim))?;
-    std::fs::rename(&tmp, &final_side).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e
-    })
-}
-
-fn masters_from_env() -> Option<PathBuf> {
-    let dir = std::env::var_os("FUNKOT_TESTDATA_DIR")?;
-    if dir.is_empty() {
-        return None;
-    }
-    let p = PathBuf::from(dir);
-    canonical_existing(&p).ok()
-}
-
-#[cfg(unix)]
-fn open_base(repo: &Path, masters: Option<PathBuf>) -> Result<Base, Refusal> {
-    let meta = std::fs::symlink_metadata(repo).map_err(|e| Refusal::Io(e.to_string()))?;
-    if meta.file_type().is_symlink() {
-        return Err(Refusal::Symlink(repo.to_path_buf()));
-    }
-    if !meta.is_dir() {
-        return Err(Refusal::Io(format!("{} is not a directory", repo.display())));
-    }
-    use std::os::unix::fs::MetadataExt;
-    let repo_canon = canonical_existing(repo).map_err(|e| Refusal::Io(e.to_string()))?;
-    Ok(Base {
-        repo: repo_canon,
-        dev: meta.dev(),
-        masters,
-    })
-}
-
-fn resolve_root(base: &Base, root: Root) -> Result<Resolved, RootState> {
-    #[cfg(not(unix))]
-    {
-        let _ = (base, root);
-        return Err(RootState::Refused(Refusal::Unsupported));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mut cur = base.repo.clone();
-        let rel = Path::new(root.rel());
-        let comps: Vec<Component> = rel.components().collect();
-        for (i, comp) in comps.iter().enumerate() {
-            match comp {
-                Component::Normal(s) => cur.push(s),
-                _ => {
-                    return Err(RootState::Refused(Refusal::Io(format!(
-                        "bad root path {}",
-                        root.rel()
-                    ))));
-                }
-            }
-            let meta = match std::fs::symlink_metadata(&cur) {
-                Ok(m) => m,
-                Err(e) if e.kind() == io::ErrorKind::NotFound && i + 1 == comps.len() => {
-                    return Err(RootState::Absent);
-                }
-                Err(e) => {
-                    return Err(RootState::Refused(Refusal::Io(e.to_string())));
-                }
+    fn begin_with_context(output: &Path, repo: &Path, context: Option<Context>) -> io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (repo, context); return Ok(Self::unclaimed(output, "native safe ownership unavailable; retained".into())); }
+        #[cfg(target_os = "linux")]
+        {
+            // Nested stream writer within write_owned already has an owned inode.
+            if output.starts_with("/proc/self/fd") { return Ok(Self::unclaimed(output, "parent generation".into())); }
+            let absolute = absolute(output)?;
+            let name = file_name(&absolute)?.to_owned();
+            let dir = match Directory::open(absolute.parent().unwrap(), repo) {
+                Ok(dir) => dir,
+                Err(e) if context.is_some() => return Err(e),
+                Err(e) => return Ok(Self::unclaimed(output, format!("protected directory: {e}"))),
             };
-            if meta.file_type().is_symlink() {
-                return Err(RootState::Refused(Refusal::Symlink(cur)));
-            }
-            if i + 1 == comps.len() {
-                if !meta.is_dir() {
-                    return Err(RootState::Refused(Refusal::Io(format!(
-                        "{} is not a directory",
-                        cur.display()
-                    ))));
+            let receipt_dir = context.as_ref().map(|c| c.owner_receipt_dir.as_path()).unwrap_or(&dir.path);
+            let receipts = Directory::open(receipt_dir, repo)?;
+            retry_open_directory(&receipts, repo);
+            let lock = receipts.lock(&absolute)?;
+            // Never adopt pre-existing outputs or old/unknown receipts.
+            if dir.exists(&name)? || dir.exists(&format!(".{name}.owned"))? {
+                if context.is_some() { return Err(invalid("managed output or receipt already exists; retained")); }
+                let mut result = Self::unclaimed(output, "pre-existing output or receipt".into());
+                result._unclaimed_lock.push(lock);
+                // Also coordinate across different task receipt directories.
+                if let Ok(existing) = dir.read_regular(&name) {
+                    existing.try_lock().map_err(|e| io::Error::other(format!("output busy: {e}")))?;
+                    result._unclaimed_lock.push(existing);
                 }
-                if meta.dev() != base.dev {
-                    return Err(RootState::Refused(Refusal::OtherMount(cur)));
-                }
-                let git = cur.join(".git");
-                if std::fs::symlink_metadata(&git).is_ok() {
-                    return Err(RootState::Refused(Refusal::NestedRepo(cur)));
-                }
-                if let Some(masters) = &base.masters {
-                    if overlaps(&cur, masters) {
-                        return Err(RootState::Refused(Refusal::OverlapsMasters(cur)));
-                    }
-                }
-                let path = canonical_existing(&cur).map_err(|e| RootState::Refused(Refusal::Io(e.to_string())))?;
-                return Ok(Resolved { root, path });
+                return Ok(result);
             }
-            if !meta.is_dir() {
-                return Err(RootState::Refused(Refusal::Io(format!(
-                    "{} is not a directory",
-                    cur.display()
-                ))));
-            }
-            if meta.dev() != base.dev {
-                return Err(RootState::Refused(Refusal::OtherMount(cur)));
-            }
+            let generation = generation_id();
+            let side = if context.is_some() { format!(".{generation}.owned") } else { format!(".{name}.owned") };
+            let mut claim = Claim {
+                version: 3, owner: "funkot-wav".into(), generation, output: absolute,
+                receipt: receipts.path.join(&side), directory_dev: dir.dev, directory_ino: dir.ino,
+                state: "writing".into(), hold: false, source_revision: source_revision(repo)?,
+                inputs: std::env::args().collect(), identity: None, sha256: None, allocated_bytes: None,
+                accepted_proof: None, released_proof: None, result: None,
+            };
+            receipts.persist(&side, &claim, true)?;
+            if let Some(context) = context { register_task_receipt(&context, &claim)?; }
+            // Exclusive creation cannot adopt a file raced in after registration.
+            let file = nofollow().write(true).read(true).create_new(true).open(dir.child(&name))?;
+            file.try_lock().map_err(|e| io::Error::other(format!("output busy: {e}")))?;
+            file.sync_all()?; dir.sync()?;
+            claim.identity = Some(identity(&file.metadata()?));
+            receipts.persist(&side, &claim, false)?;
+            use std::os::fd::AsRawFd;
+            let write_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            Ok(Self { write_path, owned: Some(Owned { dir, receipts, _lock: lock, file, side, claim }), reason: String::new(), _unclaimed_lock: Vec::new() })
         }
-        Err(RootState::Absent)
+    }
+    pub fn write_path(&self) -> &Path { &self.write_path }
+    pub fn finish(&mut self) -> io::Result<Claimed> {
+        let Some(o) = self.owned.as_mut() else {
+            let result = Claimed::No(self.reason.clone());
+            if self.reason != "parent generation" { eprintln!("owned_wav: {result}"); }
+            return Ok(result);
+        };
+        if o.claim.state != "writing" { return Err(invalid("generation already finalized; evidence is immutable")); }
+        o.file.sync_all()?; o.dir.revalidate()?;
+        let meta = o.file.metadata()?;
+        if !single_regular(&meta) || !same_inode(&meta, o.claim.identity.as_ref().unwrap()) { return Err(invalid("output identity changed during write")); }
+        let file = o.dir.read_regular(file_name(&o.claim.output)?)?;
+        if identity(&file.metadata()?) != identity(&meta) { return Err(invalid("output replaced during write")); }
+        let hash = hash_file(&file)?;
+        if identity(&file.metadata()?) != identity(&meta) { return Err(invalid("output changed while hashing")); }
+        o.claim.identity = Some(identity(&meta)); o.claim.sha256 = Some(hash);
+        o.claim.allocated_bytes = Some(allocated(&meta)); o.claim.state = "held".into();
+        o.claim.result = Some("generated; awaiting acceptance and last-use release".into());
+        o.receipts.persist(&o.side, &o.claim, false)?;
+        let result = Claimed::Yes { generation: o.claim.generation.clone(), receipt: o.claim.receipt.clone() };
+        eprintln!("owned_wav: {result}");
+        Ok(result)
     }
 }
-
-fn overlaps(a: &Path, b: &Path) -> bool {
-    a == b || a.starts_with(b) || b.starts_with(a)
+/// Proofs become durable before deletion. Repeating completion is idempotent.
+pub fn complete(output: &Path, generation: &str, receipt: Option<&Path>, accepted: &str, released: &str) -> io::Result<PathBuf> {
+    if accepted.trim().is_empty() || released.trim().is_empty() { return Err(invalid("acceptance and last-use release proofs are required")); }
+    let output = absolute(output)?;
+    let local_receipt = output.with_file_name(format!(".{}.owned", file_name(&output)?));
+    let receipt = absolute(receipt.unwrap_or(&local_receipt))?;
+    let repo = Checkout::this().repo;
+    let receipts = Directory::open(receipt.parent().unwrap(), &repo)?;
+    let _lock = receipts.lock(&output)?;
+    let side = file_name(&receipt)?;
+    let mut claim = receipts.read_claim(side)?;
+    if claim.version != 3 || claim.owner != "funkot-wav" || claim.output != output || claim.receipt != receipt || claim.generation != generation { return Err(invalid("generation does not match receipt")); }
+    if (claim.state == "pending" || claim.state == "reclaimed")
+        && (claim.accepted_proof.as_deref() != Some(accepted) || claim.released_proof.as_deref() != Some(released)) {
+        return Err(invalid("completion proof differs from durable acceptance or last-use release"));
+    }
+    if claim.state == "reclaimed" {
+        match fs::symlink_metadata(&output) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(receipt),
+            _ => return Err(invalid("new output exists at a reclaimed path; retained")),
+        }
+    }
+    if claim.hold { return Err(invalid("explicit hold remains; completion refused")); }
+    let dir = Directory::open(output.parent().unwrap(), &repo)?;
+    validate_claim(&dir, &receipts, side, &claim)?;
+    if claim.state != "held" && claim.state != "pending" { return Err(invalid("incomplete generation cannot be accepted")); }
+    if claim.sha256.is_none() || claim.identity.is_none() || !valid_provenance(&claim) { return Err(invalid("missing final output evidence")); }
+    if claim.state == "held" {
+        claim.accepted_proof = Some(accepted.into()); claim.released_proof = Some(released.into());
+        claim.hold = false; claim.state = "pending".into();
+        receipts.persist(side, &claim, false)?;
+    }
+    reclaim(&dir, &receipts, side, &mut claim)?;
+    Ok(receipt)
 }
-
-fn canonical_existing(path: &Path) -> io::Result<PathBuf> {
-    std::fs::canonicalize(path)
+fn validate_claim(dir: &Directory, receipts: &Directory, side: &str, c: &Claim) -> io::Result<()> {
+    file_name(&c.output)?;
+    if c.version != 3 || c.owner != "funkot-wav" || c.output.parent() != Some(dir.path.as_path())
+        || c.receipt != receipts.path.join(side) || c.directory_dev != dir.dev || c.directory_ino != dir.ino
+        || !c.generation.starts_with('g') || !c.generation.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(invalid("foreign, legacy or moved receipt"));
+    }
+    Ok(())
 }
-
-#[cfg(unix)]
-fn observe_path(path: &Path) -> Option<Observed> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    let regular = meta.file_type().is_file();
-    Some(Observed {
-        regular,
-        nlink: meta.nlink(),
-        id: FileId {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            len: meta.len(),
-            mtime_ns: (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
-        },
+fn retry_directory(path: &Path, repo: &Path) { if let Ok(d) = Directory::open(path, repo) { retry_open_directory(&d, repo); } }
+fn retry_open_directory(receipts: &Directory, repo: &Path) {
+    let Ok(entries) = fs::read_dir(receipts.pinned()) else { return };
+    for entry in entries.flatten() {
+        let Some(side) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if !side.starts_with('.') || !side.ends_with(".owned") { continue }
+        let Ok(claim) = receipts.read_claim(&side) else { continue };
+        if claim.state != "pending" { continue }
+        let Ok(_lock) = receipts.lock(&claim.output) else { continue };
+        let Ok(mut claim) = receipts.read_claim(&side) else { continue };
+        let Some(parent) = claim.output.parent() else { continue };
+        let Ok(dir) = Directory::open(parent, repo) else { continue };
+        if let Err(e) = reclaim(&dir, receipts, &side, &mut claim) { eprintln!("owned_wav: pending {}: {e}", claim.generation); }
+    }
+}
+fn reclaim(dir: &Directory, receipts: &Directory, side: &str, c: &mut Claim) -> io::Result<()> {
+    validate_claim(dir, receipts, side, c)?;
+    if !valid_provenance(c) || c.identity.is_none() || c.allocated_bytes.is_none()
+        || c.sha256.as_deref().is_none_or(|hash| hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(invalid("missing final output evidence or reproducible generation provenance"));
+    }
+    if c.state != "pending" || c.hold || c.accepted_proof.as_deref().is_none_or(|s| s.trim().is_empty()) || c.released_proof.as_deref().is_none_or(|s| s.trim().is_empty()) { return Err(invalid("not accepted and released")); }
+    dir.revalidate()?;
+    let name = file_name(&c.output)?;
+    let tomb = format!(".{name}.{}.reclaiming", c.generation);
+    let output_lock;
+    if !dir.exists(&tomb)? {
+        if !dir.exists(name)? {
+            c.state = "reclaimed".into(); c.result = Some("absent on pending retry; no additional bytes removed".into());
+            return receipts.persist(side, c, false);
+        }
+        output_lock = verify_output(dir, name, c)?;
+        output_lock.try_lock().map_err(|e| io::Error::other(format!("output busy: {e}")))?;
+        rename_exclusive(&dir.child(name), &dir.child(&tomb))?; dir.sync()?;
+    } else {
+        output_lock = verify_output(dir, &tomb, c)?;
+        output_lock.try_lock().map_err(|e| io::Error::other(format!("output busy: {e}")))?;
+    }
+    // Check again after rename. Never overwrite a raced-in new output to restore
+    // a mismatch; preserve it and the quarantined inode for explicit resolution.
+    verify_output(dir, &tomb, c)?; dir.revalidate()?;
+    if dir.exists(name)? { return Err(invalid("new output at reclaimed name; retained")); }
+    fs::remove_file(dir.child(&tomb))?; dir.sync()?;
+    if dir.exists(name)? { return Err(invalid("new output appeared during reclamation; retained")); }
+    c.state = "reclaimed".into(); c.result = Some(format!("removed; allocated_bytes={}", c.allocated_bytes.unwrap_or(0)));
+    receipts.persist(side, c, false)
+}
+fn verify_output(dir: &Directory, name: &str, c: &Claim) -> io::Result<File> {
+    let file = dir.read_regular(name)?; let before = file.metadata()?;
+    if c.identity.as_ref() != Some(&identity(&before)) || c.sha256.as_deref() != Some(hash_file(&file)?.as_str()) || identity(&file.metadata()?) != identity(&before) { return Err(invalid("identity or hash changed; retained")); }
+    Ok(file)
+}
+struct Directory { path: PathBuf, file: File, dev: u64, ino: u64, mount_id: u64, repo: PathBuf }
+impl Directory {
+    fn open(path: &Path, repo: &Path) -> io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (path, repo); return Err(invalid("native safe ownership unavailable; retained")); }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let path = absolute(path)?;
+            let repo = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+            if let Some(masters) = std::env::var_os("FUNKOT_TESTDATA_DIR").filter(|v| !v.is_empty()) {
+                let masters = fs::canonicalize(masters)?;
+                if overlaps(&path, &masters) { return Err(invalid("overlaps masters")); }
+            }
+            let mut walk = PathBuf::from("/"); let mut prior_dev = None;
+            let mut fd = OpenOptions::new().read(true).custom_flags(0x20000 | 0x10000).open("/")?;
+            for part in path.components().skip(1) {
+                let Component::Normal(part) = part else { return Err(invalid("non-normal path")); };
+                walk.push(part);
+                use std::os::fd::AsRawFd;
+                let child = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())).join(part);
+                let f = OpenOptions::new().read(true).custom_flags(0x20000 | 0x10000).open(child)?; // O_NOFOLLOW | O_DIRECTORY
+                let meta = f.metadata()?;
+                if walk.starts_with(&repo) && walk != repo {
+                    if prior_dev.is_some_and(|d| d != meta.dev()) || is_mountpoint(&walk)? { return Err(invalid("other mount")); }
+                    if fs::symlink_metadata(walk.join(".git")).is_ok() { return Err(invalid("nested repository")); }
+                }
+                prior_dev = Some(meta.dev()); fd = f;
+            }
+            if path == Path::new("/") { return Err(invalid("root directory cannot own output")); }
+            let file = fd;
+            let meta = file.metadata()?;
+            let mount_id = mount_id(&file)?;
+            Ok(Self { path, file, dev: meta.dev(), ino: meta.ino(), mount_id, repo })
+        }
+    }
+    fn pinned(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        { use std::os::fd::AsRawFd; PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd())) }
+        #[cfg(not(target_os = "linux"))] { self.path.clone() }
+    }
+    fn child(&self, name: &str) -> PathBuf { self.pinned().join(name) }
+    fn sync(&self) -> io::Result<()> { self.file.sync_all() }
+    fn revalidate(&self) -> io::Result<()> {
+        let current = Self::open(&self.path, &self.repo)?;
+        if current.dev != self.dev || current.ino != self.ino || current.mount_id != self.mount_id { return Err(invalid("owner directory replaced")); } Ok(())
+    }
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        match fs::symlink_metadata(self.child(name)) { Ok(_) => Ok(true), Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false), Err(e) => Err(e) }
+    }
+    fn read_regular(&self, name: &str) -> io::Result<File> {
+        let file = nofollow().read(true).open(self.child(name))?;
+        if !single_regular(&file.metadata()?) { return Err(invalid("not a single-link regular file")); } Ok(file)
+    }
+    fn lock(&self, output: &Path) -> io::Result<File> {
+        let name = format!(".funkot-wav-{:x}.lock", Sha256::digest(output.as_os_str().as_encoded_bytes()));
+        let file = nofollow().read(true).write(true).create(true).truncate(false).open(self.child(&name))?;
+        if !single_regular(&file.metadata()?) { return Err(invalid("invalid owner lock")); }
+        file.try_lock().map_err(|e| io::Error::other(format!("owner busy: {e}")))?; self.revalidate()?; Ok(file)
+    }
+    fn read_claim(&self, side: &str) -> io::Result<Claim> { serde_json::from_reader(self.read_regular(side)?).map_err(|e| invalid(&format!("invalid receipt: {e}"))) }
+    fn persist(&self, side: &str, claim: &Claim, create: bool) -> io::Result<()> {
+        self.revalidate()?;
+        let tmp = format!("{side}.{}.tmp", generation_id());
+        let mut f = nofollow().write(true).create_new(true).open(self.child(&tmp))?;
+        serde_json::to_writer_pretty(&mut f, claim)?; f.write_all(b"\n")?; f.sync_all()?;
+        if create { rename_exclusive(&self.child(&tmp), &self.child(side))?; }
+        else { self.read_regular(side)?; fs::rename(self.child(&tmp), self.child(side))?; }
+        self.sync()
+    }
+}
+fn nofollow() -> OpenOptions {
+    let mut o = OpenOptions::new();
+    #[cfg(target_os = "linux")] { use std::os::unix::fs::OpenOptionsExt; o.custom_flags(0x20000); } o
+}
+#[cfg(target_os = "linux")]
+fn identity(m: &fs::Metadata) -> Identity { use std::os::unix::fs::MetadataExt; Identity { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: m.mtime(), mtime_ns: m.mtime_nsec() } }
+#[cfg(not(target_os = "linux"))]
+fn identity(_m: &fs::Metadata) -> Identity { Identity { dev: 0, ino: 0, len: 0, mtime: 0, mtime_ns: 0 } }
+fn same_inode(m: &fs::Metadata, id: &Identity) -> bool { let now = identity(m); now.dev == id.dev && now.ino == id.ino }
+fn single_regular(m: &fs::Metadata) -> bool {
+    #[cfg(target_os = "linux")] { use std::os::unix::fs::MetadataExt; m.is_file() && m.nlink() == 1 }
+    #[cfg(not(target_os = "linux"))] { let _ = m; false }
+}
+fn allocated(m: &fs::Metadata) -> u64 {
+    #[cfg(target_os = "linux")] { use std::os::unix::fs::MetadataExt; m.blocks() * 512 }
+    #[cfg(not(target_os = "linux"))] { let _ = m; 0 }
+}
+fn hash_file(file: &File) -> io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = file.try_clone()?; file.seek(SeekFrom::Start(0))?;
+    let mut hash = Sha256::new(); let mut buf = [0u8; 65536];
+    loop { let n = file.read(&mut buf)?; if n == 0 { break } hash.update(&buf[..n]); } Ok(format!("{:x}", hash.finalize()))
+}
+fn absolute(path: &Path) -> io::Result<PathBuf> {
+    let path = if path.is_absolute() { path.into() } else { std::env::current_dir()?.join(path) };
+    let mut normal = PathBuf::new();
+    for c in path.components() { match c { Component::CurDir => {}, Component::ParentDir => return Err(invalid("parent traversal is not an ownership path")), _ => normal.push(c) } } Ok(normal)
+}
+fn file_name(path: &Path) -> io::Result<&str> { let name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| invalid("invalid filename"))?; valid_name(name)?; Ok(name) }
+fn valid_name(name: &str) -> io::Result<()> { if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') { Err(invalid("bad output name")) } else { Ok(()) } }
+fn overlaps(a: &Path, b: &Path) -> bool { a.starts_with(b) || b.starts_with(a) }
+fn invalid(s: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, s) }
+fn generation_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("g{}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+fn valid_provenance(claim: &Claim) -> bool {
+    let digest = claim.source_revision.rsplit("executable-sha256:").next().unwrap_or("");
+    !claim.inputs.is_empty() && digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        && claim.source_revision.contains("executable-sha256:")
+}
+fn source_revision(repo: &Path) -> io::Result<String> {
+    // /proc/self/exe identifies the executable actually running, even if its
+    // pathname was replaced after launch. Cache only within this process.
+    static EXECUTABLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let digest = match EXECUTABLE.get() {
+        Some(digest) => digest.clone(),
+        None => {
+            let digest = hash_file(&File::open("/proc/self/exe")?)?;
+            let _ = EXECUTABLE.set(digest.clone()); digest
+        }
+    };
+    let explicit = std::env::var("FUNKOT_SOURCE_REVISION").ok();
+    let git = || std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repo).output().ok()
+        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+    let revision = explicit.or_else(git).filter(|r| matches!(r.len(), 40 | 64) && r.bytes().all(|b| b.is_ascii_hexdigit()));
+    Ok(match revision {
+        Some(revision) => format!("git:{revision}; executable-sha256:{digest}"),
+        None => format!("executable-sha256:{digest}"),
     })
 }
-
-#[cfg(not(unix))]
-fn observe_path(_path: &Path) -> Option<Observed> {
-    None
+#[cfg(target_os = "linux")]
+fn mount_id(file: &File) -> io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")).and_then(|id| id.trim().parse().ok())
+        .ok_or_else(|| invalid("owner mount identity unavailable"))
+}
+#[cfg(target_os = "linux")]
+fn is_mountpoint(path: &Path) -> io::Result<bool> {
+    Ok(fs::read_to_string("/proc/self/mountinfo")?.lines().filter_map(|l| l.split_whitespace().nth(4)).any(|s| {
+        let s = s.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\"); Path::new(&s) == path
+    }))
+}
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt; use std::ffi::CString;
+        unsafe extern "C" { fn renameat2(olddirfd: i32, oldpath: *const std::ffi::c_char, newdirfd: i32, newpath: *const std::ffi::c_char, flags: u32) -> i32; }
+        let from = CString::new(from.as_os_str().as_bytes()).map_err(|_| invalid("NUL path"))?;
+        let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| invalid("NUL path"))?;
+        // AT_FDCWD and RENAME_NOREPLACE; unsupported kernels fail closed.
+        if unsafe { renameat2(-100, from.as_ptr(), -100, to.as_ptr(), 1) } != 0 { return Err(io::Error::last_os_error()); } Ok(())
+    }
+    #[cfg(not(target_os = "linux"))] { let _ = (from, to); Err(invalid("native safe rename unavailable")) }
+}
+fn register_task_receipt(context: &Context, claim: &Claim) -> io::Result<()> {
+    let completion = match &context.owner_completion_argv {
+        Some(argv) if !argv.is_empty() => argv.clone(),
+        _ => {
+            let exe = std::env::current_exe()?;
+            if exe.file_stem().and_then(|s| s.to_str()) != Some("funkot-autodj") { return Err(invalid("managed example requires owner_completion_argv for the main CLI")); }
+            vec![exe.to_string_lossy().into_owned()]
+        }
+    };
+    let mut completion = completion;
+    completion.extend(["--artifact-complete".into(), claim.output.to_string_lossy().into_owned(), "--generation".into(), claim.generation.clone(), "--artifact-receipt".into(), claim.receipt.to_string_lossy().into_owned(), "--accepted-proof".into(), "{result_ref}".into(), "--released-proof".into(), "{result_ref}".into()]);
+    let (program, prefix) = context.owner_receipt_argv.split_first().ok_or_else(|| invalid("empty owner_receipt_argv"))?;
+    let status = std::process::Command::new(program).args(prefix).args(["--owner", "funkot-wav", "--generation", &claim.generation, "--output"]).arg(&claim.output).arg("--receipt").arg(&claim.receipt).arg("--completion-json").arg(serde_json::to_string(&completion)?).status()?;
+    if !status.success() { return Err(invalid("owner receipt registration failed; no output written")); } Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::time::Duration;
-
-    const T0_SECS: u64 = 1_800_000_000;
-
-    fn t0() -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(T0_SECS)
+    use tempfile::TempDir;
+    fn fixture() -> (TempDir, Checkout, PathBuf) {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join("testdata/synth"); fs::create_dir_all(&dir).unwrap();
+        let checkout = Checkout::at(repo.path()); (repo, checkout, dir)
     }
-
-    fn temp_repo(label: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "funkot-owned-wav-{}-{}-{}",
-            label,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(p.join("testdata/synth")).unwrap();
-        fs::create_dir_all(p.join("testdata/phase_ab")).unwrap();
-        fs::create_dir_all(p.join("funkot-core/tests/fixtures")).unwrap();
-        p
+    fn generate(checkout: &Checkout, dir: &Path) -> (PathBuf, String) {
+        let (_, claimed) = write_owned(checkout, dir, "x.wav", SystemTime::now(), |p| fs::write(p, b"RIFF test samples")).unwrap();
+        match claimed { Claimed::Yes { receipt, generation } => (receipt, generation), _ => panic!("not claimed") }
     }
-
-    fn write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-        fs::write(path, bytes)
+    fn claim(path: &Path) -> Claim { serde_json::from_slice(&fs::read(path).unwrap()).unwrap() }
+    fn pending(path: &Path) {
+        let mut c = claim(path); c.state = "pending".into(); c.hold = false;
+        c.accepted_proof = Some("accepted:test".into()); c.released_proof = Some("released:test".into());
+        fs::write(path, serde_json::to_vec(&c).unwrap()).unwrap();
     }
-
     #[test]
-    fn owned_expired_is_deleted() {
-        let repo = temp_repo("expired");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        let name = "a.wav";
-        write_owned(&co, &dir, name, t0(), |p| write_bytes(p, b"RIFF-wav")).unwrap();
-        assert!(dir.join(name).is_file());
-        assert!(dir.join(sidecar_name(name)).is_file());
-
-        let report = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        assert_eq!(report.reclaimed(), vec!["a.wav"]);
-        assert!(!dir.join(name).exists());
-        assert!(!dir.join(sidecar_name(name)).exists());
-        let _ = fs::remove_dir_all(&repo);
+    fn held_never_ages_acceptance_reclaims_and_keeps_evidence() {
+        let (_r, co, dir) = fixture(); let (receipt, generation) = generate(&co, &dir);
+        co.open(UNIX_EPOCH + std::time::Duration::from_secs(u32::MAX as u64));
+        assert!(dir.join("x.wav").exists()); let before = claim(&receipt);
+        complete(&dir.join("x.wav"), &generation, None, "accepted:test", "released:test").unwrap();
+        assert!(!dir.join("x.wav").exists()); let after = claim(&receipt);
+        assert_eq!(after.state, "reclaimed"); assert_eq!(after.sha256, before.sha256);
+        assert_eq!(after.identity, before.identity); assert!(after.allocated_bytes.is_some());
+        complete(&dir.join("x.wav"), &generation, None, "accepted:test", "released:test").unwrap();
     }
-
     #[test]
-    fn owned_in_window_is_kept() {
-        let repo = temp_repo("inwindow");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        write_owned(&co, &dir, "b.wav", t0(), |p| write_bytes(p, b"wav")).unwrap();
-        let report = sweep(&co, t0() + RECLAIM_AFTER - Duration::from_secs(1));
-        assert!(report.reclaimed().is_empty());
-        let RootReport::Swept(s) = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1
-        else {
-            panic!("expected swept");
-        };
-        assert_eq!(s.kept, vec![("b.wav".into(), KeepReason::InWindow)]);
-        assert!(dir.join("b.wav").is_file());
-        assert!(dir.join(sidecar_name("b.wav")).is_file());
-        let _ = fs::remove_dir_all(&repo);
+    fn missing_proof_wrong_generation_and_incomplete_output_are_protected() {
+        let (_r, co, dir) = fixture(); let (_receipt, generation) = generate(&co, &dir);
+        assert!(complete(&dir.join("x.wav"), &generation, None, "", "released").is_err());
+        assert!(complete(&dir.join("x.wav"), "wrong", None, "accepted", "released").is_err());
+        let output = dir.join("partial.wav");
+        let writing = Generation::begin_at(&output, &co.repo).unwrap();
+        fs::write(writing.write_path(), b"partial").unwrap();
+        let c = claim(&dir.join(".partial.wav.owned")); drop(writing);
+        assert!(complete(&output, &c.generation, None, "accepted", "released").is_err());
+        co.open(SystemTime::now()); assert_eq!(fs::read(output).unwrap(), b"partial");
     }
-
     #[test]
-    fn active_writer_survives_because_disowned() {
-        let repo = temp_repo("active");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        let name = "live.wav";
-        // Pre-create an old claim.
-        write_owned(&co, &dir, name, t0(), |p| write_bytes(p, b"old")).unwrap();
-        let far = t0() + Duration::from_secs(100 * 24 * 60 * 60);
-        let ((), claimed) = write_owned(&co, &dir, name, t0(), |p| {
-            let mid = sweep(&co, far);
-            assert!(
-                mid.reclaimed().is_empty(),
-                "in-progress write must not be reclaimed: {:?}",
-                mid.reclaimed()
-            );
-            write_bytes(p, b"new-content")
-        })
-        .unwrap();
-        assert!(matches!(claimed, Claimed::Yes { .. }));
-        assert_eq!(fs::read(dir.join(name)).unwrap(), b"new-content");
-        let _ = fs::remove_dir_all(&repo);
+    fn receipt_is_durable_before_producer_runs_and_failure_is_held() {
+        let (_r, co, dir) = fixture();
+        let result = write_owned(&co, &dir, "x.wav", SystemTime::now(), |p| -> io::Result<()> {
+            assert_eq!(claim(&dir.join(".x.wav.owned")).state, "writing");
+            fs::write(p, b"partial")?; Err(io::Error::other("producer failed"))
+        });
+        assert!(result.is_err()); co.open(SystemTime::now());
+        assert_eq!(fs::read(dir.join("x.wav")).unwrap(), b"partial");
+        assert_eq!(claim(&dir.join(".x.wav.owned")).state, "writing");
     }
-
     #[test]
-    fn rewritten_after_claim_keeps_wav_drops_sidecar() {
-        let repo = temp_repo("rewrite");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        write_owned(&co, &dir, "c.wav", t0(), |p| write_bytes(p, b"orig")).unwrap();
-        {
-            use std::io::Write;
-            let mut f = fs::OpenOptions::new()
-                .append(true)
-                .open(dir.join("c.wav"))
-                .unwrap();
-            f.write_all(b"X").unwrap();
+    fn pending_startup_retry_and_crash_after_rename_are_idempotent() {
+        let (_r, co, dir) = fixture(); let (receipt, generation) = generate(&co, &dir); pending(&receipt);
+        let tomb = dir.join(format!(".x.wav.{generation}.reclaiming"));
+        fs::rename(dir.join("x.wav"), &tomb).unwrap();
+        co.open(SystemTime::now()); assert!(!tomb.exists()); assert_eq!(claim(&receipt).state, "reclaimed");
+        co.open(SystemTime::now()); assert_eq!(claim(&receipt).state, "reclaimed");
+    }
+    #[test]
+    fn crash_after_unlink_preserves_receipt() {
+        let (_r, co, dir) = fixture(); let (receipt, _) = generate(&co, &dir); pending(&receipt);
+        fs::remove_file(dir.join("x.wav")).unwrap(); co.open(SystemTime::now());
+        assert_eq!(claim(&receipt).state, "reclaimed"); assert!(claim(&receipt).sha256.is_some());
+    }
+    #[test]
+    fn manual_legacy_and_preexisting_receipts_are_never_adopted() {
+        let (_r, co, dir) = fixture(); fs::write(dir.join("manual.wav"), b"manual").unwrap();
+        let result = write_owned(&co, &dir, "manual.wav", SystemTime::now(), |_p| -> io::Result<()> { panic!("protected producer must not run") });
+        assert!(result.is_err()); assert_eq!(fs::read(dir.join("manual.wav")).unwrap(), b"manual");
+        assert!(!dir.join(".manual.wav.owned").exists());
+        fs::write(dir.join(".legacy.wav.owned"), b"funkot-owned-wav v1").unwrap();
+        let result = write_owned(&co, &dir, "legacy.wav", SystemTime::now(), |_p| -> io::Result<()> { panic!("legacy producer must not run") });
+        assert!(result.is_err()); co.open(SystemTime::now());
+        assert_eq!(fs::read(dir.join(".legacy.wav.owned")).unwrap(), b"funkot-owned-wav v1");
+        assert!(!dir.join("legacy.wav").exists());
+    }
+    #[test]
+    fn modified_replaced_symlink_and_hardlink_outputs_are_retained() {
+        for mode in ["modified", "replaced", "symlink", "hardlink"] {
+            let (_r, co, dir) = fixture(); let (receipt, generation) = generate(&co, &dir);
+            let output = dir.join("x.wav");
+            match mode {
+                "modified" => fs::write(&output, b"changed").unwrap(),
+                "replaced" => { fs::rename(&output, dir.join("original")).unwrap(); fs::write(&output, b"RIFF test samples").unwrap(); },
+                "symlink" => { fs::rename(&output, dir.join("original")).unwrap(); std::os::unix::fs::symlink(dir.join("original"), &output).unwrap(); },
+                "hardlink" => fs::hard_link(&output, dir.join("other")).unwrap(), _ => unreachable!(),
+            }
+            assert!(complete(&output, &generation, None, "accepted", "released").is_err(), "{mode}");
+            assert!(output.exists(), "{mode}"); assert_eq!(claim(&receipt).state, "pending");
         }
-        let report = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        assert!(report.reclaimed().is_empty());
-        let RootReport::Swept(s) = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1
-        else {
-            panic!("expected swept");
-        };
-        assert_eq!(s.kept, vec![("c.wav".into(), KeepReason::Mismatch)]);
-        assert!(dir.join("c.wav").is_file());
-        assert!(!dir.join(sidecar_name("c.wav")).exists());
-        let _ = fs::remove_dir_all(&repo);
+    }
+    #[test]
+    fn symlink_root_nested_repo_and_mount_refused() {
+        let (r, co, dir) = fixture();
+        let nested = dir.join("nested"); fs::create_dir_all(nested.join(".git")).unwrap();
+        assert!(Directory::open(&nested, &co.repo).is_err());
+        let link = r.path().join("link"); std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(Directory::open(&link, &co.repo).is_err());
+        assert!(Directory::open(Path::new("/proc"), Path::new("/")).is_err());
+    }
+    #[test]
+    fn active_writer_and_owner_lock_prevent_completion() {
+        let (_r, co, dir) = fixture(); let output = dir.join("x.wav");
+        let mut writing = Generation::begin_at(&output, &co.repo).unwrap(); fs::write(writing.write_path(), b"RIFF").unwrap();
+        let Claimed::Yes { generation, .. } = writing.finish().unwrap() else { panic!() };
+        assert!(complete(&output, &generation, None, "accepted", "released").is_err());
+        assert!(Generation::begin_at(&output, &co.repo).is_err()); drop(writing);
+        complete(&output, &generation, None, "accepted", "released").unwrap();
+    }
+    #[test]
+    fn moved_receipt_and_replaced_directory_are_refused() {
+        let (r, co, dir) = fixture(); let (receipt, generation) = generate(&co, &dir); pending(&receipt);
+        let new_dir = r.path().join("elsewhere"); fs::create_dir(&new_dir).unwrap();
+        fs::copy(&receipt, new_dir.join(".x.wav.owned")).unwrap(); fs::copy(dir.join("x.wav"), new_dir.join("x.wav")).unwrap();
+        assert!(complete(&new_dir.join("x.wav"), &generation, None, "accepted", "released").is_err());
+        let pinned = Directory::open(&dir, &co.repo).unwrap(); fs::rename(&dir, r.path().join("old")).unwrap(); fs::create_dir(&dir).unwrap();
+        assert!(pinned.revalidate().is_err());
+    }
+    #[test]
+    fn same_generation_tomb_collision_is_retained() {
+        let (_r, co, dir) = fixture(); let (_receipt, generation) = generate(&co, &dir);
+        let tomb = dir.join(format!(".x.wav.{generation}.reclaiming")); fs::write(&tomb, b"manual").unwrap();
+        assert!(complete(&dir.join("x.wav"), &generation, None, "accepted", "released").is_err());
+        assert_eq!(fs::read(tomb).unwrap(), b"manual"); assert!(dir.join("x.wav").exists());
+    }
+    #[test]
+    fn explicit_hold_cannot_be_cleared_by_completion() {
+        let (_r, co, dir) = fixture(); let (receipt, generation) = generate(&co, &dir);
+        let mut c = claim(&receipt); c.hold = true;
+        fs::write(&receipt, serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(complete(&dir.join("x.wav"), &generation, None, "accepted", "released").is_err());
+        assert!(dir.join("x.wav").exists()); assert!(claim(&receipt).hold);
+    }
+    #[test]
+    fn new_output_during_tomb_retry_is_protected() {
+        let (_r, co, dir) = fixture(); let (receipt, generation) = generate(&co, &dir); pending(&receipt);
+        let tomb = dir.join(format!(".x.wav.{generation}.reclaiming"));
+        fs::rename(dir.join("x.wav"), &tomb).unwrap(); fs::write(dir.join("x.wav"), b"manual").unwrap();
+        co.open(SystemTime::now()); assert!(tomb.exists());
+        assert_eq!(fs::read(dir.join("x.wav")).unwrap(), b"manual"); assert_eq!(claim(&receipt).state, "pending");
     }
 
     #[test]
-    fn explicit_keep_by_deleting_sidecar() {
-        let repo = temp_repo("explicit");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        write_owned(&co, &dir, "keep.wav", t0(), |p| write_bytes(p, b"keepme")).unwrap();
-        fs::remove_file(dir.join(sidecar_name("keep.wav"))).unwrap();
-        let report = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        assert!(report.reclaimed().is_empty());
-        let RootReport::Swept(s) = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1
-        else {
-            panic!("expected swept");
-        };
-        assert_eq!(s.unknown_wavs, 1);
-        assert_eq!(fs::read(dir.join("keep.wav")).unwrap(), b"keepme");
-        let _ = fs::remove_dir_all(&repo);
+    fn managed_registration_precedes_bytes_and_external_receipt_survives() {
+        let (repo, co, dir) = fixture(); let external = tempfile::tempdir().unwrap();
+        let script = repo.path().join("register.sh");
+        fs::write(&script, r#"set -eu
+output= receipt=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    --receipt) receipt=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+test ! -e "$output"
+test -s "$receipt"
+grep -q '"state": "writing"' "$receipt"
+"#).unwrap();
+        let context = Context { owner_receipt_dir: external.path().into(), owner_receipt_argv: vec!["sh".into(), script.to_string_lossy().into_owned()], owner_completion_argv: Some(vec!["main-cli".into()]) };
+        let output = dir.join("managed.wav");
+        let mut writer = Generation::begin_with_context(&output, &co.repo, Some(context)).unwrap();
+        fs::write(writer.write_path(), b"RIFF managed").unwrap();
+        let Claimed::Yes { generation, receipt } = writer.finish().unwrap() else { panic!() }; drop(writer);
+        assert!(receipt.starts_with(external.path())); assert!(!dir.join(".managed.wav.owned").exists());
+        complete(&output, &generation, Some(&receipt), "accepted", "released").unwrap();
+        assert!(!output.exists()); assert_eq!(claim(&receipt).state, "reclaimed");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+    #[test]
+    fn failed_registration_writes_no_output_bytes() {
+        let (_repo, co, dir) = fixture(); let external = tempfile::tempdir().unwrap();
+        let context = Context { owner_receipt_dir: external.path().into(), owner_receipt_argv: vec!["sh".into(), "-c".into(), "exit 1".into()], owner_completion_argv: Some(vec!["main-cli".into()]) };
+        let output = dir.join("failed.wav");
+        assert!(Generation::begin_with_context(&output, &co.repo, Some(context)).is_err());
+        assert!(!output.exists());
+        let receipts: Vec<_> = fs::read_dir(external.path()).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|e| e == "owned")).collect();
+        assert_eq!(receipts.len(), 1); assert_eq!(claim(&receipts[0].path()).state, "writing");
     }
 
     #[test]
-    fn unknown_legacy_wav_is_kept() {
-        let repo = temp_repo("legacy");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        fs::write(dir.join("old.wav"), b"legacy").unwrap();
-        let report = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        let RootReport::Swept(s) = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1
-        else {
-            panic!("expected swept");
-        };
-        assert_eq!(s.unknown_wavs, 1);
-        assert_eq!(s.unknown_bytes, 6);
-        assert!(dir.join("old.wav").is_file());
-        let _ = fs::remove_dir_all(&repo);
+    fn proofs_and_provenance_cannot_be_replaced_at_completion() {
+        let (_r, co, dir) = fixture(); let (receipt, generation) = generate(&co, &dir); pending(&receipt);
+        assert!(complete(&dir.join("x.wav"), &generation, None, "different", "released:test").is_err());
+        assert!(dir.join("x.wav").exists());
+        let mut c = claim(&receipt); let original = c.source_revision.clone(); c.source_revision = "unknown".into();
+        fs::write(&receipt, serde_json::to_vec(&c).unwrap()).unwrap();
+        co.open(SystemTime::now()); assert!(dir.join("x.wav").exists());
+        c.source_revision = original; fs::write(&receipt, serde_json::to_vec(&c).unwrap()).unwrap();
+        complete(&dir.join("x.wav"), &generation, None, "accepted:test", "released:test").unwrap();
+        assert!(complete(&dir.join("x.wav"), &generation, None, "changed", "released:test").is_err());
     }
-
-    #[cfg(unix)]
     #[test]
-    fn symlinked_root_is_refused() {
-        let repo = temp_repo("symlink-root");
-        let elsewhere = repo.join("elsewhere");
-        fs::create_dir_all(&elsewhere).unwrap();
-        fs::write(elsewhere.join("target.wav"), b"safe").unwrap();
-        let synth = repo.join("testdata/synth");
-        fs::remove_dir_all(&synth).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, &synth).unwrap();
-
-        let co = Checkout::at(&repo);
-        let ((), claimed) =
-            write_owned(&co, &synth, "x.wav", t0(), |p| write_bytes(p, b"nope")).unwrap();
-        assert!(matches!(
-            claimed,
-            Claimed::No(NotClaimed::RootRefused(ref s)) if s == "symlink"
-        ));
-        assert!(!elsewhere.join(sidecar_name("x.wav")).exists());
-        assert_eq!(fs::read(elsewhere.join("target.wav")).unwrap(), b"safe");
-
-        let report = sweep(&co, t0());
-        let rr = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1;
-        assert!(matches!(rr, RootReport::Refused(Refusal::Symlink(_))));
-        let _ = fs::remove_dir_all(&repo);
+    fn managed_preexisting_and_symlinked_outputs_fail_before_write() {
+        let (repo, co, dir) = fixture(); let external = tempfile::tempdir().unwrap();
+        let context = || Context { owner_receipt_dir: external.path().into(), owner_receipt_argv: vec!["false".into()], owner_completion_argv: Some(vec!["main-cli".into()]) };
+        let output = dir.join("manual.wav"); fs::write(&output, b"manual").unwrap();
+        assert!(Generation::begin_with_context(&output, &co.repo, Some(context())).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"manual");
+        let link = repo.path().join("link"); std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(Generation::begin_with_context(&link.join("new.wav"), &co.repo, Some(context())).is_err());
+        assert!(!dir.join("new.wav").exists());
     }
-
-    #[cfg(unix)]
     #[test]
-    fn symlink_wav_at_claimed_name_is_kept_not_regular() {
-        let repo = temp_repo("symlink-wav");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        write_owned(&co, &dir, "s.wav", t0(), |p| write_bytes(p, b"real")).unwrap();
-        let target = dir.join("other.bin");
-        fs::write(&target, b"tgt").unwrap();
-        fs::remove_file(dir.join("s.wav")).unwrap();
-        std::os::unix::fs::symlink(&target, dir.join("s.wav")).unwrap();
-
-        let report = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        let RootReport::Swept(s) = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1
-        else {
-            panic!("expected swept");
-        };
-        assert_eq!(s.kept, vec![("s.wav".into(), KeepReason::NotRegular)]);
-        assert!(dir.join("s.wav").exists());
-        assert!(dir.join(sidecar_name("s.wav")).is_file());
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn nested_repo_is_refused() {
-        let repo = temp_repo("nested");
-        let phase = repo.join("testdata/phase_ab");
-        fs::create_dir_all(phase.join(".git")).unwrap();
-        let co = Checkout::at(&repo);
-        let report = sweep(&co, t0());
-        let rr = &report
-            .roots
-            .iter()
-            .find(|(r, _)| *r == Root::PhaseAb)
-            .unwrap()
-            .1;
-        assert!(matches!(rr, RootReport::Refused(Refusal::NestedRepo(_))));
-        let ((), claimed) =
-            write_owned(&co, &phase, "n.wav", t0(), |p| write_bytes(p, b"x")).unwrap();
-        assert!(matches!(
-            claimed,
-            Claimed::No(NotClaimed::RootRefused(ref s)) if s == "nested-repo"
-        ));
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn masters_overlap_is_refused() {
-        let repo = temp_repo("masters");
-        let synth = fs::canonicalize(repo.join("testdata/synth")).unwrap();
-        let co = Checkout::at_inner(&repo, Some(synth.clone()));
-        let report = sweep(&co, t0());
-        let rr = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1;
-        assert!(matches!(rr, RootReport::Refused(Refusal::OverlapsMasters(_))));
-        let ((), claimed) =
-            write_owned(&co, &synth, "m.wav", t0(), |p| write_bytes(p, b"x")).unwrap();
-        assert!(matches!(
-            claimed,
-            Claimed::No(NotClaimed::RootRefused(ref s)) if s == "overlaps-masters"
-        ));
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn other_mount_is_refused_via_injected_dev() {
-        let repo = temp_repo("mount");
-        let mut co = Checkout::at(&repo);
-        if let Ok(base) = &mut co.base {
-            base.dev = base.dev.wrapping_add(1);
+    fn masters_overlap_is_refused_in_isolated_process() {
+        if let Some(path) = std::env::var_os("FUNKOT_OWNER_MASTER_TEST") {
+            let path = PathBuf::from(path);
+            assert!(Directory::open(&path, path.parent().unwrap()).is_err());
+            return;
         }
-        let report = sweep(&co, t0());
-        let rr = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1;
-        assert!(matches!(rr, RootReport::Refused(Refusal::OtherMount(_))));
-        let _ = fs::remove_dir_all(&repo);
+        let (_r, _co, dir) = fixture();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "owned_wav::tests::masters_overlap_is_refused_in_isolated_process"])
+            .env("FUNKOT_OWNER_MASTER_TEST", &dir).env("FUNKOT_TESTDATA_DIR", &dir).status().unwrap();
+        assert!(status.success());
     }
 
-    #[test]
-    fn sidecar_moved_to_another_root_is_wrong_root() {
-        let repo = temp_repo("wrongroot");
-        let co = Checkout::at(&repo);
-        let synth = repo.join("testdata/synth");
-        let phase = repo.join("testdata/phase_ab");
-        write_owned(&co, &synth, "w.wav", t0(), |p| write_bytes(p, b"body")).unwrap();
-        fs::copy(synth.join("w.wav"), phase.join("w.wav")).unwrap();
-        fs::copy(
-            synth.join(sidecar_name("w.wav")),
-            phase.join(sidecar_name("w.wav")),
-        )
-        .unwrap();
-        let report = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        // synth copy expired → reclaimed
-        assert!(report.reclaimed().contains(&"w.wav"));
-        let RootReport::Swept(phase_s) = &report
-            .roots
-            .iter()
-            .find(|(r, _)| *r == Root::PhaseAb)
-            .unwrap()
-            .1
-        else {
-            panic!("expected swept");
-        };
-        assert_eq!(
-            phase_s.kept,
-            vec![("w.wav".into(), KeepReason::WrongRoot)]
-        );
-        assert!(phase.join("w.wav").is_file());
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn protected_neighbours_unchanged() {
-        let repo = temp_repo("neighbours");
-        let fixtures = repo.join("funkot-core/tests/fixtures");
-        let golden = fixtures.join("golden.json");
-        let readme = fixtures.join("README.md");
-        fs::write(&golden, b"{\"v\":1}").unwrap();
-        fs::write(&readme, b"readme").unwrap();
-        fs::create_dir_all(repo.join("funkot-core/tests/data")).unwrap();
-        let data_wav = repo.join("funkot-core/tests/data/x.wav");
-        fs::write(&data_wav, b"datawav").unwrap();
-        fs::create_dir_all(repo.join("testdata")).unwrap();
-        let labels = repo.join("testdata/labels.tsv.example");
-        fs::write(&labels, b"labels").unwrap();
-
-        let co = Checkout::at(&repo);
-        write_owned(&co, &fixtures, "fx.wav", t0(), |p| write_bytes(p, b"fx")).unwrap();
-        let _ = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-
-        assert_eq!(fs::read(&golden).unwrap(), b"{\"v\":1}");
-        assert_eq!(fs::read(&readme).unwrap(), b"readme");
-        assert_eq!(fs::read(&data_wav).unwrap(), b"datawav");
-        assert_eq!(fs::read(&labels).unwrap(), b"labels");
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn outside_roots_never_claimed() {
-        let repo = temp_repo("outside");
-        let co = Checkout::at(&repo);
-        let elsewhere = repo.join("elsewhere");
-        fs::create_dir_all(&elsewhere).unwrap();
-        let ((), claimed) =
-            write_owned(&co, &elsewhere, "o.wav", t0(), |p| write_bytes(p, b"out")).unwrap();
-        assert_eq!(claimed, Claimed::No(NotClaimed::OutsideRoots));
-        assert!(!elsewhere.join(sidecar_name("o.wav")).exists());
-        assert!(elsewhere.join("o.wav").is_file());
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn crash_between_unlinks_drops_orphan_then_noop() {
-        let repo = temp_repo("orphan");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        write_owned(&co, &dir, "or.wav", t0(), |p| write_bytes(p, b"x")).unwrap();
-        fs::remove_file(dir.join("or.wav")).unwrap();
-        let report = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        let RootReport::Swept(s) = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1
-        else {
-            panic!("expected swept");
-        };
-        assert_eq!(s.orphan_claims_dropped, 1);
-        assert!(!dir.join(sidecar_name("or.wav")).exists());
-        let report2 = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        assert!(report2.is_noop());
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn second_sweep_is_noop() {
-        let repo = temp_repo("noop");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        write_owned(&co, &dir, "n.wav", t0(), |p| write_bytes(p, b"x")).unwrap();
-        let now = t0() + RECLAIM_AFTER + Duration::from_secs(1);
-        let _ = sweep(&co, now);
-        let report2 = sweep(&co, now);
-        assert!(report2.is_noop());
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn garbage_sidecar_is_not_a_claim() {
-        let repo = temp_repo("garbage");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        fs::write(dir.join("g.wav"), b"garb").unwrap();
-        fs::write(dir.join(sidecar_name("g.wav")), "hello").unwrap();
-        let report = sweep(&co, t0() + RECLAIM_AFTER + Duration::from_secs(1));
-        let RootReport::Swept(s) = &report.roots.iter().find(|(r, _)| *r == Root::Synth).unwrap().1
-        else {
-            panic!("expected swept");
-        };
-        assert_eq!(s.unknown_wavs, 1);
-        assert!(dir.join("g.wav").is_file());
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn decide_matrix_literal() {
-        let id = FileId {
-            dev: 1,
-            ino: 2,
-            len: 3,
-            mtime_ns: 4,
-        };
-        let claim = Claim {
-            root: Root::Synth,
-            file: "a.wav".into(),
-            claimed: t0(),
-            id,
-        };
-        let obs = Observed {
-            regular: true,
-            nlink: 1,
-            id,
-        };
-        assert_eq!(
-            decide(&claim, Root::Synth, Some(obs), t0() + RECLAIM_AFTER - Duration::from_secs(1)),
-            Verdict::Keep(KeepReason::InWindow)
-        );
-        assert_eq!(
-            decide(&claim, Root::Synth, Some(obs), t0() + RECLAIM_AFTER + Duration::from_secs(1)),
-            Verdict::Reclaim
-        );
-        assert_eq!(
-            decide(&claim, Root::PhaseAb, Some(obs), t0() + RECLAIM_AFTER + Duration::from_secs(1)),
-            Verdict::Keep(KeepReason::WrongRoot)
-        );
-        assert_eq!(
-            decide(&claim, Root::Synth, None, t0()),
-            Verdict::DropOrphanClaim
-        );
-        assert_eq!(
-            decide(
-                &claim,
-                Root::Synth,
-                Some(Observed {
-                    regular: false,
-                    nlink: 1,
-                    id
-                }),
-                t0()
-            ),
-            Verdict::Keep(KeepReason::NotRegular)
-        );
-        let mut bad = id;
-        bad.len = 99;
-        assert_eq!(
-            decide(
-                &claim,
-                Root::Synth,
-                Some(Observed {
-                    regular: true,
-                    nlink: 1,
-                    id: bad
-                }),
-                t0()
-            ),
-            Verdict::Keep(KeepReason::Mismatch)
-        );
-        assert_eq!(
-            decide(
-                &claim,
-                Root::Synth,
-                Some(Observed {
-                    regular: true,
-                    nlink: 2,
-                    id
-                }),
-                t0()
-            ),
-            Verdict::Keep(KeepReason::Hardlinked)
-        );
-        assert_eq!(
-            decide(&claim, Root::Synth, Some(obs), t0() - Duration::from_secs(1)),
-            Verdict::Keep(KeepReason::ClockBehind)
-        );
-    }
-
-    #[test]
-    fn open_handle_sweeps_then_write_owned() {
-        let repo = temp_repo("open");
-        let co = Checkout::at(&repo);
-        let dir = repo.join("testdata/synth");
-        write_owned(&co, &dir, "old.wav", t0(), |p| write_bytes(p, b"old")).unwrap();
-        let far = t0() + RECLAIM_AFTER + Duration::from_secs(1);
-        let opened = co.open(far);
-        assert!(!dir.join("old.wav").exists());
-        let ((), claimed) = opened
-            .write_owned(&dir, "new.wav", far, |p| write_bytes(p, b"new"))
-            .unwrap();
-        assert!(matches!(claimed, Claimed::Yes { root: Root::Synth }));
-        assert!(dir.join(sidecar_name("new.wav")).is_file());
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn reclaim_after_is_eight_days() {
-        assert_eq!(RECLAIM_AFTER, Duration::from_secs(8 * 24 * 60 * 60));
-    }
 }

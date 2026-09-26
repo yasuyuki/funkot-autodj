@@ -42,6 +42,18 @@ use serde_json::json;
 // modes mutually exclusive, which is why neither carries a `conflicts_with`.
 #[command(group(ArgGroup::new("click_modes").args(["label_sections", "survey"]).multiple(false)))]
 struct Args {
+    /// Accept and release this exact generated WAV, then reclaim it immediately
+    #[arg(long, value_name = "FILE", requires_all = ["generation", "accepted_proof", "released_proof"], conflicts_with_all = ["render", "dump_wav", "render_clips", "gen_test_fixtures", "list", "files"])]
+    artifact_complete: Option<PathBuf>,
+    #[arg(long, requires = "artifact_complete")]
+    generation: Option<String>,
+    #[arg(long, requires = "artifact_complete")]
+    artifact_receipt: Option<PathBuf>,
+    #[arg(long, requires = "artifact_complete")]
+    accepted_proof: Option<String>,
+    #[arg(long, requires = "artifact_complete")]
+    released_proof: Option<String>,
+
     /// Audio files in play order
     files: Vec<PathBuf>,
 
@@ -301,6 +313,19 @@ fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let mut args = Args::parse();
+    if let Some(output) = &args.artifact_complete {
+        let generation = args.generation.as_deref().expect("required by clap");
+        let receipt = funkot_core::owned_wav::complete(
+            output, generation, args.artifact_receipt.as_deref(),
+            args.accepted_proof.as_deref().expect("required by clap"),
+            args.released_proof.as_deref().expect("required by clap"),
+        )?;
+        println!("{}", serde_json::json!({"reclaimed": true, "generation": generation, "receipt": receipt}));
+        return Ok(());
+    }
+
+    let checkout = funkot_core::owned_wav::Checkout::this();
+    let _owner = checkout.open(std::time::SystemTime::now());
     if args.removed_lpf_hz.is_some() {
         bail!("--lpf-hz has been removed because it named the inverse filter; use --highpass-hz HZ instead");
     }

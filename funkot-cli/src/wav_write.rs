@@ -136,6 +136,7 @@ fn quantize_tpdf(sample: f32, max_pos: i32, rng: &mut XorShift32) -> i32 {
 /// Streaming WAV writer for interleaved stereo f32 chunks.
 pub struct WavStreamWriter {
     format: WavFormat,
+    generation: funkot_core::owned_wav::Generation,
     writer: hound::WavWriter<BufWriter<File>>,
     rng: XorShift32,
     pub stats: PeakStats,
@@ -144,10 +145,12 @@ pub struct WavStreamWriter {
 impl WavStreamWriter {
     pub fn create(path: &Path, sample_rate: u32, format: WavFormat) -> Result<Self> {
         let spec = format.wav_spec(sample_rate);
-        let writer = hound::WavWriter::create(path, spec)
+        let generation = funkot_core::owned_wav::Generation::begin(path)?;
+        let writer = hound::WavWriter::create(generation.write_path(), spec)
             .with_context(|| format!("failed to create WAV {}", path.display()))?;
         Ok(Self {
             format,
+            generation,
             writer,
             rng: XorShift32::new(0xF01D_CAFE),
             stats: PeakStats::default(),
@@ -188,9 +191,10 @@ impl WavStreamWriter {
         Ok(())
     }
 
-    pub fn finalize(self) -> Result<PeakStats> {
+    pub fn finalize(mut self) -> Result<PeakStats> {
         let stats = self.stats;
         self.writer.finalize().context("failed to finalize WAV")?;
+        self.generation.finish()?;
         Ok(stats)
     }
 }

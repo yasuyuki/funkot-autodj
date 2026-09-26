@@ -117,6 +117,7 @@ fn render_two_tracks_end_to_end() {
         .expect("spawn");
     assert!(status.success(), "exit status {status}");
     assert!(out.is_file(), "out.wav missing");
+    assert_held_receipt(&out);
 
     // Prepare both tracks before CPU-speed rendering: this tests clip output,
     // not whether a background decoder wins a wall-clock race. Streaming loader
@@ -125,6 +126,7 @@ fn render_two_tracks_end_to_end() {
     let transitions_dir = dir.join("out_transitions");
     let entries: Vec<_> = fs::read_dir(&transitions_dir)
         .expect("read transitions dir")
+        .filter(|entry| entry.as_ref().is_ok_and(|e| e.path().extension().is_some_and(|x| x == "wav")))
         .collect();
     assert_eq!(
         entries.len(),
@@ -133,6 +135,7 @@ fn render_two_tracks_end_to_end() {
         entries.len()
     );
     let clip_path = entries[0].as_ref().unwrap().path();
+    assert_held_receipt(&clip_path);
     let clip_reader = hound::WavReader::open(&clip_path).expect("open clip");
     let spec = clip_reader.spec();
     assert_eq!(spec.channels, 2);
@@ -414,6 +417,7 @@ fn label_sections_render_clips_writes_expected_clip_lengths() {
     let entries: Vec<_> = fs::read_dir(&clips_dir)
         .expect("read clips dir")
         .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "wav"))
         .collect();
     assert_eq!(
         entries.len(),
@@ -550,4 +554,47 @@ fn label_sections_render_clips_skips_already_labeled_tracks() {
 fn write_minimal_wav(path: &Path) {
     // Tiny valid WAV so path existence checks pass; render tests use synth tracks.
     write_wav(path, &synth_track(180.0, 1, 1, 1, 8_000)).expect("minimal wav");
+}
+
+#[cfg(target_os = "linux")]
+fn assert_held_receipt(output: &Path) {
+    let receipt = output.with_file_name(format!(".{}.owned", output.file_name().unwrap().to_str().unwrap()));
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(receipt).expect("ownership receipt")).unwrap();
+    assert_eq!(value["state"], "held");
+    assert_eq!(value["hold"], false);
+    assert_eq!(value["output"], output.to_str().unwrap());
+    assert_eq!(value["sha256"].as_str().unwrap().len(), 64);
+    assert!(value["accepted_proof"].is_null());
+}
+#[cfg(not(target_os = "linux"))]
+fn assert_held_receipt(_output: &Path) {}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn exact_cli_completion_retains_evidence_and_protects_manual_output() {
+    use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
+    let dir = temp_dir("owner_complete"); let output = dir.join("out.wav");
+    let mut writer = WavStreamWriter::create(&output, 8000, WavFormat::F32).unwrap();
+    writer.write_interleaved(&[0.1, 0.1, 0.2, 0.2]).unwrap(); writer.finalize().unwrap();
+    assert_held_receipt(&output);
+    let receipt = dir.join(".out.wav.owned");
+    let before: serde_json::Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    let generation = before["generation"].as_str().unwrap();
+    let missing = bin().arg("--artifact-complete").arg(&output).args(["--generation", generation]).output().unwrap();
+    assert!(!missing.status.success()); assert!(output.exists());
+    let done = bin().arg("--artifact-complete").arg(&output)
+        .args(["--generation", generation, "--accepted-proof", "test:accepted", "--released-proof", "test:released"])
+        .output().unwrap();
+    assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    let response: serde_json::Value = serde_json::from_slice(&done.stdout).unwrap();
+    assert_eq!(response["reclaimed"], true); assert!(!output.exists());
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(after["state"], "reclaimed"); assert_eq!(after["sha256"], before["sha256"]);
+    assert_eq!(after["identity"], before["identity"]);
+    fs::write(&output, b"manual replacement").unwrap();
+    let repeated = bin().arg("--artifact-complete").arg(&output)
+        .args(["--generation", generation, "--accepted-proof", "test:accepted", "--released-proof", "test:released"])
+        .output().unwrap();
+    assert!(!repeated.status.success()); assert_eq!(fs::read(&output).unwrap(), b"manual replacement");
+    fs::remove_dir_all(dir).unwrap();
 }

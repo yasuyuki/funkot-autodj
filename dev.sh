@@ -26,8 +26,12 @@ fi
 
 IMAGE=funkot-autodj-dev
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    docker build -t "$IMAGE" .
+# Refresh the image when its declared dependencies change, including an old
+# image built before this label existed.
+DOCKERFILE_SHA=$(sha256sum Dockerfile | cut -d ' ' -f 1)
+IMAGE_DOCKERFILE_SHA=$(docker image inspect --format '{{ index .Config.Labels "org.funkot.dev-dockerfile" }}' "$IMAGE" 2>/dev/null || true)
+if [ "$IMAGE_DOCKERFILE_SHA" != "$DOCKERFILE_SHA" ]; then
+    docker build --label "org.funkot.dev-dockerfile=$DOCKERFILE_SHA" -t "$IMAGE" . >&2
 fi
 
 # Host CPU count → container cargo/test parallelism.
@@ -66,33 +70,27 @@ fi
 #
 # DEV_BIND_*: same-path (or remapped) bind for music dirs outside the repo
 # (work.sh playlists with /mnt/c/... paths). Quoted -v keeps spaces safe.
-if [ -n "${DEV_BIND_SRC:-}" ]; then
-    exec docker run --rm -i \
-        -v "$PWD":/work \
-        -v "$DEV_BIND_SRC:${DEV_BIND_DST:-$DEV_BIND_SRC}:ro" \
-        -v funkot-cargo-registry:/usr/local/cargo/registry \
-        -v funkot-target:/work/target \
-        -e CARGO_TERM_COLOR=never \
-        -e FUNKOT_TESTDATA_DIR="${FUNKOT_TESTDATA_DIR:-}" \
-        -e HOST_UID="$(id -u)" \
-        -e HOST_GID="$(id -g)" \
-        -e CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
-        -e RUST_TEST_THREADS="$RUST_TEST_THREADS" \
-        -e CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" \
-        -e CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
-        "$IMAGE" sh -c '"$@"; status=$?; '"$CHOWN_WORK"'; exit $status' -- "$@"
-fi
-
-exec docker run --rm -i \
-    -v "$PWD":/work \
+# Preserve the command as argv throughout: no shell evaluation of context or
+# user arguments. Build Docker options before the image/command boundary.
+set -- "$IMAGE" sh -c '"$@"; status=$?; '"$CHOWN_WORK"'; exit $status' -- "$@"
+set -- -v "$PWD":/work \
     -v funkot-cargo-registry:/usr/local/cargo/registry \
     -v funkot-target:/work/target \
     -e CARGO_TERM_COLOR=never \
     -e FUNKOT_TESTDATA_DIR="${FUNKOT_TESTDATA_DIR:-}" \
-    -e HOST_UID="$(id -u)" \
-    -e HOST_GID="$(id -g)" \
+    -e FUNKOT_SOURCE_REVISION="$(git rev-parse HEAD)" \
+    -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     -e CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
     -e RUST_TEST_THREADS="$RUST_TEST_THREADS" \
     -e CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" \
-    -e CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
-    "$IMAGE" sh -c '"$@"; status=$?; '"$CHOWN_WORK"'; exit $status' -- "$@"
+    -e CARGO_INCREMENTAL="$CARGO_INCREMENTAL" "$@"
+if [ -n "${DEV_BIND_SRC:-}" ]; then
+    set -- -v "$DEV_BIND_SRC:${DEV_BIND_DST:-$DEV_BIND_SRC}:ro" "$@"
+fi
+if [ -n "${WORKSPACE_LIFECYCLE_CONTEXT:-}" ]; then
+    # Registration runs on the host with the supervisor's existing lease.
+    # The container receives only a fixed run-scoped registration socket,
+    # its task checkout, and its external owner receipt directory.
+    exec python3 tools/dev_owner_context.py run "$@"
+fi
+exec docker run --rm -i "$@"
