@@ -571,6 +571,10 @@ fn adjacent_delta(samples: &[f32], frame: usize) -> f32 {
     (samples[i] - samples[i - 2]).abs().max((samples[i + 1] - samples[i - 1]).abs())
 }
 
+fn sine_adjacent_delta_bound(freq_hz: f64, sr: u32, amp: f32) -> f32 {
+    (2.0 * f64::from(amp) * (std::f64::consts::PI * freq_hz / f64::from(sr)).sin()) as f32
+}
+
 fn handoff_metrics(samples: &[f32], center: usize, span: usize) -> (f32, f32, f32, f32, f32, f32, bool) {
     let window = 4096usize;
     let ordinary_start = center.saturating_sub(span + window);
@@ -604,8 +608,8 @@ fn handoff_metrics(samples: &[f32], center: usize, span: usize) -> (f32, f32, f3
 }
 
 /// The complex transition used the HPF on the opposite routes immediately on
-/// either side of `fade_in_end`.  A 10 ms complementary handoff must keep the
-/// central, start, and end adjacent deltas within ordinary waveform deltas for
+/// either side of `fade_in_end`.  A one-beat complementary handoff must keep
+/// its central, start, and end adjacent deltas within ordinary waveform deltas for
 /// both bass-to-treble and treble-to-bass source orders.
 #[test]
 fn hpf_route_handoff_has_no_central_step_and_is_chunk_independent() {
@@ -640,7 +644,7 @@ fn hpf_route_handoff_has_no_central_step_and_is_chunk_independent() {
         head_only_secs: None,
     };
     let prepared = prepare_tracks_parallel(&options, &[low_path, high_path], 1).expect("prepare once");
-    let handoff_span = (0.010 * f64::from(sr)).round() as usize;
+    let handoff_span = (options.bar_frames() / f64::from(BEATS_PER_BAR)).round() as usize;
     assert!(handoff_span >= 2);
 
     let mut violations = Vec::new();
@@ -659,16 +663,22 @@ fn hpf_route_handoff_has_no_central_step_and_is_chunk_independent() {
         assert!(center > handoff_span && center + 2 < one_raw.len() / 2, "{name}: boundary in output");
         let (start, central, end, handoff_max, p99, normal_max, healthy) =
             handoff_metrics(&one_raw, center, handoff_span);
-        // The ordinary window is directly before the handoff and has the same
-        // routes/gains.  The blend can add at most 2*amp/(span-1) per deck:
-        // one weight increment times the maximum raw-vs-HPF gap (2*amp).
+        // Each settled Butterworth HPF component has no greater sine amplitude
+        // than its raw input.  A channel therefore changes by at most the low
+        // and high tone slopes, 2*amp/(span-1) for each blended deck, and the
+        // linear fade-in envelope change across the same frame.
+        let tone_slope_bound = sine_adjacent_delta_bound(247.0, sr, amp)
+            + sine_adjacent_delta_bound(988.0, sr, amp);
         let blend_slope_allowance = 4.0 * amp / (handoff_span - 1) as f32;
-        let bound = normal_max + blend_slope_allowance;
+        let fade_frames = center - one_t;
+        let envelope_slope_allowance = amp / (fade_frames - 1) as f32;
+        let bound = tone_slope_bound + blend_slope_allowance + envelope_slope_allowance;
+        assert!(normal_max <= bound, "{name}: normal delta exceeds analytic bound");
         if !healthy { violations.push(format!("{name}: non-finite or clipping output")); }
-        if central > bound { violations.push(format!("{name}: central delta={central} exceeds ordinary max={normal_max}, p99={p99}")); }
+        if central > bound { violations.push(format!("{name}: central delta={central} exceeds analytic bound={bound}, normal max={normal_max}, p99={p99}")); }
         if start > bound { violations.push(format!("{name}: handoff-start delta={start} exceeds bound={bound}")); }
         if end > bound { violations.push(format!("{name}: handoff-end delta={end} exceeds bound={bound}")); }
-        if handoff_max > bound { violations.push(format!("{name}: handoff max delta={handoff_max} exceeds ordinary max={normal_max}")); }
+        if handoff_max > bound { violations.push(format!("{name}: handoff max delta={handoff_max} exceeds analytic bound={bound}")); }
         one.stop();
         block.stop();
     }

@@ -197,7 +197,7 @@ const PHASE_ALIGN_HAT_WEIGHT: f64 = 0.40;
 const PHASE_ALIGN_FINE_BEATS: f64 = 0.5;
 /// Ignore the adjustment when the best normalized correlation is below this.
 const PHASE_ALIGN_MIN_CORR: f64 = 0.45;
-/// Shared preview/upgrade/transition-route de-click duration.
+/// Shared preview/upgrade/tail de-click duration.
 const HEAD_DECLICK_SECS: f64 = 0.010;
 /// Bars before file end used as the sparse outro-tail phase anchor.
 const OUTRO_TAIL_ANCHOR_BARS: u32 = 4;
@@ -685,7 +685,7 @@ struct UpgradeFade {
 struct ActiveTransition {
     frames_into: u64,
     fade_in_end: u64,
-    /// Start of the cached 10 ms raw/HPF handoff before `fade_in_end`.
+    /// Start of the cached one-beat raw/HPF handoff before `fade_in_end`.
     handoff_start: u64,
     fade_out_start: u64,
     fade_out_end: u64,
@@ -2029,7 +2029,7 @@ impl Engine {
 
         let (fade_in_end, fade_out_start, fade_out_end) =
             (plan.fade_in_end, plan.fade_out_start, plan.fade_out_end);
-        let handoff_start = hpf_handoff_start(fade_in_end, self.options.output_sample_rate);
+        let handoff_start = hpf_handoff_start(fade_in_end, self.bar_frames);
 
         self.pending_events.push(EngineEvent::TransitionStarted {
             from: from_path,
@@ -2495,7 +2495,7 @@ impl Engine {
 
         self.prev = Some(prev_deck);
         self.active = Some(next_deck);
-        let handoff_start = hpf_handoff_start(fade_in_end, self.options.output_sample_rate);
+        let handoff_start = hpf_handoff_start(fade_in_end, self.bar_frames);
         self.transition = Some(ActiveTransition {
             frames_into: 0,
             fade_in_end,
@@ -2539,8 +2539,8 @@ impl Engine {
 
         let mut mix_l = 0.0f32;
         let mut mix_r = 0.0f32;
-        // Move each deck onto its post-fade-in route over the existing shared
-        // de-click span.  The last handoff frame is already fully on that
+        // Move each deck onto its post-fade-in route over one target-tempo beat.
+        // The last handoff frame is already fully on that
         // route, so the original `fade_in_end` boundary has no route step.
         let handoff_weight = if in_trans && !simple
             && frames_into >= handoff_start && frames_into < fade_in_end {
@@ -3201,10 +3201,11 @@ fn declick_frames(sample_rate: u32) -> u64 {
     (HEAD_DECLICK_SECS * f64::from(sample_rate)).round().max(2.0) as u64
 }
 
-/// Start the shared 10 ms raw/HPF handoff before the existing fade-in end.
+/// Start the cached one-beat raw/HPF handoff before the existing fade-in end.
 #[inline]
-fn hpf_handoff_start(fade_in_end: u64, sample_rate: u32) -> u64 {
-    fade_in_end.saturating_sub(declick_frames(sample_rate).min(fade_in_end))
+fn hpf_handoff_start(fade_in_end: u64, bar_frames: f64) -> u64 {
+    let beat = (bar_frames / f64::from(BEATS_PER_BAR)).round().max(1.0) as u64;
+    fade_in_end.saturating_sub(beat.min(fade_in_end))
 }
 
 /// Prepare every playlist path, optionally in parallel.
@@ -3770,24 +3771,30 @@ mod tests {
     }
 
     #[test]
-    fn hpf_handoff_weights_are_complementary_and_clamp_to_short_fade() {
-        let end = 10_000u64;
-        let span = declick_frames(48_000);
-        let start = hpf_handoff_start(end, 48_000);
-        assert_eq!(start, end - span);
-        assert_eq!(fade_in_gain(0, end - start), 0.0);
-        assert_eq!(fade_in_gain(end - 1 - start, end - start), 1.0);
-        for frame in [start, start + span / 2, end - 1] {
-            let w = fade_in_gain(frame - start, end - start);
-            assert_eq!(w + (1.0 - w), 1.0, "frame={frame}");
-        }
+    fn hpf_handoff_weights_follow_one_beat_and_clamp_to_short_fade() {
+        for (bar_frames, expected_span) in [
+            (48_000.0 * 60.0 / 198.0 * 4.0, 14_545u64),
+            (44_100.0 * 60.0 / 180.0 * 4.0, 14_700u64),
+        ] {
+            let end = 100_000u64;
+            let start = hpf_handoff_start(end, bar_frames);
+            let span = end - start;
+            assert_eq!(span, expected_span);
+            assert_eq!(fade_in_gain(0, span), 0.0);
+            assert_eq!(fade_in_gain(span - 1, span), 1.0);
+            let weights: Vec<_> = (0..span).map(|i| fade_in_gain(i, span)).collect();
+            assert!(weights.windows(2).all(|pair| pair[0] <= pair[1]));
+            for &w in &[weights[0], weights[span as usize / 2], *weights.last().unwrap()] {
+                assert_eq!(w + (1.0 - w), 1.0);
+            }
 
-        // A fade shorter than the normal 10 ms span uses every available
-        // frame and retains bit-exact 0/1 endpoints.
-        let short_start = hpf_handoff_start(2, 48_000);
-        assert_eq!(short_start, 0);
-        assert_eq!(fade_in_gain(0, 2), 0.0);
-        assert_eq!(fade_in_gain(1, 2), 1.0);
+            // A fade shorter than one beat uses every available frame and retains
+            // bit-exact 0/1 endpoints.
+            let short_start = hpf_handoff_start(2, bar_frames);
+            assert_eq!(short_start, 0);
+            assert_eq!(fade_in_gain(0, 2), 0.0);
+            assert_eq!(fade_in_gain(1, 2), 1.0);
+        }
     }
 
     #[test]
