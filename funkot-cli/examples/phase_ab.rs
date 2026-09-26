@@ -152,12 +152,17 @@ fn render(
         );
         let side_label = side.label();
         let name = format!("{stem}_{side_label}{bars:03}_plus{offset}beat.wav");
-        let ((), claimed) = owned.write_owned(out_dir, &name, SystemTime::now(), |p| {
-            let mut w = WavStreamWriter::create(p, buf.sample_rate, WavFormat::F32)?;
-            w.write_interleaved(&clip)?;
-            w.finalize()?;
-            Ok(())
-        })?;
+        let ((), claimed) = owned.write_owned(
+            out_dir,
+            &name,
+            SystemTime::now(),
+            |p| -> Result<(), Box<dyn std::error::Error>> {
+                let mut w = WavStreamWriter::create(p, buf.sample_rate, WavFormat::F32)?;
+                w.write_interleaved(&clip)?;
+                w.finalize()?;
+                Ok(())
+            },
+        )?;
         println!(
             "  {}  nominal={nominal} locked={locked} (+{offset} beat) [{claimed}]",
             out_dir.join(&name).display()

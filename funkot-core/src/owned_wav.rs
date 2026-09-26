@@ -998,6 +998,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_root_is_refused() {
         let repo = temp_repo("symlink-root");
@@ -1024,6 +1025,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_wav_at_claimed_name_is_kept_not_regular() {
         let repo = temp_repo("symlink-wav");
