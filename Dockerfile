@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang-dev \
     # ALSA headers + pkg-config for cpal on Linux
     pkg-config \
+    # Optional managed WAV generation uses a fixed Python socket client.
+    python3 \
     libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 

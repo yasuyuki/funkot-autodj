@@ -1,14 +1,16 @@
 # gitignore 対象データの分類と再生成
 
-このリポジトリの ignore 対象は、消えたときのコストで5つに分かれる。**保護するのは
-「再生成不可」だけで、残りは1バイトも守らない。** 迷ったらこの表に戻る。
+このリポジトリの ignore 対象は、消えたときのコストで5つに分かれる。再生成可能であること
+だけでは削除の根拠にならない。以下の「消してよい」は、受入と最終利用終了を確認し、
+生成条件・結果・必要なハッシュを保存し、明示的な保持指定がない場合に限る。
+未受入の成果物、利用中の共有キャッシュ、再生成不可のデータは保持する。
 
 `testdata/` の現物の目録は `testdata/README.md`（これ自体も ignore 対象）にある。
 本書は分類と再生成手順の正で、`testdata/README.md` はいまローカルに何があるかの索引。
 
 | クラス | 対象 | 扱い |
 |---|---|---|
-| A 再生成可能 | `target*/`、`dist/`、`funkot-core/tests/fixtures/*.wav` | 消してよい。下のコマンドで戻る。ツール所有の合成 WAV は 8 日（`RECLAIM_AFTER`）で回収され、`.owned` sidecar を消すとその WAV は残る |
+| A 再生成可能 | `target*/`、`dist/`、`funkot-core/tests/fixtures/*.wav` | 消してよい。下のコマンドで戻る。新しく生成した WAV は生成前に所有 receipt を保存し、受入と最終利用終了の明示後に回収する。経過時間では削除しない |
 | B 外部から再取得 | 原盤（実音源） | **リポジトリに置かない。** `FUNKOT_TESTDATA_DIR` で音楽ライブラリを指す |
 | C 高コストな派生 | `testdata/phase_ab/`、`testdata/click_*/`、`testdata/opus_s1/`、`testdata/synth/`、`whitelabel2022fall-b_transitions/` | 消してよい。`synth/` 以外の再生成には原盤が要る。`synth/` は `gen_synth` だけで戻る |
 | D 自動キャッシュ（manual 値は下記を参照） | `funkot-cache/`、`testdata/cache/`、`testdata/real-cache-v*/` | 消してよい。温め直す |
@@ -128,3 +130,50 @@ JSON 編集、cache/lock の削除は稼働中に混在させない。更新前�
 `purge_auto` を使う（最新の手動値を保持し `needs_reanalysis` を立てる）。cache directory の
 全削除を手動値のバックアップと取り違えない。labels/survey と同様、手動値を唯一保持する
 ファイルは private に保全する。CACHE_VERSION、content_hash、ラベルのキーは変更していない。
+
+## WAV 生成物の受入と回収
+
+Linux では `--render`、`--dump-wav`、遷移クリップ、`--render-clips`、
+`gen_synth`、`phase_ab`、`--gen-test-fixtures` が、新しい出力だけを生成前に所有する。
+生成成功は受入ではない。receipt の `state=held` は受入待ちであり、明示された
+`hold=true` は受入・終了の証拠があっても回収を拒否する。
+task 連携のない通常の CLI レンダーは既存ファイルへ従来どおり上書きできるが、
+既存ファイルや旧 receipt を所有物へ取り込まない。`write_owned` を使う合成音源・fixture
+生成器、および managed task の生成では、既存出力や旧 receipt があれば書込前に拒否する。
+未受入の出力や手動ファイルを再生成によって破壊しないため、新しい生成先を選ぶか、
+以前の所有世代の受入・利用終了を完了させる。
+原盤との重なり、symlink、checkout 内の別 mount・nested repository は所有対象外。
+hardlink、内容または inode の変化、実行中 writer は回収を拒否する。
+Linux 以外は安全な native owner が未実装のため、出力を保持して診断する。
+
+通常の task lifecycle が owner receipt の登録先と callback を提供すると、receipt は
+checkout 外へ保存され、task の受入・最終利用終了時に owner callback が回収する。
+公開コードは private runtime を必須依存にしない。連携のない実行では出力と同じ directory の
+`.NAME.wav.owned` が receipt となる。出力・generation・receipt は生成時の stderr に表示される。
+明示的な完了入口は `--artifact-complete FILE --generation ID --accepted-proof TEXT
+--released-proof TEXT`。外部 receipt は `--artifact-receipt FILE` で指定する。
+proof は受入結果と最後の利用終了を実際に確認した記録への参照であり、レンダー成功だけでは足りない。
+
+完了入口は証拠を `pending` として durable に保存してから即時回収する。同じ owner の
+次回起動で、固定の生成先、再び開いた出力 directory、または task に指定された receipt
+保存先にある `pending` を再試行する。ファイル探索による一般的な掃除は行わない。
+生成途中の中断は `writing` のまま保持し、自動受入しない。
+削除後も SHA-256、実行中 executable の SHA-256 と取得可能な source revision、入力 argv、生成 ID、file identity、allocated bytes、
+受入・利用終了の証拠と結果を receipt に残す。receipt を消すことは完了操作ではない。
+owner が出力を退避したあとに別ファイルが同名で現れた場合も、両方を保持して完了を拒否する。
+
+`WORKSPACE_LIFECYCLE_CONTEXT` は JSON 文字列で、任意の連携フィールドは
+`owner_receipt_dir`（既存の外部 directory）、`owner_receipt_argv`（登録コマンドの argv）、
+`owner_completion_argv`（main CLI を呼ぶ argv）である。登録コマンドは生成前に
+`--owner funkot-wav --generation ID --output FILE --receipt RECEIPT --completion-json JSON`
+を受け取る。completion argv 内の `{result_ref}` は task の受入・終了記録への参照に置換する。
+main CLI は既定で自身の実行ファイルを callback に使う。example は main CLI の argv を
+明示設定する必要がある。callback は checkout / build 出力の退役より前に実行する。
+`dev.sh` は managed context がある場合、同じ絶対パスへ task checkout と外部 receipt directory
+を bind し、通常の相対出力を host と対応させる。`/work` を含む container 専用の絶対出力は
+登録を拒否する。生成時の登録だけを、実行中に限った private Unix socket で host に渡す。
+host は元の lifecycle lease と登録 argv を使い、受領側は durable な登録完了を待ってから
+出力する。任意のコマンド実行は受け付けず、common Git state や host PID namespace は
+container へ公開しない。container 終了後に socket を除去する。
+completion callback にも同じ task context を与え、checkout の退役より先に実行する。
+`FUNKOT_SOURCE_REVISION` は build 元を呼出側が確認済みの場合の明示的な revision 指定に使える。

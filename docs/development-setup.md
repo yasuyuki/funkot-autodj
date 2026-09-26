@@ -49,7 +49,12 @@ RUST_TEST_THREADS=1 ./dev.sh cargo test --workspace --release
 
 Notes:
 
-- The first run builds the `funkot-autodj-dev` image.
+- The first run, and the first run after a Dockerfile change, builds the `funkot-autodj-dev` image.
+- Optional managed WAV ownership uses host Python 3 and a short-lived local socket through `dev.sh`.
+  The container contains Python for the fixed registration client; it does not receive the host lifecycle
+  state or PID namespace. The ordinary unmanaged Docker workflow needs no lifecycle installation.
+  The bridge unit check is `python3 -B -m unittest discover -s tools -p test_dev_owner_context.py`.
+  See [WAV ownership](local-data.md#wav-生成物の受入と回収) for the receipt and completion contract.
 - CLI transition-clip tests use the existing `--jobs 2` prepare-first path. At accelerated render speed, the streaming loader can legitimately reach the end before the next track is ready; serial test scheduling alone did not make clip assertions deterministic.
 - Without a real audio library, tests that need external tracks may **skip** and the suite can still finish green.
 
