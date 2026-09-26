@@ -14,6 +14,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use funkot_cli::label_session::{
     bar_frames_for, boundary_frame_on_grid, build_candidate_clip_on_grid, click_grid,
@@ -21,6 +22,7 @@ use funkot_cli::label_session::{
     Side, NORMAL_HALF_WIDTH_BARS,
 };
 use funkot_cli::wav_write::{WavFormat, WavStreamWriter};
+use funkot_core::owned_wav::{Checkout, Opened};
 use funkot_core::{cache, decode::decode_file, TrackAnalysis};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,8 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     std::fs::create_dir_all(&out_dir)?;
+    let checkout = Checkout::this();
+    let owned = checkout.open(SystemTime::now());
     for p in &paths {
-        render(p, &cache_dir, &out_dir, bars, side, &offsets)?;
+        render(p, &cache_dir, &out_dir, bars, side, &offsets, &owned)?;
     }
     Ok(())
 }
@@ -67,6 +71,7 @@ fn render(
     bars: u32,
     side: Side,
     offsets: &[f64],
+    owned: &Opened<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let buf = decode_file(path)?;
     let analysis = cache::get_or_analyze(path, cache_dir, &buf)?;
@@ -146,13 +151,16 @@ fn render(
             shifted_grid,
         );
         let side_label = side.label();
-        let p = out_dir.join(format!("{stem}_{side_label}{bars:03}_plus{offset}beat.wav"));
-        let mut w = WavStreamWriter::create(&p, buf.sample_rate, WavFormat::F32)?;
-        w.write_interleaved(&clip)?;
-        w.finalize()?;
+        let name = format!("{stem}_{side_label}{bars:03}_plus{offset}beat.wav");
+        let ((), claimed) = owned.write_owned(out_dir, &name, SystemTime::now(), |p| {
+            let mut w = WavStreamWriter::create(p, buf.sample_rate, WavFormat::F32)?;
+            w.write_interleaved(&clip)?;
+            w.finalize()?;
+            Ok(())
+        })?;
         println!(
-            "  {}  nominal={nominal} locked={locked} (+{offset} beat)",
-            p.display()
+            "  {}  nominal={nominal} locked={locked} (+{offset} beat) [{claimed}]",
+            out_dir.join(&name).display()
         );
     }
     Ok(())
