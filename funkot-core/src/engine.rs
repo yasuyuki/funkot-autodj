@@ -1098,6 +1098,9 @@ pub struct Engine {
     pending_events: Vec<EngineEvent>,
     finished: bool,
     finished_emitted: bool,
+    /// Gain ramp only after resuming a naturally finished finite source.
+    /// Loader-wait silence must not consume these frames.
+    resume_fade: Option<(u64, u64)>,
     stopped: bool,
     /// Third loader permit (history / in-transition `prev`) armed after a slot exists.
     ///
@@ -1206,6 +1209,7 @@ impl Engine {
             pending_events: Vec::new(),
             finished: false,
             finished_emitted: false,
+            resume_fade: None,
             stopped: false,
             third_permit_armed: false,
             loader_exhausted: false,
@@ -1296,6 +1300,7 @@ impl Engine {
             pending_events: Vec::new(),
             finished: false,
             finished_emitted: false,
+            resume_fade: None,
             stopped: false,
             third_permit_armed: false,
             loader_exhausted: rest_empty,
@@ -1405,6 +1410,9 @@ impl Engine {
     /// Source replacement itself never restarts finished playback. stop() is terminal.
     pub fn resume(&mut self) -> bool {
         if self.stopped || self.future_fence.is_some() { return false; }
+        if self.finished {
+            self.resume_fade = Some((0, declick_frames(self.options.output_sample_rate)));
+        }
         self.finished = false;
         self.finished_emitted = false;
         true
@@ -1450,6 +1458,7 @@ impl Engine {
                 self.mark_finished();
                 return 0;
             } else {
+                if let Some((frame, _)) = self.resume_fade.as_mut() { *frame = 0; }
                 for s in out.iter_mut() {
                     *s = 0.0;
                 }
@@ -1480,6 +1489,7 @@ impl Engine {
                 if self.loader_exhausted && self.ready_ahead() == 0 {
                     self.mark_finished();
                 }
+                if let Some((frame, _)) = self.resume_fade.as_mut() { *frame = 0; }
                 for s in out[frames_done * 2..].iter_mut() {
                     *s = 0.0;
                 }
@@ -1584,6 +1594,7 @@ impl Engine {
     pub fn stop(&mut self) {
         self.cancel_pending_nav();
         self.stopped = true;
+        self.resume_fade = None;
         self.shutdown.store(true, Ordering::SeqCst);
         while let Ok(msg) = self.loader_rx.try_recv() {
             if let LoaderMsg::Failed { index, path, message } = msg {
@@ -2137,6 +2148,7 @@ impl Engine {
     }
 
     fn mark_finished(&mut self) {
+        self.resume_fade = None;
         self.finished = true;
         if !self.finished_emitted {
             self.finished_emitted = true;
@@ -2632,6 +2644,14 @@ impl Engine {
                 self.drop_prev();
                 self.transition = None;
             }
+        }
+
+        // Apply to this frame before retiring its deck or clearing on Finished.
+        if let Some((frame, span)) = self.resume_fade {
+            let gain = fade_in_gain(frame, span);
+            mix_l *= gain;
+            mix_r *= gain;
+            self.resume_fade = (frame + 1 < span).then_some((frame + 1, span));
         }
 
         let active_done = self
@@ -3579,10 +3599,111 @@ mod tests {
         assert!(engine.resume());
         let mut audio = [0.0; 2];
         assert_eq!(engine.render(&mut audio), 1);
-        assert!(audio[0] > 0.0);
+        assert_eq!(audio, [0.0; 2]);
         assert_eq!(engine.current_index(), Some(2));
         wait_future(&mut engine);
         assert_eq!(engine.next_track.as_ref().unwrap().playlist_index, 3);
+    }
+
+    #[test]
+    fn finished_resume_declick_waits_for_audio_and_preserves_time_and_chunks() {
+        for sample_rate in [44_100, 48_000] {
+            let span = declick_frames(sample_rate) as usize;
+            let frames = span + 19;
+            let mut track = upgrade_test_track("resume.wav", frames + 3, 0.0, 0.75, false);
+            track.playlist_index = 2;
+            track.first_downbeat_out = 3;
+            track.samples = Arc::new((0..frames + 3).flat_map(|i| {
+                let phase = i as f32 * 0.03;
+                [0.4 + 0.1 * phase.sin(), -0.3 + 0.1 * phase.cos()]
+            }).collect());
+            let reference: Vec<_> = track.samples[6..].iter().map(|x| x * track.gain_linear).collect();
+            let options = EngineOptions { output_sample_rate: sample_rate, ..EngineOptions::default() };
+            // Initial start and a redundant live resume retain the old PCM.
+            let mut fresh = Engine::from_prepared(options.clone(), vec![track.clone()]).unwrap();
+            assert!(fresh.resume());
+            let mut first = [0.0; 2];
+            assert_eq!(fresh.render(&mut first), 1);
+            assert_eq!(first.as_slice(), &reference[..2]);
+
+            let mut outputs = Vec::new();
+            for chunk in [1, 17, 4096] {
+                let mut engine = Engine::from_prepared(options.clone(), vec![future_track(1)]).unwrap();
+                engine.render(&mut [0.0; 128]);
+                assert!(engine.finished);
+                engine.poll_events();
+                // Controlled Ready arrival: hold the channel open with no track.
+                let (ready, rx) = mpsc::sync_channel(1);
+                engine.loader_rx = rx;
+                engine.loader_exhausted = false;
+                assert!(engine.resume());
+                for _ in 0..3 {
+                    let mut silence = [1.0; 32];
+                    assert_eq!(engine.render(&mut silence), 16);
+                    assert_eq!(silence, [0.0; 32]);
+                }
+                ready.send(LoaderMsg::Ready(track.clone())).unwrap();
+                let mut output = Vec::new();
+                while output.len() < reference.len() {
+                    // Repeated Play must not restart the ramp.
+                    assert!(engine.resume());
+                    let want = chunk.min((reference.len() - output.len()) / 2);
+                    let mut audio = vec![0.0; want * 2];
+                    assert_eq!(engine.render(&mut audio), want);
+                    output.extend(audio);
+                }
+                let starts: Vec<_> = engine.poll_events().into_iter().filter_map(|e| {
+                    if let EngineEvent::TrackStarted { index, .. } = e { Some(index) } else { None }
+                }).collect();
+                assert_eq!(starts, vec![2]);
+                assert_eq!(&output[..2], &[0.0; 2]);
+                assert_eq!(&output[(span - 1) * 2..], &reference[(span - 1) * 2..]);
+                for channel in 0..2 {
+                    let raw_step = reference.chunks_exact(2).map(|f| f[channel]).collect::<Vec<_>>()
+                        .windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+                    let peak = reference.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                    let bound = raw_step + peak / (span - 1) as f32;
+                    let step = output.chunks_exact(2).map(|f| f[channel]).collect::<Vec<_>>()
+                        .windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+                    assert!(step <= bound + f32::EPSILON);
+                    assert!(reference[channel].abs() > bound);
+                }
+                outputs.push(output);
+            }
+            assert!(outputs.windows(2).all(|w| w[0] == w[1]));
+        }
+    }
+
+    #[test]
+    fn finished_resume_short_track_wait_and_final_frame_keep_the_ramp() {
+        let mut engine = future_engine(&[1]);
+        engine.render(&mut [0.0; 128]);
+        let (ready, rx) = mpsc::sync_channel(1);
+        engine.loader_rx = rx;
+        engine.loader_exhausted = false;
+        let short = upgrade_test_track("short.wav", 4, 0.5, 1.0, false);
+        ready.send(LoaderMsg::Ready(short.clone())).unwrap();
+        assert!(engine.resume());
+        let mut first = [0.0; 8];
+        assert_eq!(engine.render(&mut first), 4);
+        assert_eq!(first[0], 0.0);
+        assert!(first[6] > 0.0 && first[6] < 0.5);
+        // No Ready next: actual zero output restarts the ramp, not half gain.
+        let mut silence = [1.0; 4];
+        assert_eq!(engine.render(&mut silence), 2);
+        assert_eq!(silence, [0.0; 4]);
+        ready.send(LoaderMsg::Ready(short)).unwrap();
+        engine.poll_events();
+        ready.send(LoaderMsg::Exhausted).unwrap();
+        let mut second = [0.0; 8];
+        assert_eq!(engine.render(&mut second), 4);
+        assert_eq!(second, first);
+        assert!(engine.finished);
+        assert!(engine.resume_fade.is_none());
+        assert!(engine.resume());
+        engine.stop();
+        assert!(engine.resume_fade.is_none());
+        assert!(!engine.resume());
     }
 
     #[test]
