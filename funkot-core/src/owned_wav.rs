@@ -41,7 +41,7 @@ pub fn write_owned<T, E>(checkout: &Checkout, dir: &Path, name: &str, _now: Syst
 where E: From<io::Error> {
     valid_name(name).map_err(E::from)?;
     let mut owned = Generation::begin_at(&dir.join(name), &checkout.repo).map_err(E::from)?;
-    if owned.owned.is_none() {
+    if owned.owned.is_none() && owned.reason != "native safe ownership unavailable; retained" {
         return Err(invalid(&format!("owned generator refused protected output: {}", owned.reason)).into());
     }
     let value = write(owned.write_path())?;
@@ -84,7 +84,9 @@ impl Generation {
     }
     fn begin_with_context(output: &Path, repo: &Path, context: Option<Context>) -> io::Result<Self> {
         #[cfg(not(target_os = "linux"))]
-        { let _ = (repo, context); return Ok(Self::unclaimed(output, "native safe ownership unavailable; retained".into())); }
+        { let _ = repo;
+            if context.is_some() { return Err(invalid("native safe ownership unavailable; managed generation refused")); }
+            return Ok(Self::unclaimed(output, "native safe ownership unavailable; retained".into())); }
         #[cfg(target_os = "linux")]
         {
             // Nested stream writer within write_owned already has an owned inode.
@@ -647,4 +649,30 @@ grep -q '"state": "writing"' "$receipt"
         assert!(status.success());
     }
 
+}
+
+#[cfg(test)]
+mod portable_writes_tests {
+    use super::*;
+    #[test]
+    fn standalone_generator_still_writes_on_unsupported_platforms() {
+        let repo = tempfile::tempdir().unwrap();
+        let checkout = Checkout::at(repo.path());
+        let (_, result) = write_owned(&checkout, repo.path(), "portable.wav", SystemTime::now(),
+            |path| fs::write(path, b"RIFF portable")).unwrap();
+        assert_eq!(fs::read(repo.path().join("portable.wav")).unwrap(), b"RIFF portable");
+        #[cfg(target_os = "linux")]
+        assert!(matches!(result, Claimed::Yes { .. }));
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(result, Claimed::No(reason) if reason == "native safe ownership unavailable; retained"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unsupported_managed_generation_refuses_before_writing() {
+        let repo = tempfile::tempdir().unwrap();
+        let output = repo.path().join("managed.wav");
+        let context = Context { owner_receipt_dir: repo.path().into(), owner_receipt_argv: vec![], owner_completion_argv: None };
+        assert!(Generation::begin_with_context(&output, repo.path(), Some(context)).is_err());
+        assert!(!output.exists());
+    }
 }
