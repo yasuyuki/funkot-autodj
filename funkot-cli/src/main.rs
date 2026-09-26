@@ -701,7 +701,7 @@ fn print_event(
     analysis: &mut AnalysisPrinter,
 ) {
     match event {
-        EngineEvent::TrackStarted { index, path } => {
+        EngineEvent::TrackStarted { index, path, .. } => {
             play_elapsed.on_track_started();
             println!(
                 "> now playing [{}/{}] {}  {} (+{})",
@@ -713,7 +713,7 @@ fn print_event(
             );
             analysis.on_track_started(path);
         }
-        EngineEvent::TransitionStarted { from, to } => {
+        EngineEvent::TransitionStarted { from, to, .. } => {
             println!("~ transition: {} -> {}", file_name(from), file_name(to));
         }
         EngineEvent::TrackFailed { path, message, .. } => {
@@ -1018,7 +1018,7 @@ fn run_render(
             if matches!(event, EngineEvent::TrackStarted { .. }) {
                 seen_track_started = true;
             }
-            if let EngineEvent::TransitionStarted { from, to } = &event {
+            if let EngineEvent::TransitionStarted { from, to, .. } = &event {
                 transitions_started.push((from.clone(), to.clone()));
             }
             print_event(&event, playlist_len, &mut play_elapsed, &mut analysis);

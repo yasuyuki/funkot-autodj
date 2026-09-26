@@ -45,10 +45,14 @@ pub enum NavAction {
 }
 
 /// Events emitted by the engine (and loader failures).
+///
+/// `entry_frame_out` is the phase-corrected and clamped start frame actually
+/// adopted by the deck in the stretched/output domain. Convert it to seconds
+/// with [`EngineOptions::output_sample_rate`].
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    TrackStarted { index: usize, path: PathBuf },
-    TransitionStarted { from: PathBuf, to: PathBuf },
+    TrackStarted { index: usize, path: PathBuf, entry_frame_out: u64 },
+    TransitionStarted { from: PathBuf, to: PathBuf, entry_frame_out: u64 },
     TrackFailed { index: usize, path: PathBuf, message: String },
     Finished,
 }
@@ -2045,11 +2049,13 @@ impl Engine {
         self.pending_events.push(EngineEvent::TransitionStarted {
             from: from_path,
             to: to_path.clone(),
+            entry_frame_out: entry,
         });
         if !same_track {
             self.pending_events.push(EngineEvent::TrackStarted {
                 index: next_index,
                 path: to_path,
+                entry_frame_out: entry,
             });
         }
 
@@ -2345,7 +2351,7 @@ impl Engine {
             upgrade_fade: None,
         });
         self.pending_events
-            .push(EngineEvent::TrackStarted { index, path });
+            .push(EngineEvent::TrackStarted { index, path, entry_frame_out: playhead });
         self.kick_phase_align_if_needed();
     }
 
@@ -2499,10 +2505,12 @@ impl Engine {
         self.pending_events.push(EngineEvent::TransitionStarted {
             from: from_path,
             to: to_path.clone(),
+            entry_frame_out: entry,
         });
         self.pending_events.push(EngineEvent::TrackStarted {
             index: next_index,
             path: to_path,
+            entry_frame_out: entry,
         });
 
         self.prev = Some(prev_deck);
@@ -3538,6 +3546,36 @@ mod tests {
         let mut engine = Engine::from_prepared(EngineOptions::default(), indices.iter().map(|i| future_track(*i)).collect()).unwrap();
         engine.set_realtime(true);
         engine
+    }
+
+    #[test]
+    fn realtime_auto_transition_reports_the_final_clamped_entry() {
+        let mut active = future_track(0);
+        active.frames = 8;
+        active.samples = Arc::new(vec![0.25; 16]);
+        active.first_downbeat_out = 0;
+        active.outro_start_out = 0;
+        active.outro_end_anchored_out = 0;
+        active.outro_bars = 0;
+
+        let mut next = future_track(1);
+        next.frames = 8;
+        next.samples = Arc::new(vec![0.5; 16]);
+        next.first_downbeat_out = 7;
+        next.intro_bars = 0;
+
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![active, next]).unwrap();
+        engine.set_realtime(true);
+        let mut audio = [0.0; 2];
+        for _ in 0..8 {
+            engine.render(&mut audio);
+            if engine.poll_events().iter().any(|event| matches!(event,
+                EngineEvent::TransitionStarted { entry_frame_out: 7, .. }
+            )) {
+                return;
+            }
+        }
+        panic!("realtime transition did not report the final clamped entry");
     }
 
     // Private controlled decoder seam: production activation/channels/permits,

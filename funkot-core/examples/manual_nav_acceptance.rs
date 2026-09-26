@@ -236,8 +236,8 @@ fn track_marker_json(index: usize, track: &PreparedTrack) -> Value {
 
 fn event_json(event: &EngineEvent, files: &[PathBuf; 2]) -> Value {
     match event {
-        EngineEvent::TrackStarted { index, path } => json!({"kind": "track_started", "index": index, "track_id": track_index(path, files)}),
-        EngineEvent::TransitionStarted { from, to } => json!({"kind": "transition_started", "from_track_id": track_index(from, files), "to_track_id": track_index(to, files)}),
+        EngineEvent::TrackStarted { index, path, .. } => json!({"kind": "track_started", "index": index, "track_id": track_index(path, files)}),
+        EngineEvent::TransitionStarted { from, to, .. } => json!({"kind": "transition_started", "from_track_id": track_index(from, files), "to_track_id": track_index(to, files)}),
         // Loader messages can embed a source path, so keep only the stable track id.
         EngineEvent::TrackFailed { path, .. } => json!({"kind": "track_failed", "track_id": track_index(path, files)}),
         EngineEvent::Finished => json!({"kind": "finished"}),
