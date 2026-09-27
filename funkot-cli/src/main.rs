@@ -3579,7 +3579,7 @@ fn run_survey(
 fn gen_test_fixtures(dir: &Path) -> Result<()> {
     use funkot_core::analysis::analyze;
     use funkot_core::owned_wav::Checkout;
-    use funkot_core::testutil::{synth_track, synth_track_with_options, write_wav, SynthOptions};
+    use funkot_core::testutil::{synth_track, synth_track_with_options, write_wav_file, SynthOptions};
     use serde_json::json;
     use std::time::SystemTime;
 
@@ -3665,7 +3665,7 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
         let path = dir.join(name);
         let buf = synth_track_with_options(opt.clone());
         owned
-            .write_owned(dir, name, SystemTime::now(), |p| write_wav(p, &buf))
+            .write_owned(dir, name, SystemTime::now(), |p| write_wav_file(p, &buf))
             .with_context(|| format!("write {}", path.display()))?;
         let a = analyze(&buf, name).map_err(|e| anyhow::anyhow!("analyze {name}: {e}"))?;
         println!(
@@ -3694,7 +3694,7 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
     let demo = dir.join("synth_classic_short.wav");
     owned
         .write_owned(dir, "synth_classic_short.wav", SystemTime::now(), |p| {
-            write_wav(p, &synth_track(180.0, 8, 8, 8, sr))
+            write_wav_file(p, &synth_track(180.0, 8, 8, 8, sr))
         })
         .with_context(|| format!("write {}", demo.display()))?;
     println!("wrote {}", demo.display());

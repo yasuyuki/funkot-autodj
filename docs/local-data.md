@@ -133,20 +133,33 @@ JSON 編集、cache/lock の削除は稼働中に混在させない。更新前�
 
 ## WAV 生成物の受入と回収
 
-Linux では `--render`、`--dump-wav`、遷移クリップ、`--render-clips`、
+Linux / Windows では `--render`、`--dump-wav`、遷移クリップ、`--render-clips`、
 `gen_synth`、`phase_ab`、`--gen-test-fixtures` が、新しい出力だけを生成前に所有する。
 生成成功は受入ではない。receipt の `state=held` は受入待ちであり、明示された
 `hold=true` は受入・終了の証拠があっても回収を拒否する。
-task 連携のない通常の CLI レンダーは既存ファイルへ従来どおり上書きできるが、
-既存ファイルや旧 receipt を所有物へ取り込まない。`write_owned` を使う合成音源・fixture
-生成器、および managed task の生成では、既存出力や旧 receipt があれば書込前に拒否する。
+Linux では既存出力や旧 receipt があれば、task 連携の有無によらず書込前に拒否する。
+外部 receipt を持つ未受入の出力と手動ファイルを、出力名だけでは区別できないためである。
+Windows の task 連携のない CLI は所有 marker / receipt のない手動ファイルを上書きできるが、
+既存ファイルを新しい所有物へ取り込まない。`write_owned` を使う合成音源・fixture 生成器と
+managed task は、両 platform とも既存出力や旧 receipt があれば書込前に拒否する。
 未受入の出力や手動ファイルを再生成によって破壊しないため、新しい生成先を選ぶか、
 以前の所有世代の受入・利用終了を完了させる。
 原盤との重なり、symlink、checkout 内の別 mount・nested repository は所有対象外。
 hardlink、内容または inode の変化、実行中 writer は回収を拒否する。
-Linux 以外は安全な native owner が未実装のため、task 連携のない生成は従来どおり
-実行して出力を保持する。owner 連携を要求する managed task は生成前に拒否し、
-所有されていない出力を成功として返さない。
+Windows は directory handle を起点に各成分を reparse を許さず開き、生成・receipt の
+読書きと置換・回収を同じ親 handle に束縛する。各親と生成中の出力は delete sharing を
+許さず、確認後の置換を拒否する。出力名の共通 lease は receipt の保存先をまたいで排他し、
+managed 出力には受入待ちの所有を示す `.NAME.wav.owned` marker も登録する。
+別 owner や task 連携のないレンダーも、この marker がある出力を上書きしない。
+marker は WAV と同じ完了 callback が回収する。receipt 保存領域の更新は、同じ
+owner lease に参加する writer 間で排他する。外部から receipt を直接変更する writer
+まで安全にしたとは扱わず、その利用解除を確認できるまで回収しない。
+volume と完全な 128-bit File ID を保存し、回収は書込・削除 sharing を許さない handle で
+再検証する。同じ handle へ削除 disposition を設定し、その前に削除 intent を receipt へ
+保存する。junction / reparse point、hardlink、nested repository、busy / 変更済みの出力は
+保持する。checkout は実行時の task context または cwd から解決し、8.3 / case 別名は
+handle が返す正規名へ揃える。未実装の platform では standalone 生成を継続して保持診断を
+出し、managed 生成は出力前に拒否する。Windows の UNC / device path も所有対象にしない。
 
 通常の task lifecycle が owner receipt の登録先と callback を提供すると、receipt は
 checkout 外へ保存され、task の受入・最終利用終了時に owner callback が回収する。
@@ -159,7 +172,8 @@ proof は受入結果と最後の利用終了を実際に確認した記録へ�
 完了入口は証拠を `pending` として durable に保存してから即時回収する。同じ owner の
 次回起動で、固定の生成先、再び開いた出力 directory、または task に指定された receipt
 保存先にある `pending` を再試行する。ファイル探索による一般的な掃除は行わない。
-生成途中の中断は `writing` のまま保持し、自動受入しない。
+生成途中の中断は `writing` のまま保持し、自動受入しない。検証済みの削除 intent を
+保存する前に出力が消えた場合も回収成功にせず保持し、外部変更として診断する。
 削除後も SHA-256、実行中 executable の SHA-256 と取得可能な source revision、入力 argv、生成 ID、file identity、allocated bytes、
 受入・利用終了の証拠と結果を receipt に残す。receipt を消すことは完了操作ではない。
 owner が出力を退避したあとに別ファイルが同名で現れた場合も、両方を保持して完了を拒否する。
@@ -170,7 +184,9 @@ owner が出力を退避したあとに別ファイルが同名で現れた場�
 `--owner funkot-wav --generation ID --output FILE --receipt RECEIPT --completion-json JSON`
 を受け取る。completion argv 内の `{result_ref}` は task の受入・終了記録への参照に置換する。
 main CLI は既定で自身の実行ファイルを callback に使う。example は main CLI の argv を
-明示設定する必要がある。callback は checkout / build 出力の退役より前に実行する。
+明示設定する必要がある。callback は checkout の退役より前に実行する。finish の
+restore 処理は callback より先なので、callback の実行ファイルを restore 対象に含めず、
+全 owner の完了まで保持する。
 `dev.sh` は managed context がある場合、同じ絶対パスへ task checkout と外部 receipt directory
 を bind し、通常の相対出力を host と対応させる。`/work` を含む container 専用の絶対出力は
 登録を拒否する。生成時の登録だけを、実行中に限った private Unix socket で host に渡す。

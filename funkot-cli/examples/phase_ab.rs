@@ -157,7 +157,7 @@ fn render(
             &name,
             SystemTime::now(),
             |p| -> Result<(), Box<dyn std::error::Error>> {
-                let mut w = WavStreamWriter::create(p, buf.sample_rate, WavFormat::F32)?;
+                let mut w = WavStreamWriter::from_file(p, buf.sample_rate, WavFormat::F32)?;
                 w.write_interleaved(&clip)?;
                 w.finalize()?;
                 Ok(())

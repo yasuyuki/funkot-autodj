@@ -326,6 +326,11 @@ fn next_rand(state: &mut u32) -> f32 {
 
 /// Write an [`AudioBuffer`] as a 16-bit stereo WAV for cache / decode round-trips.
 pub fn write_wav(path: &std::path::Path, buffer: &AudioBuffer) -> std::io::Result<()> {
+    write_wav_file(std::fs::File::create(path)?, buffer)
+}
+
+/// Write to a caller-owned handle, preserving its exact object binding.
+pub fn write_wav_file(file: std::fs::File, buffer: &AudioBuffer) -> std::io::Result<()> {
     let spec = hound::WavSpec {
         channels: 2,
         sample_rate: buffer.sample_rate,
@@ -333,7 +338,7 @@ pub fn write_wav(path: &std::path::Path, buffer: &AudioBuffer) -> std::io::Resul
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer =
-        hound::WavWriter::create(path, spec).map_err(|e| std::io::Error::other(e.to_string()))?;
+        hound::WavWriter::new(std::io::BufWriter::new(file), spec).map_err(|e| std::io::Error::other(e.to_string()))?;
     for &s in &buffer.samples {
         let clamped = s.clamp(-1.0, 1.0);
         let sample = (clamped * f32::from(i16::MAX)) as i16;
