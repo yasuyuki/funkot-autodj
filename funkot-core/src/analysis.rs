@@ -581,16 +581,6 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         SectionDir::Backward,
     )?;
 
-    // Both sides now carry structural boundaries, so reconcile compares like
-    // with like; the mix trigger is derived from the result below.
-    let (intro_bars, outro_structure_bars, intro_low_conf, outro_low_conf) =
-        reconcile_intro_outro(intro_est, outro_est);
-
-    // One rule, every track: start the transition `OUTRO_LEAD_BARS` before the
-    // outro so it finishes exactly where the outro begins. This is also what
-    // keeps the exported invariant `outro_structure_bars <= outro_bars` true
-    // by construction (`outro_trigger_bars` never returns less than the
-    // boundary it is given).
     // Rounded, not floored: these are nominal bar counts, and flooring
     // would shave a bar off the room every time the division came out just
     // under a whole number.
@@ -598,6 +588,18 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         / (outro_bar_len.max(1) as f64))
         .round()
         .max(0.0) as u32;
+
+    // Both sides now carry structural boundaries, so reconcile compares like
+    // with like. The only ambiguous case that depends on track duration is
+    // both-low fallback: it must leave room for both sections and the lead.
+    let (intro_bars, outro_structure_bars, intro_low_conf, outro_low_conf) =
+        reconcile_intro_outro_for_track_bars(intro_est, outro_est, track_bars);
+
+    // One rule, every track: start the transition `OUTRO_LEAD_BARS` before the
+    // outro so it finishes exactly where the outro begins. This is also what
+    // keeps the exported invariant `outro_structure_bars <= outro_bars` true
+    // by construction (`outro_trigger_bars` never returns less than the
+    // boundary it is given).
     let outro_bars = outro_trigger_bars(outro_structure_bars, intro_bars, track_bars);
 
     let bars_estimated_low_confidence = intro_low_conf || outro_low_conf;
@@ -655,8 +657,25 @@ pub fn reconcile_intro_outro(
     intro: SectionEstimate,
     outro: SectionEstimate,
 ) -> (u32, u32, bool, bool) {
+    reconcile_intro_outro_for_track_bars(intro, outro, u32::MAX)
+}
+
+/// Reconcile section estimates when the analyzed track duration is known.
+///
+/// Its both-low fallback is the largest [`SNAP_CANDIDATES`] section that
+/// leaves room for both sections and [`OUTRO_LEAD_BARS`]. The public
+/// two-argument compatibility API has no duration and retains 64 instead.
+pub(crate) fn reconcile_intro_outro_for_track_bars(
+    intro: SectionEstimate,
+    outro: SectionEstimate,
+    track_bars: u32,
+) -> (u32, u32, bool, bool) {
     if intro.low_confidence && outro.low_confidence {
-        return (FALLBACK_BARS, FALLBACK_BARS, true, true);
+        let section = SNAP_CANDIDATES.iter().copied()
+            .filter(|bars| bars.saturating_mul(2).saturating_add(OUTRO_LEAD_BARS) <= track_bars)
+            .last()
+            .unwrap_or(SNAP_CANDIDATES[0]);
+        return (section, section, true, true);
     }
 
     if intro.low_confidence && !outro.low_confidence {

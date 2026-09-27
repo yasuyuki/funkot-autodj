@@ -230,6 +230,20 @@ fn two_track_transition_tempo_and_envelope() {
     assert!(!mixed.is_empty(), "expected non-silent output");
 
     let events = engine.poll_events();
+    assert!(
+        events.iter().any(|event| matches!(event,
+            EngineEvent::TransitionStarted { to, entry_frame_out, .. }
+            if to == &path_b && *entry_frame_out == entry
+        )),
+        "automatic transition must report its phase-corrected entry {entry}, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(event,
+            EngineEvent::TrackStarted { path, entry_frame_out, .. }
+            if path == &path_b && *entry_frame_out == entry
+        )),
+        "automatic TrackStarted must report its phase-corrected entry {entry}, got {events:?}"
+    );
     let finished = events
         .iter()
         .filter(|e| matches!(e, EngineEvent::Finished))
@@ -499,6 +513,7 @@ fn nav_jump_next_intro_and_restart() {
     let bar_frames = options.bar_frames();
     let tracks =
         prepare_tracks_parallel(&options, &[path_a.clone(), path_b.clone()], 1).expect("prepare");
+    let a_fd = tracks[0].first_downbeat_out;
     let b_fd = tracks[1].first_downbeat_out;
     let mut engine = Engine::from_prepared(options, tracks).expect("engine");
     render_until_playing(&mut engine, 2048);
@@ -508,10 +523,18 @@ fn nav_jump_next_intro_and_restart() {
     let _ = engine.render(&mut buf);
     let events = engine.poll_events();
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, EngineEvent::TrackStarted { path, .. } if path == &path_b)),
-        "expected TrackStarted for B, got {events:?}"
+        events.iter().any(|e| matches!(e,
+            EngineEvent::TrackStarted { path, entry_frame_out, .. }
+            if path == &path_a && *entry_frame_out == a_fd
+        )),
+        "first TrackStarted must report its output downbeat {a_fd}, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e,
+            EngineEvent::TrackStarted { path, entry_frame_out, .. }
+            if path == &path_b && *entry_frame_out == b_fd
+        )),
+        "expected TrackStarted for B at its output downbeat {b_fd}, got {events:?}"
     );
 
     // Advance a bit into B, then restart current (left ×1).
@@ -525,13 +548,16 @@ fn nav_jump_next_intro_and_restart() {
     }
     let events = engine.poll_events();
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, EngineEvent::TransitionStarted { .. })),
-        "restart should start a transition, got {events:?}"
+        events.iter().any(|e| matches!(e,
+            EngineEvent::TransitionStarted { from, to, entry_frame_out }
+            if from == &path_b && to == &path_b && *entry_frame_out == b_fd
+        )),
+        "restart should carry its output downbeat {b_fd} on TransitionStarted, got {events:?}"
     );
-
-    let _ = b_fd;
+    assert!(
+        !events.iter().any(|e| matches!(e, EngineEvent::TrackStarted { .. })),
+        "same-track restart must not emit TrackStarted, got {events:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

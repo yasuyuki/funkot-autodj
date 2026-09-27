@@ -45,12 +45,32 @@ pub enum NavAction {
 }
 
 /// Events emitted by the engine (and loader failures).
+///
+/// `entry_frame_out` is the phase-corrected and clamped start frame actually
+/// adopted by the deck in the stretched/output domain. Convert it to seconds
+/// with [`EngineOptions::output_sample_rate`].
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    TrackStarted { index: usize, path: PathBuf },
-    TransitionStarted { from: PathBuf, to: PathBuf },
+    TrackStarted { index: usize, path: PathBuf, entry_frame_out: u64 },
+    TransitionStarted { from: PathBuf, to: PathBuf, entry_frame_out: u64 },
     TrackFailed { index: usize, path: PathBuf, message: String },
     Finished,
+}
+
+/// Most recent replacement of a playing head preview with its full buffer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PreviewUpgrade {
+    pub playlist_index: usize,
+    pub playhead: u64,
+    pub preview_frames: u64,
+}
+
+/// Cumulative per-engine diagnostics for first-track preview rendering.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderDiagnostics {
+    pub preview_wait_frames: u64,
+    pub preview_upgrades: u64,
+    pub last_preview_upgrade: Option<PreviewUpgrade>,
 }
 
 /// Offline-rendered track ready for the mix bus.
@@ -197,7 +217,7 @@ const PHASE_ALIGN_HAT_WEIGHT: f64 = 0.40;
 const PHASE_ALIGN_FINE_BEATS: f64 = 0.5;
 /// Ignore the adjustment when the best normalized correlation is below this.
 const PHASE_ALIGN_MIN_CORR: f64 = 0.45;
-/// Shared preview/upgrade de-click duration.
+/// Shared preview/upgrade/tail de-click duration.
 const HEAD_DECLICK_SECS: f64 = 0.010;
 /// Bars before file end used as the sparse outro-tail phase anchor.
 const OUTRO_TAIL_ANCHOR_BARS: u32 = 4;
@@ -685,6 +705,8 @@ struct UpgradeFade {
 struct ActiveTransition {
     frames_into: u64,
     fade_in_end: u64,
+    /// Start of the cached one-beat raw/HPF handoff before `fade_in_end`.
+    handoff_start: u64,
     fade_out_start: u64,
     fade_out_end: u64,
     /// Simultaneous linear crossfade without HPF / phase-align (local BPM out of range).
@@ -1096,6 +1118,9 @@ pub struct Engine {
     pending_events: Vec<EngineEvent>,
     finished: bool,
     finished_emitted: bool,
+    /// Gain ramp only after resuming a naturally finished finite source.
+    /// Loader-wait silence must not consume these frames.
+    resume_fade: Option<(u64, u64)>,
     stopped: bool,
     /// Third loader permit (history / in-transition `prev`) armed after a slot exists.
     ///
@@ -1110,6 +1135,7 @@ pub struct Engine {
     /// ends before Upgrade (CPU-speed pulls / offline). Realtime hosts set
     /// this false via [`Self::set_realtime`] so the audio callback never sleeps.
     block_on_preview_upgrade: bool,
+    render_diagnostics: RenderDiagnostics,
     /// Background phase-align result: `(prev_start, next_entry, prev_nudge)`.
     phase_align_ready: Option<(u64, u64, u64)>,
     phase_align_rx: Option<Receiver<(u64, u64, u64)>>,
@@ -1204,10 +1230,12 @@ impl Engine {
             pending_events: Vec::new(),
             finished: false,
             finished_emitted: false,
+            resume_fade: None,
             stopped: false,
             third_permit_armed: false,
             loader_exhausted: false,
             block_on_preview_upgrade: true,
+            render_diagnostics: RenderDiagnostics::default(),
             phase_align_ready: None,
             phase_align_rx: None,
             nav_tx,
@@ -1294,10 +1322,12 @@ impl Engine {
             pending_events: Vec::new(),
             finished: false,
             finished_emitted: false,
+            resume_fade: None,
             stopped: false,
             third_permit_armed: false,
             loader_exhausted: rest_empty,
             block_on_preview_upgrade: true,
+            render_diagnostics: RenderDiagnostics::default(),
             phase_align_ready: None,
             phase_align_rx: None,
             nav_tx,
@@ -1403,6 +1433,9 @@ impl Engine {
     /// Source replacement itself never restarts finished playback. stop() is terminal.
     pub fn resume(&mut self) -> bool {
         if self.stopped || self.future_fence.is_some() { return false; }
+        if self.finished {
+            self.resume_fade = Some((0, declick_frames(self.options.output_sample_rate)));
+        }
         self.finished = false;
         self.finished_emitted = false;
         true
@@ -1415,6 +1448,11 @@ impl Engine {
     /// CPU-speed tests leave the default (blocking) so WAV/output has no gap.
     pub fn set_realtime(&mut self, realtime: bool) {
         self.block_on_preview_upgrade = !realtime;
+    }
+
+    /// Cumulative per-engine observations; reading it does not change PCM timing.
+    pub fn render_diagnostics(&self) -> RenderDiagnostics {
+        self.render_diagnostics
     }
 
     /// Fill `out` (interleaved stereo at `options.output_sample_rate`).
@@ -1448,6 +1486,7 @@ impl Engine {
                 self.mark_finished();
                 return 0;
             } else {
+                if let Some((frame, _)) = self.resume_fade.as_mut() { *frame = 0; }
                 for s in out.iter_mut() {
                     *s = 0.0;
                 }
@@ -1478,12 +1517,19 @@ impl Engine {
                 if self.loader_exhausted && self.ready_ahead() == 0 {
                     self.mark_finished();
                 }
+                if let Some((frame, _)) = self.resume_fade.as_mut() { *frame = 0; }
                 for s in out[frames_done * 2..].iter_mut() {
                     *s = 0.0;
                 }
                 break;
             }
 
+            if !self.block_on_preview_upgrade && self.preview_exhausted_awaiting_upgrade() {
+                self.render_diagnostics.preview_wait_frames = self
+                    .render_diagnostics
+                    .preview_wait_frames
+                    .saturating_add(1);
+            }
             let (l, r) = self.render_one_frame();
             out[frames_done * 2] = l;
             out[frames_done * 2 + 1] = r;
@@ -1582,6 +1628,7 @@ impl Engine {
     pub fn stop(&mut self) {
         self.cancel_pending_nav();
         self.stopped = true;
+        self.resume_fade = None;
         self.shutdown.store(true, Ordering::SeqCst);
         while let Ok(msg) = self.loader_rx.try_recv() {
             if let LoaderMsg::Failed { index, path, message } = msg {
@@ -2027,15 +2074,18 @@ impl Engine {
 
         let (fade_in_end, fade_out_start, fade_out_end) =
             (plan.fade_in_end, plan.fade_out_start, plan.fade_out_end);
+        let handoff_start = hpf_handoff_start(fade_in_end, self.bar_frames);
 
         self.pending_events.push(EngineEvent::TransitionStarted {
             from: from_path,
             to: to_path.clone(),
+            entry_frame_out: entry,
         });
         if !same_track {
             self.pending_events.push(EngineEvent::TrackStarted {
                 index: next_index,
                 path: to_path,
+                entry_frame_out: entry,
             });
         }
 
@@ -2044,6 +2094,7 @@ impl Engine {
         self.transition = Some(ActiveTransition {
             frames_into: 0,
             fade_in_end,
+            handoff_start,
             fade_out_start,
             fade_out_end,
             simple: plan.simple,
@@ -2133,6 +2184,7 @@ impl Engine {
     }
 
     fn mark_finished(&mut self) {
+        self.resume_fade = None;
         self.finished = true;
         if !self.finished_emitted {
             self.finished_emitted = true;
@@ -2193,8 +2245,22 @@ impl Engine {
                 // its already-retained preview to drop on this callback.
                 retire_upgrade_fade(deck.upgrade_fade.take());
                 let old_playhead = deck.playhead;
+                let preview_upgrade = deck.track.preview && !track.preview;
+                let preview_frames = deck.track.frames;
+                let playlist_index = deck.track.playlist_index;
                 let playhead = old_playhead.min(track.frames);
                 let old = std::mem::replace(&mut deck.track, track);
+                if preview_upgrade {
+                    self.render_diagnostics.preview_upgrades = self
+                        .render_diagnostics
+                        .preview_upgrades
+                        .saturating_add(1);
+                    self.render_diagnostics.last_preview_upgrade = Some(PreviewUpgrade {
+                        playlist_index,
+                        playhead: old_playhead,
+                        preview_frames,
+                    });
+                }
                 deck.playhead = playhead;
                 deck.upgrade_fade = Some(UpgradeFade { track: old, playhead: old_playhead,
                     frames_into: 0, frames: declick_frames(self.options.output_sample_rate) });
@@ -2329,7 +2395,7 @@ impl Engine {
             upgrade_fade: None,
         });
         self.pending_events
-            .push(EngineEvent::TrackStarted { index, path });
+            .push(EngineEvent::TrackStarted { index, path, entry_frame_out: playhead });
         self.kick_phase_align_if_needed();
     }
 
@@ -2483,17 +2549,21 @@ impl Engine {
         self.pending_events.push(EngineEvent::TransitionStarted {
             from: from_path,
             to: to_path.clone(),
+            entry_frame_out: entry,
         });
         self.pending_events.push(EngineEvent::TrackStarted {
             index: next_index,
             path: to_path,
+            entry_frame_out: entry,
         });
 
         self.prev = Some(prev_deck);
         self.active = Some(next_deck);
+        let handoff_start = hpf_handoff_start(fade_in_end, self.bar_frames);
         self.transition = Some(ActiveTransition {
             frames_into: 0,
             fade_in_end,
+            handoff_start,
             fade_out_start,
             fade_out_end,
             simple: false,
@@ -2516,22 +2586,32 @@ impl Engine {
             }
         }
 
-        let (in_trans, frames_into, fade_in_end, fade_out_start, fade_out_end, simple) =
+        let (in_trans, frames_into, fade_in_end, handoff_start, fade_out_start, fade_out_end, simple) =
             if let Some(t) = self.transition.as_ref() {
                 (
                     true,
                     t.frames_into,
                     t.fade_in_end,
+                    t.handoff_start,
                     t.fade_out_start,
                     t.fade_out_end,
                     t.simple,
                 )
             } else {
-                (false, 0, 0, 0, 0, false)
+                (false, 0, 0, 0, 0, 0, false)
             };
 
         let mut mix_l = 0.0f32;
         let mut mix_r = 0.0f32;
+        // Move each deck onto its post-fade-in route over one target-tempo beat.
+        // The last handoff frame is already fully on that
+        // route, so the original `fade_in_end` boundary has no route step.
+        let handoff_weight = if in_trans && !simple
+            && frames_into >= handoff_start && frames_into < fade_in_end {
+            Some(fade_in_gain(frames_into - handoff_start, fade_in_end - handoff_start))
+        } else {
+            None
+        };
 
         if let Some(deck) = self.prev.as_mut() {
             // Prev is only reachable while in_trans && frames_into < fade_out_end.
@@ -2555,7 +2635,10 @@ impl Engine {
                 let mut fr = r;
                 deck.filter.process_frame(&mut fl, &mut fr);
                 if gain_env > 0.0 {
-                    if deck.highpass_enabled {
+                    if let Some(w) = handoff_weight {
+                        l = l * (1.0 - w) + fl * w;
+                        r = r * (1.0 - w) + fr * w;
+                    } else if deck.highpass_enabled {
                         l = fl;
                         r = fr;
                     }
@@ -2579,6 +2662,8 @@ impl Engine {
 
             if deck.playhead < deck.track.frames || deck.upgrade_fade.is_some() {
                 let (mut l, mut r) = read_deck_frame(deck);
+                let raw_l = l;
+                let raw_r = r;
                 // Active HPF is on from transition start (incl. silent first
                 // fade-in frame), so drive it whenever enabled.
                 if deck.highpass_enabled {
@@ -2586,6 +2671,10 @@ impl Engine {
                 }
                 // First fade-in frame is bit-exact 0: do not touch the mix bus.
                 if gain_env > 0.0 {
+                    if let Some(w) = handoff_weight {
+                        l = l * (1.0 - w) + raw_l * w;
+                        r = r * (1.0 - w) + raw_r * w;
+                    }
                     let g = gain_env * deck.track.gain_linear;
                     mix_l += l * g;
                     mix_r += r * g;
@@ -2607,6 +2696,14 @@ impl Engine {
                 self.drop_prev();
                 self.transition = None;
             }
+        }
+
+        // Apply to this frame before retiring its deck or clearing on Finished.
+        if let Some((frame, span)) = self.resume_fade {
+            let gain = fade_in_gain(frame, span);
+            mix_l *= gain;
+            mix_r *= gain;
+            self.resume_fade = (frame + 1 < span).then_some((frame + 1, span));
         }
 
         let active_done = self
@@ -3176,6 +3273,13 @@ fn declick_frames(sample_rate: u32) -> u64 {
     (HEAD_DECLICK_SECS * f64::from(sample_rate)).round().max(2.0) as u64
 }
 
+/// Start the cached one-beat raw/HPF handoff before the existing fade-in end.
+#[inline]
+fn hpf_handoff_start(fade_in_end: u64, bar_frames: f64) -> u64 {
+    let beat = (bar_frames / f64::from(BEATS_PER_BAR)).round().max(1.0) as u64;
+    fade_in_end.saturating_sub(beat.min(fade_in_end))
+}
+
 /// Prepare every playlist path, optionally in parallel.
 ///
 /// `jobs == 0` uses the host CPU count. Does not change decode/analysis/stretch
@@ -3488,6 +3592,36 @@ mod tests {
         engine
     }
 
+    #[test]
+    fn realtime_auto_transition_reports_the_final_clamped_entry() {
+        let mut active = future_track(0);
+        active.frames = 8;
+        active.samples = Arc::new(vec![0.25; 16]);
+        active.first_downbeat_out = 0;
+        active.outro_start_out = 0;
+        active.outro_end_anchored_out = 0;
+        active.outro_bars = 0;
+
+        let mut next = future_track(1);
+        next.frames = 8;
+        next.samples = Arc::new(vec![0.5; 16]);
+        next.first_downbeat_out = 7;
+        next.intro_bars = 0;
+
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![active, next]).unwrap();
+        engine.set_realtime(true);
+        let mut audio = [0.0; 2];
+        for _ in 0..8 {
+            engine.render(&mut audio);
+            if engine.poll_events().iter().any(|event| matches!(event,
+                EngineEvent::TransitionStarted { entry_frame_out: 7, .. }
+            )) {
+                return;
+            }
+        }
+        panic!("realtime transition did not report the final clamped entry");
+    }
+
     // Private controlled decoder seam: production activation/channels/permits,
     // synthetic PCM instead of filesystem decode.
     fn future_replacement(tracks: Vec<PreparedTrack>) -> PreparedSourceReplacement {
@@ -3547,10 +3681,111 @@ mod tests {
         assert!(engine.resume());
         let mut audio = [0.0; 2];
         assert_eq!(engine.render(&mut audio), 1);
-        assert!(audio[0] > 0.0);
+        assert_eq!(audio, [0.0; 2]);
         assert_eq!(engine.current_index(), Some(2));
         wait_future(&mut engine);
         assert_eq!(engine.next_track.as_ref().unwrap().playlist_index, 3);
+    }
+
+    #[test]
+    fn finished_resume_declick_waits_for_audio_and_preserves_time_and_chunks() {
+        for sample_rate in [44_100, 48_000] {
+            let span = declick_frames(sample_rate) as usize;
+            let frames = span + 19;
+            let mut track = upgrade_test_track("resume.wav", frames + 3, 0.0, 0.75, false);
+            track.playlist_index = 2;
+            track.first_downbeat_out = 3;
+            track.samples = Arc::new((0..frames + 3).flat_map(|i| {
+                let phase = i as f32 * 0.03;
+                [0.4 + 0.1 * phase.sin(), -0.3 + 0.1 * phase.cos()]
+            }).collect());
+            let reference: Vec<_> = track.samples[6..].iter().map(|x| x * track.gain_linear).collect();
+            let options = EngineOptions { output_sample_rate: sample_rate, ..EngineOptions::default() };
+            // Initial start and a redundant live resume retain the old PCM.
+            let mut fresh = Engine::from_prepared(options.clone(), vec![track.clone()]).unwrap();
+            assert!(fresh.resume());
+            let mut first = [0.0; 2];
+            assert_eq!(fresh.render(&mut first), 1);
+            assert_eq!(first.as_slice(), &reference[..2]);
+
+            let mut outputs = Vec::new();
+            for chunk in [1, 17, 4096] {
+                let mut engine = Engine::from_prepared(options.clone(), vec![future_track(1)]).unwrap();
+                engine.render(&mut [0.0; 128]);
+                assert!(engine.finished);
+                engine.poll_events();
+                // Controlled Ready arrival: hold the channel open with no track.
+                let (ready, rx) = mpsc::sync_channel(1);
+                engine.loader_rx = rx;
+                engine.loader_exhausted = false;
+                assert!(engine.resume());
+                for _ in 0..3 {
+                    let mut silence = [1.0; 32];
+                    assert_eq!(engine.render(&mut silence), 16);
+                    assert_eq!(silence, [0.0; 32]);
+                }
+                ready.send(LoaderMsg::Ready(track.clone())).unwrap();
+                let mut output = Vec::new();
+                while output.len() < reference.len() {
+                    // Repeated Play must not restart the ramp.
+                    assert!(engine.resume());
+                    let want = chunk.min((reference.len() - output.len()) / 2);
+                    let mut audio = vec![0.0; want * 2];
+                    assert_eq!(engine.render(&mut audio), want);
+                    output.extend(audio);
+                }
+                let starts: Vec<_> = engine.poll_events().into_iter().filter_map(|e| {
+                    if let EngineEvent::TrackStarted { index, .. } = e { Some(index) } else { None }
+                }).collect();
+                assert_eq!(starts, vec![2]);
+                assert_eq!(&output[..2], &[0.0; 2]);
+                assert_eq!(&output[(span - 1) * 2..], &reference[(span - 1) * 2..]);
+                for channel in 0..2 {
+                    let raw_step = reference.chunks_exact(2).map(|f| f[channel]).collect::<Vec<_>>()
+                        .windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+                    let peak = reference.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                    let bound = raw_step + peak / (span - 1) as f32;
+                    let step = output.chunks_exact(2).map(|f| f[channel]).collect::<Vec<_>>()
+                        .windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+                    assert!(step <= bound + f32::EPSILON);
+                    assert!(reference[channel].abs() > bound);
+                }
+                outputs.push(output);
+            }
+            assert!(outputs.windows(2).all(|w| w[0] == w[1]));
+        }
+    }
+
+    #[test]
+    fn finished_resume_short_track_wait_and_final_frame_keep_the_ramp() {
+        let mut engine = future_engine(&[1]);
+        engine.render(&mut [0.0; 128]);
+        let (ready, rx) = mpsc::sync_channel(1);
+        engine.loader_rx = rx;
+        engine.loader_exhausted = false;
+        let short = upgrade_test_track("short.wav", 4, 0.5, 1.0, false);
+        ready.send(LoaderMsg::Ready(short.clone())).unwrap();
+        assert!(engine.resume());
+        let mut first = [0.0; 8];
+        assert_eq!(engine.render(&mut first), 4);
+        assert_eq!(first[0], 0.0);
+        assert!(first[6] > 0.0 && first[6] < 0.5);
+        // No Ready next: actual zero output restarts the ramp, not half gain.
+        let mut silence = [1.0; 4];
+        assert_eq!(engine.render(&mut silence), 2);
+        assert_eq!(silence, [0.0; 4]);
+        ready.send(LoaderMsg::Ready(short)).unwrap();
+        engine.poll_events();
+        ready.send(LoaderMsg::Exhausted).unwrap();
+        let mut second = [0.0; 8];
+        assert_eq!(engine.render(&mut second), 4);
+        assert_eq!(second, first);
+        assert!(engine.finished);
+        assert!(engine.resume_fade.is_none());
+        assert!(engine.resume());
+        engine.stop();
+        assert!(engine.resume_fade.is_none());
+        assert!(!engine.resume());
     }
 
     #[test]
@@ -3736,6 +3971,116 @@ mod tests {
             outro_end_anchored_out: frames as u64, intro_bars: 0, outro_bars: 0,
             gain_linear: gain, preview, head_only: false,
         }
+    }
+
+    #[test]
+    fn hpf_handoff_weights_follow_one_beat_and_clamp_to_short_fade() {
+        for (bar_frames, expected_span) in [
+            (48_000.0 * 60.0 / 198.0 * 4.0, 14_545u64),
+            (44_100.0 * 60.0 / 180.0 * 4.0, 14_700u64),
+        ] {
+            let end = 100_000u64;
+            let start = hpf_handoff_start(end, bar_frames);
+            let span = end - start;
+            assert_eq!(span, expected_span);
+            assert_eq!(fade_in_gain(0, span), 0.0);
+            assert_eq!(fade_in_gain(span - 1, span), 1.0);
+            let weights: Vec<_> = (0..span).map(|i| fade_in_gain(i, span)).collect();
+            assert!(weights.windows(2).all(|pair| pair[0] <= pair[1]));
+            for &w in &[weights[0], weights[span as usize / 2], *weights.last().unwrap()] {
+                assert_eq!(w + (1.0 - w), 1.0);
+            }
+
+            // A fade shorter than one beat uses every available frame and retains
+            // bit-exact 0/1 endpoints.
+            let short_start = hpf_handoff_start(2, bar_frames);
+            assert_eq!(short_start, 0);
+            assert_eq!(fade_in_gain(0, 2), 0.0);
+            assert_eq!(fade_in_gain(1, 2), 1.0);
+        }
+    }
+
+    #[test]
+    fn simple_transition_keeps_raw_mix_bit_exact() {
+        let sr = 48_000;
+        let mut engine = phase_test_engine(false, 8, sr);
+        let prev = upgrade_test_track("simple-prev.wav", 32, 0.25, 1.0, false);
+        let active = upgrade_test_track("simple-active.wav", 32, -0.5, 1.0, false);
+        engine.prev = Some(Deck {
+            track: prev, playhead: 0, highpass_enabled: true,
+            filter: StereoHighPass::new(sr, 300.0), upgrade_fade: None,
+        });
+        engine.active = Some(Deck {
+            track: active, playhead: 0, highpass_enabled: true,
+            filter: StereoHighPass::new(sr, 300.0), upgrade_fade: None,
+        });
+        engine.transition = Some(ActiveTransition {
+            frames_into: 3, fade_in_end: 8, handoff_start: 0,
+            fade_out_start: 8, fade_out_end: 16, simple: true,
+        });
+
+        let (l, r) = engine.render_one_frame();
+        let expected = 0.25 + -0.5 * fade_in_gain(3, 8);
+        assert_eq!((l, r), (expected, expected));
+        assert!(!engine.prev.as_ref().unwrap().highpass_enabled);
+        assert!(!engine.active.as_ref().unwrap().highpass_enabled);
+    }
+
+    #[test]
+    fn render_diagnostics_counts_realtime_preview_wait_frames_until_upgrade() {
+        let preview = upgrade_test_track("preview.wav", 2, 0.25, 1.0, true);
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview]).unwrap();
+        engine.set_realtime(true);
+        let (tx, rx) = mpsc::sync_channel(1);
+        engine.loader_rx = rx;
+        engine.loader_exhausted = false;
+
+        assert_eq!(engine.render(&mut [0.0; 4]), 2);
+        let mut waiting = [1.0; 6];
+        assert_eq!(engine.render(&mut waiting), 3);
+        assert_eq!(waiting, [0.0; 6]);
+        assert_eq!(engine.render_diagnostics().preview_wait_frames, 3);
+
+        tx.send(LoaderMsg::Upgrade(upgrade_test_track("preview.wav", 600, 0.5, 1.0, false))).unwrap();
+        let mut resumed = [0.0; 1024];
+        assert_eq!(engine.render(&mut resumed), 512);
+        assert_eq!(engine.render_diagnostics().preview_wait_frames, 3);
+        assert!(resumed.iter().any(|sample| *sample != 0.0));
+    }
+
+    #[test]
+    fn render_diagnostics_records_only_active_preview_to_full_upgrade() {
+        let mut preview = upgrade_test_track("same.wav", 8, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview]).unwrap();
+        engine.active.as_mut().unwrap().playhead = 3;
+
+        let mut full = upgrade_test_track("same.wav", 20, 0.5, 1.0, false);
+        full.playlist_index = 7;
+        engine.apply_upgrade(full.clone());
+        assert_eq!(engine.render_diagnostics(), RenderDiagnostics {
+            preview_wait_frames: 0,
+            preview_upgrades: 1,
+            last_preview_upgrade: Some(PreviewUpgrade {
+                playlist_index: 7,
+                playhead: 3,
+                preview_frames: 8,
+            }),
+        });
+
+        engine.apply_upgrade(full.clone());
+        let mut wrong_occurrence = full.clone();
+        wrong_occurrence.playlist_index = 8;
+        engine.apply_upgrade(wrong_occurrence);
+        assert_eq!(engine.render_diagnostics().preview_upgrades, 1);
+
+        let mut next_preview = upgrade_test_track("next.wav", 8, 0.25, 1.0, true);
+        next_preview.playlist_index = 9;
+        engine.next_track = Some(next_preview);
+        let mut next_full = upgrade_test_track("next.wav", 20, 0.5, 1.0, false);
+        next_full.playlist_index = 9;
+        engine.apply_upgrade(next_full);
+        assert_eq!(engine.render_diagnostics().preview_upgrades, 1);
     }
 
     #[test]

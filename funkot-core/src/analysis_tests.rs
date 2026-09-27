@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::analysis::{
     analyze, analyze_local_tempo, outro_trigger_bars, reconcile_intro_outro,
+    reconcile_intro_outro_for_track_bars,
     refine_kick_marker, SectionEstimate,
 };
 use crate::cache::{self, get_cached_or_provisional, get_or_analyze};
@@ -402,8 +403,9 @@ fn no_section_contrast_falls_back() {
 
     assert!((a.intro_bpm - bpm).abs() < 0.3, "intro_bpm {}", a.intro_bpm);
     assert!((a.outro_bpm - bpm).abs() < 0.3, "outro_bpm {}", a.outro_bpm);
-    assert_eq!(a.intro_bars, FALLBACK_BARS);
-    assert_eq!(a.outro_bars, FALLBACK_BARS);
+    assert_eq!(a.intro_bars, 16);
+    assert_eq!(a.outro_structure_bars, 16);
+    assert_eq!(a.outro_bars, 32);
     assert!(a.bars_estimated_low_confidence);
     assert!(a.intro_bars_low_confidence);
     assert!(a.outro_bars_low_confidence);
@@ -512,8 +514,9 @@ fn ambiguous_near_flat_falls_back() {
         ..SynthOptions::default()
     });
     let a = analyze(&buf, "ambiguous.wav").expect("analyze");
-    assert_eq!(a.intro_bars, FALLBACK_BARS);
-    assert_eq!(a.outro_bars, FALLBACK_BARS);
+    assert_eq!(a.intro_bars, 32);
+    assert_eq!(a.outro_structure_bars, 32);
+    assert_eq!(a.outro_bars, 48);
     assert!(a.bars_estimated_low_confidence);
 }
 
@@ -612,10 +615,22 @@ fn reconcile_rules_unit() {
     assert_eq!((i, o), (32, 32));
     assert!(!il && ol);
 
-    // Both low → FALLBACK (64).
+    // The public compatibility API lacks a duration, retaining fallback 64.
     let (i, o, il, ol) = reconcile_intro_outro(lo(16), lo(32));
     assert_eq!((i, o), (FALLBACK_BARS, FALLBACK_BARS));
     assert!(il && ol);
+}
+
+#[test]
+fn both_low_sections_fit_track_geometry_at_candidate_boundaries() {
+    let low = || SectionEstimate { bars: 64, low_confidence: true, score: 0.0, sharpness: 0.0, structure_bars: 64 };
+    for (track_bars, expected, trigger) in [(90, 32, 48), (144, 64, 80), (143, 32, 48),
+        (80, 32, 48), (79, 16, 32), (31, 8, 23)] {
+        let (intro, structure, intro_low, outro_low) = reconcile_intro_outro_for_track_bars(low(), low(), track_bars);
+        assert_eq!((intro, structure), (expected, expected), "{track_bars}-bar track");
+        assert!(intro_low && outro_low);
+        assert_eq!(outro_trigger_bars(structure, intro, track_bars), trigger);
+    }
 }
 
 /// Regression for the invariant documented on

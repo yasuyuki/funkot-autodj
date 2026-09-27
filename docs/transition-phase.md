@@ -46,7 +46,26 @@ onset対の相関がcomb首位と半速の両方に勝つことを独立の根�
 場合はゼロからつなぐ。再生位置と全曲の構造マーカーは維持し、不要bufferの破棄は音声処理外で行う。
 今回の実測・受入状況は [Issue #13](https://github.com/yasuyuki/funkot-autodj/issues/13) を参照。
 
+有限リストが完全終了した後の明示resumeでは、無音から解析マーカー位置の非ゼロsampleへ
+直結しないよう、既存と同じ10 msの開始fadeを適用する。loader待ちの無音ではfadeを消費せず、
+実際のrender開始から進める。曲の位置・長さ・開始イベントは変えず、再送されたresumeで
+fadeをやり直さない。通常の初回開始・自動遷移・host側のpause/playには適用しない。
+10 ms未満の素材はfade途中で終わり得る。終了時の最後のframeにもfadeを適用する。
+この修正は無操作の切替中クリックやOS出力全体の解決を保証しない。
+
 ## 自動アウトロ遷移（v17）
+
+通常の段階的遷移では、次曲のフェードインが終わる位置で300 Hz HPFの担当を次曲から
+前曲へ移す。filterをwarmにしてもrawとの値は一致しないため、1 sampleで経路を替えると
+不連続になり得る。target tempoの1拍（フェードインが短ければその長さ）だけ早く、
+前曲はraw→HPF、次曲はHPF→rawを相補的な線形係数でつなぐ。最後のhandoff frameで
+新経路へ完全移行し、元の小節スケジュール、音量フェード端点、イベント時刻は変えない。
+この1拍では低域の担当が徐々に移る。PCの実PCMでは旧10 msのraw/HPF位相相殺による
+短いnotch/reboundが残ったため、これを音楽時間のbass引継ぎへ延ばした。notch深さ自体を
+消す主張ではない。簡易クロスフェードには適用しない。
+合成低音／高音の両方向とrender chunkによらない出力を回帰検査するが、実音源や端末出力の
+聴感受入、またはクリックが全て解消したことの代わりにはしない。実測・実機受入は
+[Issue #44](https://github.com/yasuyuki/funkot-player/issues/44)を参照。
 
 `align_next_entry_with_phase_hypotheses`（`engine.rs`）。
 

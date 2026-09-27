@@ -20,6 +20,28 @@ ZCR centroid）で、Funkot のイントロ・アウトロを実際に定義し�
 2. 判定は候補スコアリング＋オフライン学習した重み（実行時 ML 依存ゼロ、決定的）
 3. `outro_bars` は「構造境界」と「mix リード」を分離する
 
+## 短い曲の両端低信頼 fallback（player #44）
+
+両端とも低信頼のときに一律64小節とすると、90小節の曲では intro 64 と
+outro trigger 64 が重なる。trigger は先頭から26小節なのに、遷移の incoming
+entry は48小節になり、前の overlap 終了直後に次の遷移を始める。この経路は
+Android lifecycle やプレイリストの consumed 更新なしでも生じる。
+
+自動解析の両端低信頼の場合だけ、既存の候補 `{8,16,32,64}` から
+`2 × section + OUTRO_LEAD_BARS <= track_bars` を満たす最大値を使う。
+該当がなければ最小候補を使い、既存の曲長制約で lead を短くする。
+90小節では intro/structure が32、trigger が48となる。incoming entry は16、
+overlap 終了は24、自身の次の trigger は42小節となり、連続切替を避ける。
+片側だけ低信頼・高信頼・手動の区間指定は、この補正で変更しない。
+
+v14 の既存自動 cache にも同じ問題が残り得る。両端低信頼かつ手動指定のない
+`intro_bars + outro_bars > track_bars` の項目だけを読取時に再解析待ちとして
+扱い、既存の provisional／再解析／保存経路へ渡す。schema を変更せず、
+全 cache の消去や版違いによる手動指定の喪失を避ける。修正の判定には
+合成回帰に加えて実音源の接続確認が必要であり、消費側の Kani PASS だけでは
+音声・区間解析の受入にはならない。実施結果と残件の正本は
+[player #44](https://github.com/yasuyuki/funkot-player/issues/44)。
+
 ## Stage 0〜2（完了）
 
 | Stage | commit | 内容 |
