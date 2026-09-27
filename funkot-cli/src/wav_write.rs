@@ -136,21 +136,28 @@ fn quantize_tpdf(sample: f32, max_pos: i32, rng: &mut XorShift32) -> i32 {
 /// Streaming WAV writer for interleaved stereo f32 chunks.
 pub struct WavStreamWriter {
     format: WavFormat,
-    generation: funkot_core::owned_wav::Generation,
+    // Flush/drop the writer before releasing the generation's handles and lease.
     writer: hound::WavWriter<BufWriter<File>>,
+    generation: Option<funkot_core::owned_wav::Generation>,
     rng: XorShift32,
     pub stats: PeakStats,
 }
 
 impl WavStreamWriter {
     pub fn create(path: &Path, sample_rate: u32, format: WavFormat) -> Result<Self> {
-        let spec = format.wav_spec(sample_rate);
         let generation = funkot_core::owned_wav::Generation::begin(path)?;
-        let writer = hound::WavWriter::create(generation.write_path(), spec)
+        let mut writer = Self::from_file(generation.writer_file()?, sample_rate, format)
             .with_context(|| format!("failed to create WAV {}", path.display()))?;
+        writer.generation = Some(generation);
+        Ok(writer)
+    }
+
+    /// The caller retains responsibility for completing the owning generation.
+    pub fn from_file(file: File, sample_rate: u32, format: WavFormat) -> Result<Self> {
+        let writer = hound::WavWriter::new(BufWriter::new(file), format.wav_spec(sample_rate))?;
         Ok(Self {
             format,
-            generation,
+            generation: None,
             writer,
             rng: XorShift32::new(0xF01D_CAFE),
             stats: PeakStats::default(),
@@ -194,7 +201,7 @@ impl WavStreamWriter {
     pub fn finalize(mut self) -> Result<PeakStats> {
         let stats = self.stats;
         self.writer.finalize().context("failed to finalize WAV")?;
-        self.generation.finish()?;
+        if let Some(generation) = self.generation.as_mut() { generation.finish()?; }
         Ok(stats)
     }
 }
@@ -254,6 +261,7 @@ mod tests {
         assert_eq!(reader.spec().sample_format, hound::SampleFormat::Float);
         let samples: Vec<f32> = reader.samples::<f32>().map(|s| s.unwrap()).collect();
         assert_eq!(samples, vec![1.25, -1.25]);
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(reader);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

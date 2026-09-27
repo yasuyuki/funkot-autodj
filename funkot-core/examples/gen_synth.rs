@@ -6,7 +6,7 @@
 use std::time::SystemTime;
 
 use funkot_core::owned_wav::Checkout;
-use funkot_core::testutil::{synth_track, write_wav};
+use funkot_core::testutil::{synth_track, write_wav_file};
 
 fn main() {
     let dir = std::env::args()
@@ -30,7 +30,7 @@ fn main() {
 
     for (name, bpm, intro, main, outro) in specs {
         let buf = synth_track(bpm, intro, main, outro, 44_100);
-        match owned.write_owned(&dir, name, SystemTime::now(), |path| write_wav(path, &buf)) {
+        match owned.write_owned(&dir, name, SystemTime::now(), |path| write_wav_file(path, &buf)) {
             Ok(((), claimed)) => println!(
                 "wrote {} ({bpm} BPM, intro {intro} / main {main} / outro {outro} bars) [{claimed}]",
                 dir.join(name).display()

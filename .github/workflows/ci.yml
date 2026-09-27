@@ -65,7 +65,7 @@ jobs:
         run: cargo test --locked --workspace --release
 
   windows-cache:
-    name: cache tests (windows)
+    name: cache and WAV ownership tests (windows)
     needs: [gate]
     if: needs.gate.outputs.run == 'true'
     runs-on: windows-latest
@@ -86,12 +86,14 @@ jobs:
         with: { toolchain: "${{ env.RUST_VERSION }}" }
       - uses: Swatinem/rust-cache@v2
         with: { key: windows-cache-tests }
-      - name: cargo test --locked cache unit tests
+      - name: cargo test --locked cache and ownership unit tests
         env: { CARGO_PROFILE_RELEASE_LTO: "false" }
-        run: cargo test --locked -p funkot-core --release cache::tests
-      - name: Standalone WAV generation compatibility
-        env: { CARGO_PROFILE_RELEASE_LTO: "false" }
-        run: cargo test --locked -p funkot-core --release owned_wav::portable_writes_tests
+        run: |
+          cargo test --locked -p funkot-core --release cache::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p funkot-core --release owned_wav::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p funkot-cli --release --lib wav_write::
 
   dependency-policy:
     name: dependency policy
