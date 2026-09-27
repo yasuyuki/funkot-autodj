@@ -467,7 +467,7 @@ assert completion[completion.index('--artifact-complete') + 1] == args['--output
         let output = dir.join("managed space.wav"); let mut writer = Generation::begin_with_context(&output, &co.repo, Some(context)).unwrap();
         writer.writer_file().unwrap().write_all(b"RIFF managed").unwrap();
         let Claimed::Yes { generation, receipt } = writer.finish().unwrap() else { panic!() }; drop(writer);
-        assert_eq!(receipt.parent().unwrap(), normal_path(external.path()).unwrap());
+        assert_eq!(receipt.parent().unwrap(), normal_path(&fs::canonicalize(external.path()).unwrap()).unwrap());
         complete(&output, &generation, Some(&receipt), "accepted", "released").unwrap();
         assert!(!output.exists()); assert_eq!(claim(&receipt).state, "reclaimed");
     }
