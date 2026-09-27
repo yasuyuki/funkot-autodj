@@ -98,13 +98,13 @@ fn path_to_utf8(path: &std::path::Path) -> String {
 
 fn fill_event(out: &mut FunkotEvent, event: EngineEvent) {
     match event {
-        EngineEvent::TrackStarted { index, path } => {
+        EngineEvent::TrackStarted { index, path, .. } => {
             out.type_ = FunkotEventType::TrackStarted;
             out.track_index = i32::try_from(index).unwrap_or(i32::MAX);
             copy_utf8_c_array(&mut out.path, &path_to_utf8(&path));
             out.detail[0] = 0;
         }
-        EngineEvent::TransitionStarted { from, to } => {
+        EngineEvent::TransitionStarted { from, to, .. } => {
             out.type_ = FunkotEventType::TransitionStarted;
             out.track_index = -1;
             copy_utf8_c_array(&mut out.path, &path_to_utf8(&to));
