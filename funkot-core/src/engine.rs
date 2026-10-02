@@ -897,13 +897,12 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
             shortened_for_drift = false;
             continue;
         }
-        let target_continuous = local_grid_continuous(&request.target, request.key.target_first,
+        let target_structure_known = local_grid_continuous(&request.target, request.key.target_first,
             nominal.saturating_add(overlap), request.sample_rate, request.target_bpm);
-        // Once the one permitted beat-only retry is selected, the active
-        // marker corridor is precisely the evidence it no longer claims.
-        // The target corridor and corrected actual-overlap gates remain
-        // mandatory.
-        if !target_continuous || (!beat_only && !active_continuous) {
+        // A broken target marker corridor cannot establish bar identity. The
+        // proposed overlap may still establish beat sync after correction; both
+        // actual overlap regions must pass the checks below.
+        if !beat_only && !active_continuous {
             return simple("structural continuity unknown");
         }
         let (entry, score, nudge) = align_next_entry_scored(&request.active, start,
@@ -944,7 +943,10 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
         let four_bar = aligned_configuration && schedule.skip % 4 == 0
             && schedule.f_eff % 4 == 0 && schedule.fadeout_start % 4 == 0
             && schedule.fadeout_end % 4 == 0 && schedule.m % 4 == 0;
-        let reason = if beat_only { "beat sync: structural identity unknown" }
+        let reason = if beat_only && !target_structure_known {
+            "beat sync: both structural identities unknown"
+        } else if beat_only { "beat sync: structural identity unknown" }
+            else if !target_structure_known { "beat sync: target structural identity unknown" }
             else if deadline_limited { "bar sync: deadline limited" }
             else if four_bar { "four-bar sync" }
             else if shortened_for_drift { "bar sync: drift shortened" }

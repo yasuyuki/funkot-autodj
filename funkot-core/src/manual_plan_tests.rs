@@ -122,12 +122,51 @@ fn manual_plan_rejects_bad_marker_and_does_not_bridge_a_break() {
         assert_ne!(rejected.reason, "beat sync: structural identity unknown");
     }
 
-    // The fallback needs the target's trusted marker corridor as well.
+    // A break in the target's actual overlap still rejects beat sync.
     let mut broken_target = next.clone();
     Arc::make_mut(&mut broken_target.samples)[2 * 58_800 * 2..3 * 58_800 * 2].fill(0.0);
     let rejected = build_manual_plan(request(&active, &broken_target, earliest, 4));
     assert!(rejected.simple);
-    assert_eq!(rejected.reason, "structural continuity unknown");
+    assert_eq!(rejected.reason, "target overlap unsafe");
+}
+
+#[test]
+fn manual_plan_beat_syncs_target_after_a_historical_break() {
+    let active = track(0, 180.0);
+    let mut next = track(1, 180.0);
+    let audio = synth_track(180.0, 64, 16, 16, 44_100);
+    next.frames = audio.frames;
+    next.samples = Arc::new(audio.samples);
+    next.intro_bars = 64;
+    next.outro_start_out = 80 * 58_800;
+    next.outro_end_anchored_out = next.outro_start_out;
+    Arc::make_mut(&mut next.samples)[2 * 58_800 * 2..3 * 58_800 * 2].fill(0.0);
+
+    let plan = build_manual_plan(request(&active, &next, 4 * 58_800 + 100, 4));
+    assert!(!plan.simple, "{}", plan.reason);
+    assert_eq!(plan.reason, "beat sync: target structural identity unknown");
+    assert_eq!(plan.start, 8 * 58_800);
+    assert!(plan.entry > 40 * 58_800, "entry must use the prepared overlap, not the head");
+
+    let mut broken_active = active.clone();
+    Arc::make_mut(&mut broken_active.samples)[2 * 58_800 * 2..3 * 58_800 * 2].fill(0.0);
+    let both_unknown = build_manual_plan(request(&broken_active, &next, 4 * 58_800 + 100, 4));
+    assert!(!both_unknown.simple, "{}", both_unknown.reason);
+    assert_eq!(both_unknown.reason, "beat sync: both structural identities unknown");
+
+    let mut overlap_break = next.clone();
+    Arc::make_mut(&mut overlap_break.samples)[50 * 58_800 * 2..51 * 58_800 * 2].fill(0.0);
+    let rejected = build_manual_plan(request(&active, &overlap_break, 4 * 58_800 + 100, 4));
+    assert!(rejected.simple);
+    assert_eq!(rejected.reason, "target overlap unsafe");
+
+    let mut slow_overlap = next.clone();
+    let slow = synth_track(90.0, 2, 0, 0, 44_100);
+    Arc::make_mut(&mut slow_overlap.samples)[50 * 58_800 * 2..54 * 58_800 * 2]
+        .copy_from_slice(&slow.samples);
+    let rejected = build_manual_plan(request(&active, &slow_overlap, 4 * 58_800 + 100, 4));
+    assert!(rejected.simple);
+    assert_eq!(rejected.reason, "target overlap unsafe");
 }
 
 #[test]
