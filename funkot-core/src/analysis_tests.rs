@@ -1268,3 +1268,81 @@ fn observed_groove_gaps_must_be_shorter_than_half_time_at_both_rates() {
         }
     }
 }
+
+#[test]
+fn later_bar_fills_keep_a_constant_tempo_overlap_syncable() {
+    use crate::analysis::local_sync_span;
+    for sr in [44_100, 48_000] {
+        let bpm = 198.0;
+        let mut audio = synth_track(bpm, 16, 16, 16, sr);
+        let fill = pulse_pattern_track(bpm, 2, sr, &[0.0, 0.9, 1.9, 2.9]);
+        for (dst, src) in audio.samples.iter_mut().zip(&fill.samples) {
+            *dst += *src * 1.2;
+        }
+        let first = analyze_local_tempo(&audio.samples, 4 * sr as u64, sr, bpm);
+        let later = analyze_local_tempo(&audio.samples, 8 * sr as u64, sr, bpm);
+        assert!(first.is_some_and(|tempo| tempo.in_transition_range),
+            "the fill must retain a local pulse at {sr}Hz: {first:?}");
+        assert!(later.is_some_and(|tempo| tempo.in_transition_range),
+            "later groove must retain the same pulse at {sr}Hz: {later:?}");
+        assert!(local_sync_span(&audio.samples, 0, 16 * sr as u64, sr, bpm).is_some(),
+            "a later-bar fill must not force a simple transition at {sr}Hz");
+    }
+}
+
+#[test]
+fn half_tied_phase_jump_cannot_authorize_an_overlap() {
+    use crate::analysis::{local_grid_continuous, local_sync_span};
+    for sr in [44_100, 48_000] {
+        let bpm = 198.0;
+        let audio = pulse_pattern_track(bpm, 16, sr, &[0.0, 1.5, 2.5, 3.5]);
+        assert!(!analyze_local_tempo(&audio.samples, 4 * sr as u64, sr, bpm)
+            .is_some_and(|tempo| tempo.in_transition_range),
+            "the source must retain its half-time ambiguity at {sr}Hz");
+        let beat = sr as f64 * 60.0 / bpm;
+        let boundary = (8.0 * 4.0 * beat).round() as usize * 2;
+        let shift = (beat / 2.0).round() as usize * 2;
+        let mut shifted = audio.samples.clone();
+        shifted.copy_within(boundary..audio.samples.len() - shift, boundary + shift);
+        shifted[boundary..boundary + shift].fill(0.0);
+        assert!(!local_grid_continuous(&shifted, 0, audio.frames, sr, bpm));
+        assert!(local_sync_span(&shifted, 0, audio.frames, sr, bpm).is_none(),
+            "half-tied phase jump accepted at {sr}Hz");
+    }
+}
+
+#[test]
+fn constant_tempo_alternating_accents_keep_a_fixed_grid_overlap_syncable() {
+    use crate::analysis::{
+        first_overlap_tile_is_half_tie_for_test, local_grid_continuous, local_sync_span,
+    };
+    for sr in [44_100, 48_000] {
+        let bpm = 198.0;
+        let mut audio = pulse_pattern_track(bpm, 16, sr, &[0.0, 1.0, 2.0, 3.0]);
+        let beat = sr as f64 * 60.0 / bpm;
+        for (frame, sample) in audio.samples.chunks_exact_mut(2).enumerate() {
+            if (frame as f64 / beat).floor() as u64 % 2 == 1 {
+                sample[0] *= 0.7;
+                sample[1] *= 0.7;
+            }
+        }
+        assert!(local_grid_continuous(&audio.samples, 0, audio.frames, sr, bpm));
+        assert!(first_overlap_tile_is_half_tie_for_test(
+            &audio.samples, 12 * sr as u64, sr, bpm,
+        ));
+        assert!(!analyze_local_tempo(&audio.samples, 4 * sr as u64, sr, bpm)
+            .is_some_and(|tempo| tempo.in_transition_range),
+            "alternating accents must remain locally ambiguous at {sr}Hz");
+        assert!(local_sync_span(&audio.samples, 0, 12 * sr as u64, sr, bpm).is_some(),
+            "fixed-grid alternating accents must sync at {sr}Hz");
+
+        let boundary = (8.0 * 4.0 * beat).round() as usize * 2;
+        let shift = (beat / 2.0).round() as usize * 2;
+        let mut shifted = audio.samples.clone();
+        shifted.copy_within(boundary..audio.samples.len() - shift, boundary + shift);
+        shifted[boundary..boundary + shift].fill(0.0);
+        assert!(!local_grid_continuous(&shifted, 0, audio.frames, sr, bpm));
+        assert!(local_sync_span(&shifted, 0, 12 * sr as u64, sr, bpm).is_none(),
+            "shifted alternating accents must not sync at {sr}Hz");
+    }
+}
