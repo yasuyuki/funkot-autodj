@@ -154,11 +154,20 @@ fn manual_plan_beat_syncs_target_after_a_historical_break() {
     assert!(!both_unknown.simple, "{}", both_unknown.reason);
     assert_eq!(both_unknown.reason, "beat sync: both structural identities unknown");
 
+    let mut active_overlap_break = active.clone();
+    Arc::make_mut(&mut active_overlap_break.samples)[10 * 58_800 * 2..11 * 58_800 * 2].fill(0.0);
+    let rejected = build_manual_plan(request(&active_overlap_break, &next, 8 * 58_800, 4));
+    assert_eq!(rejected.reason, "previous overlap unsafe");
+    assert!(rejected.simple);
+    assert!(rejected.entry > next.first_downbeat_out,
+        "unsafe overlap must use a simple fade near the next main, not its long intro head");
+
     let mut overlap_break = next.clone();
     Arc::make_mut(&mut overlap_break.samples)[50 * 58_800 * 2..51 * 58_800 * 2].fill(0.0);
     let rejected = build_manual_plan(request(&active, &overlap_break, 4 * 58_800 + 100, 4));
     assert!(rejected.simple);
     assert_eq!(rejected.reason, "target overlap unsafe");
+    assert!(rejected.entry > next.first_downbeat_out);
 
     let mut slow_overlap = next.clone();
     let slow = synth_track(90.0, 2, 0, 0, 44_100);
