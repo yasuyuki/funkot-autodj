@@ -802,15 +802,16 @@ fn manual_key(action: NavAction, active: &PreparedTrack, target: &PreparedTrack)
 /// Pure, off-audio-thread local plan builder.  A repeating beat may validate
 /// propagation from an existing structural marker, but never invents one.
 fn build_manual_plan(request: ManualRequest) -> ManualPlan {
-    let simple = |reason| {
+    let simple_at = |reason, entry| {
         let available = request.key.active_frames.saturating_sub(request.playhead)
-            .min(request.key.target_frames.saturating_sub(request.key.target_first));
+            .min(request.key.target_frames.saturating_sub(entry));
         let fade = bar_to_frames(request.fade_bars.max(1), request.bar_frames).min(available);
         ManualPlan { generation: request.generation, key: request.key.clone(),
-            start: request.playhead, entry: request.key.target_first, prev_nudge: 0,
+            start: request.playhead, entry, prev_nudge: 0,
             fade_in_end: fade, fade_out_start: 0, fade_out_end: fade,
             simple: true, reason }
     };
+    let simple = |reason| simple_at(reason, request.key.target_first);
     let beat = request.bar_frames / BEATS_PER_BAR as f64;
     if request.key.active_preview || request.key.target_preview || !(beat.is_finite() && beat > 0.0)
         || request.key.active_first >= request.key.active_frames
@@ -921,10 +922,12 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
             || entry.saturating_add(bar_to_frames(schedule.m, request.bar_frames)) > request.key.target_frames {
             return simple("corrected entry exceeds material");
         }
+        // An unsafe overlap forbids rhythmic sync, but the checked nominal
+        // entry can still skip a long analysed intro in a simple crossfade.
         let Some((a_lo, a_hi)) = local_sync_span(&request.active, prev_start, prev_end,
-            request.sample_rate, request.target_bpm) else { return simple("previous overlap unsafe") };
+            request.sample_rate, request.target_bpm) else { return simple_at("previous overlap unsafe", nominal) };
         let Some((b_lo, b_hi)) = local_sync_span(&request.target, entry, target_end,
-            request.sample_rate, request.target_bpm) else { return simple("target overlap unsafe") };
+            request.sample_rate, request.target_bpm) else { return simple_at("target overlap unsafe", nominal) };
         let delta = (a_hi - b_lo).abs().max((b_hi - a_lo).abs());
         // Conservative provisional ceiling, exercised by synthetic drift
         // tests. Listening acceptance is still required before tuning it.

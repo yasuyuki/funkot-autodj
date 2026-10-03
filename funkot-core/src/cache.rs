@@ -405,7 +405,7 @@ fn recompute_outro_start(a: &mut TrackAnalysis) {
     let bar_len = outro_bar_len(a);
     a.outro_start = a
         .total_frames
-        .saturating_sub(u64::from(a.outro_bars) * bar_len);
+        .saturating_sub(u64::from(a.outro_bars).saturating_mul(bar_len));
 }
 
 /// `track_bars`, or a stand-in for entries written before it was stored.
