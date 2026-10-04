@@ -568,10 +568,9 @@ pub(crate) fn local_grid_continuous(
         peaks.sort_by(f64::total_cmp);
         let offset = bar_index as f64 * bar_hops;
         let partial = extent - offset < bar_hops - 1.0;
-        if partial {
-            // The final fraction cannot supply the scorer's two-beat window.
-            // Validate observed attacks against the fixed reference in both
-            // directions instead of silently discarding this part of a fade.
+        if partial && extent - offset < 2.0 * beat / HOP as f64 {
+            // A short final fraction cannot supply the scorer's two-beat window.
+            // Validate its attacks against the fixed reference instead.
             let tolerance = beat * 0.125 / HOP as f64 + 1.0;
             if peaks.iter().any(|p| !reference_peaks.iter().any(|r: &f64|
                 (p - offset - r).abs() <= tolerance)) {
@@ -610,7 +609,7 @@ pub(crate) fn local_grid_continuous(
     let mut index = 1;
     loop {
         let start = anchor + (index as f64 * bar).round() as u64;
-        if start + bar.round() as u64 > end { break; }
+        if start + (2.0 * beat).ceil() as u64 > end { break; }
         let pad = beat.ceil() as u64;
         let from = start - pad;
         let stop = (start + span).min(end);
