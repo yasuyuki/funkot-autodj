@@ -860,105 +860,166 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
             return simple("deadline boundary unavailable");
         }
     };
-    let mut remaining = (request.key.active_frames.saturating_sub(start) as f64 / request.bar_frames)
-        .floor().min(u32::MAX as f64) as u32;
-    let mut schedule = plan_transition(request.fade_bars, request.key.target_intro, remaining);
-    let mut shortened_for_drift = false;
-    // Losing the historical marker propagation does not prove that the tempo
-    // or the immediate overlap is unsafe. This flag permits one bounded retry
-    // from the captured earliest frame, without inventing a new bar origin.
-    let mut beat_only = false;
-    loop {
-        if schedule.fadeout_end == 0 || schedule.f_eff > schedule.fadeout_end {
-            return simple("insufficient fade material");
-        }
-        let nominal = request.key.target_first.saturating_add(bar_to_frames(schedule.skip, request.bar_frames));
-        let overlap = bar_to_frames(schedule.fadeout_end, request.bar_frames);
-        if start.saturating_add(overlap) > request.key.active_frames
-            || nominal.saturating_add(bar_to_frames(schedule.m, request.bar_frames)) > request.key.target_frames {
-            return simple("insufficient remaining material");
-        }
-        // This on-demand corridor check preserves the count from the marker.
-        // A break/tempo change cannot be bridged by a newly invented kick grid.
-        let active_continuous = !beat_only && local_grid_continuous(
-            &request.active, request.key.active_first, start.saturating_add(overlap),
-            request.sample_rate, request.target_bpm,
+    // Keep the historically anchored position first. If it is unsafe, search
+    // the live beat grid up to the deadline captured when Next was pressed.
+    let mut searching_later = false;
+    let next_candidate = |start: u64, searching_later: bool| {
+        let next = if searching_later {
+            start.saturating_add(bar_to_frames(1, request.bar_frames))
+        } else {
+            request.playhead
+        };
+        (next <= request.deadline).then_some(next)
+    };
+    'candidate_search: loop {
+        let remaining = (request.key.active_frames.saturating_sub(start) as f64
+            / request.bar_frames)
+            .floor()
+            .min(u32::MAX as f64) as u32;
+        let mut schedule = plan_transition(
+            request.fade_bars, request.key.target_intro, remaining,
         );
-        if !active_continuous && !beat_only
-            && request.playhead <= request.deadline {
-            // Recompute from the actual earliest frame. Validate the target
-            // corridor for that final schedule below, not for an abandoned
-            // candidate, then require every corrected-overlap check before
-            // accepting Beat. Do not snap to a new marker/bar boundary.
-            beat_only = true;
-            start = request.playhead;
-            remaining = (request.key.active_frames.saturating_sub(start) as f64 / request.bar_frames)
-                .floor().min(u32::MAX as f64) as u32;
-            schedule = plan_transition(request.fade_bars, request.key.target_intro, remaining);
-            shortened_for_drift = false;
-            continue;
+        let mut shortened_for_drift = false;
+        let beat_only = searching_later;
+        loop {
+            if schedule.fadeout_end == 0 || schedule.f_eff > schedule.fadeout_end {
+                return simple("insufficient fade material");
+            }
+            let nominal = request.key.target_first.saturating_add(bar_to_frames(
+                schedule.skip, request.bar_frames,
+            ));
+            let overlap = bar_to_frames(schedule.fadeout_end, request.bar_frames);
+            if start.saturating_add(overlap) > request.key.active_frames
+                || nominal.saturating_add(bar_to_frames(schedule.m, request.bar_frames))
+                    > request.key.target_frames
+            {
+                return simple("insufficient remaining material");
+            }
+
+            // Historical marker continuity proves bar identity. A later
+            // candidate uses only its corrected, locally checked beat span.
+            let active_continuous = !beat_only && local_grid_continuous(
+                &request.active, request.key.active_first,
+                start.saturating_add(overlap), request.sample_rate,
+                request.target_bpm,
+            );
+            if !active_continuous && !beat_only {
+                if let Some(next) = next_candidate(start, searching_later) {
+                    searching_later = true;
+                    start = next;
+                    continue 'candidate_search;
+                }
+                return simple("structural continuity unknown");
+            }
+            let (entry, score, nudge) = align_next_entry_scored(
+                &request.active, start, &request.target, nominal,
+                request.sample_rate, beat,
+            );
+            if !score.is_finite() || score <= 0.0
+                || entry.abs_diff(nominal) as f64 >= beat / 2.0
+                || nudge as f64 >= beat / 2.0
+            {
+                if let Some(next) = next_candidate(start, searching_later) {
+                    searching_later = true;
+                    start = next;
+                    continue 'candidate_search;
+                }
+                return simple("phase evidence uncertain");
+            }
+
+            // Check the corrected overlap, including an earlier target entry
+            // and the active deck's fractional phase nudge.
+            let prev_start = start.saturating_add(nudge);
+            let prev_end = prev_start.saturating_add(overlap);
+            let target_end = entry.saturating_add(overlap);
+            if prev_end > request.key.active_frames
+                || target_end > request.key.target_frames
+                || entry.saturating_add(bar_to_frames(schedule.m, request.bar_frames))
+                    > request.key.target_frames
+            {
+                return simple("corrected entry exceeds material");
+            }
+            let Some((a_lo, a_hi)) = local_sync_span(
+                &request.active, prev_start, prev_end,
+                request.sample_rate, request.target_bpm,
+            ) else {
+                if let Some(next) = next_candidate(start, searching_later) {
+                    searching_later = true;
+                    start = next;
+                    continue 'candidate_search;
+                }
+                return simple_at("previous overlap unsafe", nominal);
+            };
+            let Some((b_lo, b_hi)) = local_sync_span(
+                &request.target, entry, target_end,
+                request.sample_rate, request.target_bpm,
+            ) else {
+                if let Some(next) = next_candidate(start, searching_later) {
+                    searching_later = true;
+                    start = next;
+                    continue 'candidate_search;
+                }
+                return simple_at("target overlap unsafe", nominal);
+            };
+            let delta = (a_hi - b_lo).abs().max((b_hi - a_lo).abs());
+            // Keep the provisional drift ceiling and revalidate after any
+            // fade shortening, because the target entry may change.
+            let drift = delta * overlap as f64 / request.sample_rate as f64 / 60.0;
+            if drift > 0.125 {
+                if !shortened_for_drift {
+                    let max_frames = 0.125 * 60.0 / delta * request.sample_rate as f64;
+                    let fade_bars = (max_frames / request.bar_frames / 2.0).floor() as u32;
+                    if fade_bars > 0 && fade_bars < schedule.f_eff {
+                        schedule = plan_transition(
+                            fade_bars, request.key.target_intro, remaining,
+                        );
+                        shortened_for_drift = true;
+                        continue;
+                    }
+                }
+                if let Some(next) = next_candidate(start, searching_later) {
+                    searching_later = true;
+                    start = next;
+                    continue 'candidate_search;
+                }
+                return simple("tempo drift");
+            }
+
+            // This long marker corridor only labels a safe plan. Failed
+            // candidates need their corrected local overlap checks alone.
+            let target_structure_known = local_grid_continuous(
+                &request.target, request.key.target_first,
+                nominal.saturating_add(overlap), request.sample_rate,
+                request.target_bpm,
+            );
+            let four_bar = aligned_configuration && schedule.skip % 4 == 0
+                && schedule.f_eff % 4 == 0 && schedule.fadeout_start % 4 == 0
+                && schedule.fadeout_end % 4 == 0 && schedule.m % 4 == 0;
+            let reason = if beat_only && !target_structure_known {
+                "beat sync: both structural identities unknown"
+            } else if beat_only {
+                "beat sync: structural identity unknown"
+            } else if !target_structure_known {
+                "beat sync: target structural identity unknown"
+            } else if deadline_limited {
+                "bar sync: deadline limited"
+            } else if four_bar {
+                "four-bar sync"
+            } else if shortened_for_drift {
+                "bar sync: drift shortened"
+            } else if schedule.f_eff != request.fade_bars {
+                "bar sync: material shortened"
+            } else {
+                "bar sync: explicit fade or intro"
+            };
+            return ManualPlan {
+                generation: request.generation, key: request.key, start, entry,
+                prev_nudge: nudge,
+                fade_in_end: bar_to_frames(schedule.f_eff, request.bar_frames),
+                fade_out_start: bar_to_frames(schedule.fadeout_start, request.bar_frames),
+                fade_out_end: overlap, simple: false, reason,
+            };
         }
-        let target_structure_known = local_grid_continuous(&request.target, request.key.target_first,
-            nominal.saturating_add(overlap), request.sample_rate, request.target_bpm);
-        // A broken target marker corridor cannot establish bar identity. The
-        // proposed overlap may still establish beat sync after correction; both
-        // actual overlap regions must pass the checks below.
-        if !beat_only && !active_continuous {
-            return simple("structural continuity unknown");
-        }
-        let (entry, score, nudge) = align_next_entry_scored(&request.active, start,
-            &request.target, nominal, request.sample_rate, beat);
-        if !score.is_finite() || score <= 0.0
-            || entry.abs_diff(nominal) as f64 >= beat / 2.0 || nudge as f64 >= beat / 2.0 {
-            return simple("phase evidence uncertain");
-        }
-        // The corrected positions, not the nominal ones, bound all subsequent
-        // analysis and material checks. An earlier target entry retains its
-        // fractional phase correction without changing bar identity.
-        let prev_start = start.saturating_add(nudge);
-        let prev_end = prev_start.saturating_add(overlap);
-        let target_end = entry.saturating_add(overlap);
-        if prev_end > request.key.active_frames || target_end > request.key.target_frames
-            || entry.saturating_add(bar_to_frames(schedule.m, request.bar_frames)) > request.key.target_frames {
-            return simple("corrected entry exceeds material");
-        }
-        // An unsafe overlap forbids rhythmic sync, but the checked nominal
-        // entry can still skip a long analysed intro in a simple crossfade.
-        let Some((a_lo, a_hi)) = local_sync_span(&request.active, prev_start, prev_end,
-            request.sample_rate, request.target_bpm) else { return simple_at("previous overlap unsafe", nominal) };
-        let Some((b_lo, b_hi)) = local_sync_span(&request.target, entry, target_end,
-            request.sample_rate, request.target_bpm) else { return simple_at("target overlap unsafe", nominal) };
-        let delta = (a_hi - b_lo).abs().max((b_hi - a_lo).abs());
-        // Conservative provisional ceiling, exercised by synthetic drift
-        // tests. Listening acceptance is still required before tuning it.
-        let drift = delta * overlap as f64 / request.sample_rate as f64 / 60.0;
-        if drift > 0.125 {
-            if shortened_for_drift { return simple("tempo drift"); }
-            let max_frames = 0.125 * 60.0 / delta * request.sample_rate as f64;
-            let fade_bars = (max_frames / request.bar_frames / 2.0).floor() as u32;
-            if fade_bars == 0 || fade_bars >= schedule.f_eff { return simple("tempo drift"); }
-            schedule = plan_transition(fade_bars, request.key.target_intro, remaining);
-            shortened_for_drift = true;
-            // Changing fade length changes entry: recompute phase and inspect
-            // the new overlap instead of reusing the previous correction.
-            continue;
-        }
-        let four_bar = aligned_configuration && schedule.skip % 4 == 0
-            && schedule.f_eff % 4 == 0 && schedule.fadeout_start % 4 == 0
-            && schedule.fadeout_end % 4 == 0 && schedule.m % 4 == 0;
-        let reason = if beat_only && !target_structure_known {
-            "beat sync: both structural identities unknown"
-        } else if beat_only { "beat sync: structural identity unknown" }
-            else if !target_structure_known { "beat sync: target structural identity unknown" }
-            else if deadline_limited { "bar sync: deadline limited" }
-            else if four_bar { "four-bar sync" }
-            else if shortened_for_drift { "bar sync: drift shortened" }
-            else if schedule.f_eff != request.fade_bars { "bar sync: material shortened" }
-            else { "bar sync: explicit fade or intro" };
-        return ManualPlan { generation: request.generation, key: request.key, start, entry,
-            prev_nudge: nudge, fade_in_end: bar_to_frames(schedule.f_eff, request.bar_frames),
-            fade_out_start: bar_to_frames(schedule.fadeout_start, request.bar_frames),
-            fade_out_end: overlap, simple: false, reason };
     }
 }
 
@@ -1804,6 +1865,10 @@ impl Engine {
                 return;
             }
             _ => {}
+        }
+
+        if action == NavAction::TransitionToNext && self.manual_action == Some(action) {
+            return;
         }
 
         // Immediate jumps skip BPM / bar wait.
@@ -5217,6 +5282,26 @@ mod tests {
         assert_eq!(replanned.key.action, NavAction::TransitionToNext);
         assert_eq!(engine.manual_deadline, Some(now + 32), "retry must not extend the deadline");
         assert!(engine.manual_in_flight);
+    }
+
+    #[test]
+    fn duplicate_next_keeps_the_first_plan_and_deadline() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let (request_tx, request_rx) = mpsc::sync_channel(2);
+        engine.manual_tx = request_tx;
+        engine.begin_nav(NavAction::TransitionToNext);
+        let first = request_rx.try_recv().expect("first Next dispatched");
+        let generation = engine.nav_gen;
+        let deadline = engine.manual_deadline;
+        let reserved = engine.next_track_path().map(Path::to_path_buf);
+
+        engine.begin_nav(NavAction::TransitionToNext);
+
+        assert_eq!(first.generation, generation);
+        assert_eq!(engine.nav_gen, generation);
+        assert_eq!(engine.manual_deadline, deadline);
+        assert_eq!(engine.next_track_path().map(Path::to_path_buf), reserved);
+        assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]

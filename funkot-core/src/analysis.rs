@@ -275,7 +275,8 @@ fn analyze_local_tempo_inner(
         .clamp(0.0, (frames.saturating_sub(1)) as f64) as u64;
 
     let in_transition_range = (bpm_lo..=bpm_hi).contains(&bpm)
-        && local_period_supported(&onset.novelty, bpm, sample_rate, target_bpm, context)
+        && local_period_support(&onset.novelty, bpm, sample_rate, target_bpm, context)
+            == PeriodSupport::Strong
         // An overlap validates one reference across the full span
         // after collecting all tempo tiles. Do not invent another reference
         // at each arbitrary eight-second seam.
@@ -295,7 +296,12 @@ fn analyze_local_tempo_inner(
 #[derive(Clone, Copy, PartialEq)]
 enum PeriodContext { Unanchored, Overlap }
 
-fn local_period_supported(novelty: &[f64], bpm: f64, sr: u32, target: f64, context: PeriodContext) -> bool {
+#[derive(Clone, Copy, PartialEq)]
+enum PeriodSupport { Strong, HalfTie, Reject }
+
+fn local_period_support(
+    novelty: &[f64], bpm: f64, sr: u32, target: f64, context: PeriodContext,
+) -> PeriodSupport {
     // Integrate the onset over its neighboring hops before comparing metrical
     // levels. At 48 kHz/180 BPM a beat is 62.5 hops: point sampling alternates
     // between a peak and an interpolated valley, spuriously favoring half time.
@@ -305,12 +311,12 @@ fn local_period_supported(novelty: &[f64], bpm: f64, sr: u32, target: f64, conte
         novelty[a..b].iter().sum::<f64>() / (b - a) as f64
     }).collect();
     let novelty = integrated.as_slice();
-    let Some((mean, sd)) = novelty_stats(novelty) else { return false };
+    let Some((mean, sd)) = novelty_stats(novelty) else { return PeriodSupport::Reject };
     let period = bpm_to_period_hops(bpm, HOP as f64, sr as f64);
     let z = comb_z(novelty, period, mean, sd);
     // At least eight observed pulses, and a peak three standard errors above
     // the envelope mean. Sparse hits cannot establish a mixable pulse train.
-    if novelty.len() as f64 / period < 8.0 || z < 3.0 { return false; }
+    if novelty.len() as f64 / period < 8.0 || z < 3.0 { return PeriodSupport::Reject; }
     let mut best = z;
     let mut best_period = period;
     let mut candidate = target / 3.0;
@@ -323,27 +329,40 @@ fn local_period_supported(novelty: &[f64], bpm: f64, sr: u32, target: f64, conte
     let half = comb_z(novelty, period * 2.0, mean, sd);
     // The candidate may differ slightly from the wide sweep's sampling of the
     // same peak. A half-time peak must be clearly weaker, not merely in-band.
-    if z >= best * 0.95 && half < z * 0.9 { return true; }
-    if context == PeriodContext::Unanchored { return false; }
+    if z >= best * 0.95 && half < z * 0.9 { return PeriodSupport::Strong; }
+    if context == PeriodContext::Overlap && z >= best * 0.80 && half < z * 0.9 {
+        return PeriodSupport::Strong;
+    }
+    if context == PeriodContext::Unanchored { return PeriodSupport::Reject; }
     // A one-phase comb can prefer subdivisions or alternating accents in a
     // syncopated groove. Full-span fixed-reference phase validation permits
     // a second witness: all onset pairs at the proposed beat must correlate
     // more strongly than the winning comb period and half time. Sub-beat
     // subdivisions alone do not invalidate an independently preserved beat.
-    // Use the same samples for all lags; ties remain unknown. When the proposed
-    // beat is itself the comb winner, this intentionally cannot override the
-    // half-time ambiguity by comparing the candidate to itself.
+    // Use the same samples for all lags. A local tie remains unknown; only
+    // `local_sync_span` may resolve one bounded tie with whole-overlap evidence.
+    // A whole-overlap witness may resolve a narrow half-time tie caused by one
+    // tile's accents. It is intentionally not local evidence: callers must
+    // still prove fixed-grid continuity across the whole overlap.
+    let tie = z >= best * 0.65 && half <= z * 0.97;
     // Refinement and the coarse sweep can sample the same peak at slightly
     // different tempi. They are not independent evidence when their phase
     // separation over the observed span is inside the existing 1/8-beat
-    // tolerance; a tiny interpolation advantage must not defeat a half tie.
+    // tolerance, so only the full overlap may decide a bounded tie.
     if (1.0 / period - 1.0 / best_period).abs() * novelty.len() as f64 <= 0.125 {
-        return false;
+        return if tie { PeriodSupport::HalfTie } else { PeriodSupport::Reject };
     }
     let overlap = novelty.len().saturating_sub((period * 2.0).max(best_period).ceil() as usize + 1);
     let proposed = period_correlation(novelty, period, overlap);
-    proposed > period_correlation(novelty, best_period, overlap)
+    if proposed > period_correlation(novelty, best_period, overlap)
         && proposed > period_correlation(novelty, period * 2.0, overlap)
+    {
+        PeriodSupport::Strong
+    } else if tie {
+        PeriodSupport::HalfTie
+    } else {
+        PeriodSupport::Reject
+    }
 }
 
 fn period_correlation(values: &[f64], lag: f64, overlap: usize) -> f64 {
@@ -378,20 +397,120 @@ pub(crate) fn local_sync_span(
     let mut offset = 0;
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
+    let mut half_ties = 0usize;
     loop {
         let a = start + offset;
         let b = (a + window).min(end);
         let segment = &samples[a as usize * 2..b as usize * 2];
         let tempo = analyze_local_tempo_inner(segment, (b - a) / 2, sr, target, PeriodContext::Overlap)?;
-        if !tempo.in_transition_range { return None; }
+        if !(target * (BPM_MIN / NOMINAL_BPM)..=target * (BPM_MAX / NOMINAL_BPM))
+            .contains(&tempo.bpm)
+        {
+            return None;
+        }
+        let mono: Vec<f32> = segment.chunks_exact(2).map(|s| (s[0] + s[1]) * 0.5).collect();
+        let onset = onset_envelope(&mono, sr, HOP).ok()?;
+        let support = local_period_support(&onset.novelty, tempo.bpm, sr, target, PeriodContext::Overlap);
+        match support {
+            PeriodSupport::Strong => {}
+            PeriodSupport::HalfTie => half_ties += 1,
+            PeriodSupport::Reject => return None,
+        }
         lo = lo.min(tempo.bpm);
         hi = hi.max(tempo.bpm);
         if b == end { break; }
         offset = (offset + window / 2).min(span.saturating_sub(window));
     }
-    // Tiles measure tempo; a single reference phase covers their seams.
-    local_grid_continuous(samples, start, end, sr, (lo + hi) / 2.0)
-        .then_some((lo, hi))
+    // Every overlap retains the fixed grid check. A near half-time tie may
+    // be an accent alias only when independent normalized onset evidence also
+    // covers the same fixed-tempo overlap.
+    let grid_bpm = (lo + hi) / 2.0;
+    let grid = local_grid_continuous(samples, start, end, sr, grid_bpm);
+    let witness = half_ties == 0 || overlap_onset_witness(samples, start, end, sr, grid_bpm);
+    if !grid || !witness {
+        None
+    } else {
+        Some((lo, hi))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn first_overlap_tile_is_half_tie_for_test(
+    samples: &[f32], end: u64, sr: u32, target: f64,
+) -> bool {
+    let window = (8.0 * sr as f64) as u64;
+    let end = end.min((samples.len() / 2) as u64).min(window);
+    if end == 0 { return false; }
+    let segment = &samples[..end as usize * 2];
+    let Some(tempo) = analyze_local_tempo_inner(
+        segment, end / 2, sr, target, PeriodContext::Overlap,
+    ) else { return false; };
+    let mono: Vec<f32> = segment.chunks_exact(2).map(|s| (s[0] + s[1]) * 0.5).collect();
+    let Ok(onset) = onset_envelope(&mono, sr, HOP) else { return false; };
+    local_period_support(&onset.novelty, tempo.bpm, sr, target, PeriodContext::Overlap)
+        == PeriodSupport::HalfTie
+}
+
+/// Confirm continuous onset presence across a bounded accent change. Per-bar
+/// normalization and capping remove level changes; non-maximum suppression
+/// keeps one drum attack from counting as its decay.
+fn overlap_onset_witness(samples: &[f32], start: u64, end: u64, sr: u32, bpm: f64) -> bool {
+    let beat = 60.0 * sr as f64 / bpm;
+    let beat_hops = beat / HOP as f64;
+    let bar_hops = beat_hops * f64::from(BEATS_PER_BAR);
+    if !beat_hops.is_finite() || beat_hops < 8.0 { return false; }
+    let mono: Vec<f32> = samples[start as usize * 2..end as usize * 2]
+        .chunks_exact(2).map(|s| (s[0] + s[1]) * 0.5).collect();
+    let Ok(onset) = onset_envelope(&mono, sr, HOP) else { return false; };
+    let full_bars = (onset.novelty.len() as f64 / bar_hops).floor() as usize;
+    if full_bars < 3 { return false; }
+    let bars = (onset.novelty.len() as f64 / bar_hops).ceil() as usize;
+
+    let half_time = beat_hops * 2.0;
+    let mut last = None;
+    let mut observed = 0usize;
+    for bar in 0..bars {
+        let a = (bar as f64 * bar_hops).round() as usize;
+        let b = (((bar as f64 + 1.0) * bar_hops).round() as usize)
+            .min(onset.novelty.len());
+        if b <= a { break; }
+        let scale = onset.novelty[a..b].iter().copied().fold(0.0, f64::max);
+        if scale <= SILENCE_EPS {
+            if bar == full_bars { break; }
+            return false;
+        }
+        let mut order: Vec<usize> = (a..b).collect();
+        order.sort_by(|&i, &j| onset.novelty[j].total_cmp(&onset.novelty[i]));
+        let mut peaks = Vec::new();
+        let suppression = beat_hops * 0.125;
+        for i in order {
+            let weight = (onset.novelty[i] / scale).min(1.0);
+            if weight < 0.15 { break; }
+            if peaks.iter().all(|&p: &usize| (p as f64 - i as f64).abs() > suppression) {
+                peaks.push(i);
+            }
+        }
+        if peaks.is_empty() {
+            if bar == full_bars { break; }
+            return false;
+        }
+        peaks.sort_unstable();
+        for peak in peaks {
+            if let Some(previous) = last {
+                let gap = peak as f64 - previous + 2.0;
+                if gap >= half_time {
+                    return false;
+                }
+            }
+            last = Some(peak as f64);
+            observed += 1;
+        }
+    }
+    let Some(last) = last else { return false; };
+    let end_gap = onset.novelty.len() as f64 - last + 2.0;
+    // A slow island can keep every onset gap under two target beats, but
+    // cannot provide one capped attack per target beat across each bar.
+    observed >= full_bars * BEATS_PER_BAR as usize && end_gap < half_time
 }
 
 /// Preserve an existing count only across continuous rhythmic evidence.

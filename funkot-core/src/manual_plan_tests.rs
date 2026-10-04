@@ -106,9 +106,9 @@ fn manual_plan_rejects_bad_marker_and_does_not_bridge_a_break() {
     // beat-only candidate; historical marker loss alone is not enough.
     let mut overlap_break = track(2, 180.0);
     Arc::make_mut(&mut overlap_break.samples)[10 * 58_800 * 2..11 * 58_800 * 2].fill(0.0);
-    let rejected = build_manual_plan(request(&overlap_break, &next, 8 * 58_800, 4));
-    assert!(rejected.simple);
-    assert_eq!(rejected.reason, "previous overlap unsafe");
+    let delayed = build_manual_plan(request(&overlap_break, &next, 8 * 58_800, 4));
+    assert!(!delayed.simple, "{}", delayed.reason);
+    assert_eq!(delayed.start, 11 * 58_800);
 
     // A recovered 90/120 BPM island in the actual overlap is just as unsafe
     // as silence there. The historical break must not turn it into Beat.
@@ -117,7 +117,9 @@ fn manual_plan_rejects_bad_marker_and_does_not_bridge_a_break() {
         let different_tempo = synth_track(bpm, 4, 0, 0, 44_100);
         Arc::make_mut(&mut excursion.samples)[10 * 58_800 * 2..14 * 58_800 * 2]
             .copy_from_slice(&different_tempo.samples[..4 * 58_800 * 2]);
-        let rejected = build_manual_plan(request(&excursion, &next, 8 * 58_800, 4));
+        let mut req = request(&excursion, &next, 8 * 58_800, 4);
+        req.deadline = 12 * 58_800;
+        let rejected = build_manual_plan(req);
         assert!(rejected.simple, "{bpm}: {}", rejected.reason);
         assert_ne!(rejected.reason, "beat sync: structural identity unknown");
     }
@@ -126,10 +128,24 @@ fn manual_plan_rejects_bad_marker_and_does_not_bridge_a_break() {
     let mut broken_target = next.clone();
     Arc::make_mut(&mut broken_target.samples)[2 * 58_800 * 2..3 * 58_800 * 2].fill(0.0);
     let rejected = build_manual_plan(request(&active, &broken_target, earliest, 4));
-    assert!(rejected.simple);
-    assert_eq!(rejected.reason, "target overlap unsafe");
+    assert!(!rejected.simple, "{}", rejected.reason);
 }
 
+
+#[test]
+fn manual_plan_uses_simple_fade_when_no_safe_overlap_precedes_deadline() {
+    let bar = 58_800usize;
+    let mut active = track(0, 180.0);
+    let next = track(1, 180.0);
+    Arc::make_mut(&mut active.samples)[10 * bar * 2..20 * bar * 2].fill(0.0);
+    let mut req = request(&active, &next, 8 * bar as u64, 4);
+    req.deadline = 12 * bar as u64;
+
+    let plan = build_manual_plan(req);
+
+    assert!(plan.simple);
+    assert_eq!(plan.entry, next.first_downbeat_out);
+}
 #[test]
 fn manual_plan_beat_syncs_target_after_a_historical_break() {
     let active = track(0, 180.0);
@@ -156,26 +172,23 @@ fn manual_plan_beat_syncs_target_after_a_historical_break() {
 
     let mut active_overlap_break = active.clone();
     Arc::make_mut(&mut active_overlap_break.samples)[10 * 58_800 * 2..11 * 58_800 * 2].fill(0.0);
-    let rejected = build_manual_plan(request(&active_overlap_break, &next, 8 * 58_800, 4));
-    assert_eq!(rejected.reason, "previous overlap unsafe");
-    assert!(rejected.simple);
-    assert!(rejected.entry > next.first_downbeat_out,
-        "unsafe overlap must use a simple fade near the next main, not its long intro head");
+    let delayed = build_manual_plan(request(&active_overlap_break, &next, 8 * 58_800, 4));
+    assert!(!delayed.simple, "{}", delayed.reason);
+    assert_eq!(delayed.start, 11 * 58_800);
 
     let mut overlap_break = next.clone();
     Arc::make_mut(&mut overlap_break.samples)[50 * 58_800 * 2..51 * 58_800 * 2].fill(0.0);
     let rejected = build_manual_plan(request(&active, &overlap_break, 4 * 58_800 + 100, 4));
-    assert!(rejected.simple);
-    assert_eq!(rejected.reason, "target overlap unsafe");
+    assert!(!rejected.simple, "{}", rejected.reason);
     assert!(rejected.entry > next.first_downbeat_out);
-
     let mut slow_overlap = next.clone();
     let slow = synth_track(90.0, 2, 0, 0, 44_100);
     Arc::make_mut(&mut slow_overlap.samples)[50 * 58_800 * 2..54 * 58_800 * 2]
         .copy_from_slice(&slow.samples);
     let rejected = build_manual_plan(request(&active, &slow_overlap, 4 * 58_800 + 100, 4));
     assert!(rejected.simple);
-    assert_eq!(rejected.reason, "target overlap unsafe");
+    assert!(rejected.entry >= next.first_downbeat_out,
+        "unsafe target must retain the analyzed entry");
 }
 
 #[test]
