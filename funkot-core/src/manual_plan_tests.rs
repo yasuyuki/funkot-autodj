@@ -367,3 +367,33 @@ fn manual_syncopated_groove_keeps_structural_four_bar_plan() {
     assert_eq!(plan.fade_out_start, 4 * 58_800);
     assert_eq!(plan.fade_out_end, 8 * 58_800);
 }
+
+#[test]
+fn manual_plan_shortens_a_sparse_target_overlap_before_simple_fade() {
+    let bar = 58_800usize;
+    let active = track(0, 180.0);
+    let mut target = track(1, 180.0);
+    let audio = synth_track(180.0, 64, 16, 16, 44_100);
+    target.frames = audio.frames;
+    target.samples = Arc::new(audio.samples);
+    target.intro_bars = 64;
+    target.outro_start_out = 80 * bar as u64;
+    target.outro_end_anchored_out = target.outro_start_out;
+    Arc::make_mut(&mut target.samples)[50 * bar * 2..51 * bar * 2].fill(0.0);
+
+    assert!(crate::analysis::local_sync_span(
+        &target.samples, 48 * bar as u64, 56 * bar as u64, 44_100, 180.0,
+    ).is_none());
+    assert!(crate::analysis::local_sync_span(
+        &target.samples, 52 * bar as u64, 56 * bar as u64, 44_100, 180.0,
+    ).is_some());
+
+    let mut req = request(&active, &target, 4 * bar as u64 + 100, 4);
+    req.deadline = 8 * bar as u64;
+    let plan = build_manual_plan(req);
+    assert!(!plan.simple, "{}", plan.reason);
+    assert_eq!(plan.start, 8 * bar as u64);
+    assert!(plan.entry.abs_diff(52 * bar as u64) < (bar / 4) as u64);
+    assert_eq!(plan.fade_in_end, 2 * bar as u64);
+    assert_eq!(plan.fade_out_end, 4 * bar as u64);
+}

@@ -880,6 +880,7 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
             request.fade_bars, request.key.target_intro, remaining,
         );
         let mut shortened_for_drift = false;
+        let mut shortened_for_target = false;
         let beat_only = searching_later;
         loop {
             if schedule.fadeout_end == 0 || schedule.f_eff > schedule.fadeout_end {
@@ -954,6 +955,16 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
                 &request.target, entry, target_end,
                 request.sample_rate, request.target_bpm,
             ) else {
+                if !shortened_for_target && schedule.f_eff > 1 {
+                    // A shorter fade enters later in the prepared intro while
+                    // preserving the gap before its main section. Recheck both
+                    // decks, phase, and drift for the new overlap.
+                    schedule = plan_transition(
+                        (schedule.f_eff / 2).max(1), request.key.target_intro, remaining,
+                    );
+                    shortened_for_target = true;
+                    continue;
+                }
                 if let Some(next) = next_candidate(start, searching_later) {
                     searching_later = true;
                     start = next;
