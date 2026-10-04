@@ -1901,7 +1901,7 @@ impl Engine {
         let simple_fade = bar_to_frames(self.options.fade_bars.max(1), self.bar_frames);
         let material_end = active.track.frames.saturating_sub(simple_fade);
         let natural_end = if active.track.outro_start_out > active.playhead { active.track.outro_start_out } else { material_end };
-        self.manual_deadline = Some(active.playhead.saturating_add(bar_to_frames(16, self.bar_frames)).min(natural_end).min(material_end));
+        self.manual_deadline = Some(active.playhead.saturating_add(bar_to_frames(24, self.bar_frames)).min(natural_end).min(material_end));
         self.manual_action = Some(action);
         self.manual_pending = Some(ManualDemand { generation: self.nav_gen, action });
         self.kick_manual_plan_if_idle();
