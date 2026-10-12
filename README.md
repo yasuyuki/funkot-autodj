@@ -149,6 +149,8 @@ Startup options:
 funkot-autodj -l playlist.txt --purge-auto-cache --fill-missing-cache
 ```
 
+Domain terms: [CONTEXT.md](CONTEXT.md).
+
 ## Layout
 
 - `funkot-core` — analysis and mix engine library. Exposes a C ABI
