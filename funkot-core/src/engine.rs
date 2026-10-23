@@ -3985,6 +3985,32 @@ mod tests {
     }
 
     #[test]
+    fn future_fence_keeps_a_prepared_old_track_silent_between_tracks() {
+        for commit in [false, true] {
+            let mut engine = future_engine(&[1, 2]);
+            engine.poll_events();
+            engine.retire_active();
+            let token = engine.begin_future_update().unwrap();
+            assert_eq!(token.current_index(), None);
+            let mut audio = [1.0; 8];
+            assert_eq!(engine.render(&mut audio), 4);
+            assert_eq!(audio, [0.0; 8]);
+            assert_eq!(engine.current_index(), None, "the old prepared track must not start under the fence");
+            assert!(engine.poll_events().is_empty());
+            if commit {
+                drop(engine.commit_future_update(token, future_replacement(vec![future_track(3)])));
+                wait_future(&mut engine);
+                engine.render(&mut [0.0; 2]);
+                assert_eq!(engine.current_index(), Some(3));
+            } else {
+                engine.abort_future_update(token);
+                engine.render(&mut [0.0; 2]);
+                assert_eq!(engine.current_index(), Some(2));
+            }
+        }
+    }
+
+    #[test]
     fn future_parked_source_is_not_consumed_before_commit_and_nav_sender_survives() {
         struct Empty(Arc<AtomicUsize>);
         impl TrackSource for Empty {
