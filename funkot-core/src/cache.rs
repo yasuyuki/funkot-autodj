@@ -121,6 +121,11 @@ fn read_entry(path: &Path) -> std::result::Result<CacheLookup, ReadError> {
     if automatic_both_low_geometry_is_impossible(&analysis) {
         analysis.needs_reanalysis = true;
     }
+    if !analysis.outro_bars_manual
+        && analysis.outro_bars > track_bars_or_estimate(&analysis).saturating_sub(analysis.intro_bars)
+    {
+        derive_outro_from_structure(&mut analysis);
+    }
     Ok(CacheLookup::Hit(analysis))
 }
 
@@ -452,19 +457,8 @@ fn derive_outro_from_structure(a: &mut TrackAnalysis) {
     recompute_outro_start(a);
 }
 
-/// Keep `outro_structure_bars <= outro_bars` after a hand-edited trigger.
-///
-/// `analysis::analyze` holds that invariant by construction — the trigger is
-/// the boundary plus a lead-in, so it can never sit closer to the file end.
-/// A manual `outro_bars` skips that rule entirely, and shortening the outro
-/// past the detected boundary would leave the boundary claiming the outro
-/// starts *earlier* than the mix trigger the same entry advertises. That is
-/// the field `labels`/`eval_sections` compare against hand-labeled ground
-/// truth, so the tracks a user cared enough about to correct by hand would be
-/// exactly the ones scored against a broken value.
-///
-/// Only ever lowers: a manual trigger placed further back adds room, and the
-/// detected boundary is still the best estimate of where the outro begins.
+/// A manual trigger override also clips the structural count to that trigger.
+
 fn clamp_structure_to_outro(a: &mut TrackAnalysis) {
     a.outro_structure_bars = a.outro_structure_bars.min(a.outro_bars);
 }
@@ -1140,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_or_partly_confident_v14_entries_are_read_without_geometry_repair() {
+    fn cached_derived_trigger_clips_without_changing_manual_fields_or_disk() {
         let dir = TempDir::new("v14-protected-geometry");
         for (number, label) in ["intro_manual", "outro_manual", "structure_manual",
             "intro_confident", "outro_confident"].into_iter().enumerate() {
@@ -1165,6 +1159,10 @@ mod tests {
             fs::write(&path, &bytes).unwrap();
             let loaded = load_checked(dir.path(), &hash).unwrap();
             let CacheLookup::Hit(loaded) = loaded else { panic!("{label} entry was not a hit"); };
+            if !protected.outro_bars_manual {
+                protected.outro_bars = 26;
+                recompute_outro_start(&mut protected);
+            }
             assert_eq!(loaded, protected, "{label} semantics");
             assert!(!loaded.needs_reanalysis, "{label} entry must remain complete");
             assert_eq!(fs::read(path).unwrap(), bytes, "{label} bytes");

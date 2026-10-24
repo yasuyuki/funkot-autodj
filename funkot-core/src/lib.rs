@@ -25,6 +25,7 @@ pub mod filter;
 pub mod labels;
 pub mod stretch;
 pub mod structure;
+mod transition_geometry;
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod owned_wav;
@@ -44,9 +45,7 @@ pub const NOMINAL_BPM: f64 = 180.0;
 /// Beats per bar (Funkot is straight 4/4).
 pub const BEATS_PER_BAR: u32 = 4;
 
-/// Bars of the next track's intro that remain after the previous track's
-/// fade-out has completed (and before the next main section starts).
-pub const MAIN_GAP_BARS: u32 = 8;
+pub use transition_geometry::MAIN_GAP_BARS;
 
 /// Obsolete: the compact schedule always leaves exactly [`MAIN_GAP_BARS`] of
 /// next-intro solo; long intros are entered via `skip` instead of a longer
@@ -137,10 +136,10 @@ pub struct TrackAnalysis {
     #[serde(default)]
     pub track_bars: u32,
     /// Outro mix-trigger length in bars (from file end): where the
-    /// transition *starts*. [`Self::outro_structure_bars`] plus the mix
-    /// lead-in, so that the transition — two fades and [`MAIN_GAP_BARS`],
-    /// 16 bars in total — finishes exactly where the outro begins. The outro
-    /// itself is never mixed over.
+    /// transition starts, measured in bars from the end. A valid structural
+    /// boundary gets up to 16 bars of lead, bounded by the track body after
+    /// the intro. Default four-bar fades use that lead; short or contradictory
+    /// material may require a shorter or simple transition.
     pub outro_bars: u32,
     /// Musical main→outro *structural* boundary in bars from file end —
     /// where the energy/mid-high content actually collapses, independent of
@@ -156,17 +155,12 @@ pub struct TrackAnalysis {
     /// than re-deriving, and it is what offline evaluation against
     /// hand-labeled ground truth compares.
     ///
-    /// **Invariant: `outro_structure_bars <= outro_bars` always holds** —
-    /// the structural boundary is never farther from the file end than the
-    /// mix trigger derived from it. True by construction since cache version
-    /// 10: `analysis::outro_trigger_bars` never returns less than the
-    /// boundary it is handed. Hand-edited triggers don't go through that rule,
-    /// so `cache::set_manual_bars` / `cache::apply_manual_overrides` lower this
-    /// field to match instead. `0` only in stripped/manual-only cache entries pending
-    /// reanalysis (see `cache::purge_auto`); a completed analysis always
-    /// sets a real value. Added in cache version 9; absent (defaults to 0)
-    /// on entries written before that, but those are already invalidated by
-    /// the version bump.
+    /// For a boundary within the track body after the intro,
+    /// `outro_structure_bars <= outro_bars`. A contradictory boundary can
+    /// exceed the clipped trigger; the estimate is retained for evaluation.
+    /// Manual trigger overrides separately lower the structural count to the
+    /// requested trigger when needed. Zero also denotes stripped/manual-only
+    /// entries pending reanalysis. Added in cache version 9.
     #[serde(default)]
     pub outro_structure_bars: u32,
     /// `true` when either intro or outro bar count is low-confidence
