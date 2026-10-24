@@ -1211,6 +1211,9 @@ impl Engine {
         }
 
         let bar_frames = options.bar_frames();
+        if !(bar_frames.is_finite() && bar_frames >= 1.0) {
+            return Err(Error::Engine("a bar must span at least one finite output frame".into()));
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
         // Permit capacity is fixed at construction (no live labeling switch):
@@ -1309,6 +1312,9 @@ impl Engine {
         }
 
         let bar_frames = options.bar_frames();
+        if !(bar_frames.is_finite() && bar_frames >= 1.0) {
+            return Err(Error::Engine("a bar must span at least one finite output frame".into()));
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
         let prefetch = prefetch_depth_for(&options);
@@ -3849,6 +3855,15 @@ mod tests {
 
         assert!(engine.transition.as_ref().unwrap().simple);
         assert_eq!(engine.render_one_frame(), (0.5, 0.5));
+    }
+
+    #[test]
+    fn unrepresentable_bar_frame_geometry_is_rejected_at_ingress() {
+        for (rate, sample_rate) in [(f64::MAX, 44_100), (f64::MIN_POSITIVE, 44_100), (30.0, 1)] {
+            let options = EngineOptions { rate, output_sample_rate: sample_rate, ..EngineOptions::default() };
+            assert!(Engine::new(options.clone(), Vec::new()).is_err());
+            assert!(Engine::from_prepared(options, vec![future_track(0)]).is_err());
+        }
     }
 
     #[test]
