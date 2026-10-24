@@ -9,7 +9,7 @@
 //!    then refine to sample accuracy (hop quantization is not enough for DJ phase).
 //! 5. Anchor the outro grid from the track end (production ends on a bar).
 //! 6. Detect intro length via boundary contrast + edge sharpness at
-//!    {8,16,32,48,64}, then medium/long cues at {48,64,80,96} (tension drop,
+//!    {16,32,48,64}, then medium/long cues at {48,64,80,96} (tension drop,
 //!    pre-boundary fill/shout, sharp rise) when the before-window is still
 //!    intro-like. At 48, a sustained tension drop — quieter (RMS) or duller
 //!    (mid/high share, vocal main with the hats stepping back) — is checked
@@ -21,7 +21,7 @@
 //!    exists. Short lengths need a sharp local step (energy or spectral);
 //!    gradual layering ramps must not be called short with high confidence.
 //!    `bars >= 64` is not a free pass.
-//!    Outro mix trigger = full mid/high-ratio drop boundary at {8,16,32,64}
+//!    Outro mix trigger = full mid/high-ratio drop boundary at {16,32,64}
 //!    plus 16 bars so DJ mixing starts before the collapse (~48 bars from end
 //!    on typical Funkot). Short snaps whose after-window is already a mid-outro
 //!    plateau (near far-body mid/high) are rejected. Fall back to
@@ -92,9 +92,9 @@ const MAX_SCAN_BARS_INTRO: usize = 112;
 const MAX_SCAN_BARS_OUTRO: usize = 80;
 /// Plausible Funkot outro lengths (bars). Intro snapping uses
 /// [`INTRO_SNAP_CANDIDATES`] (adds 48).
-const SNAP_CANDIDATES: [u32; 4] = [8, 16, 32, 64];
+const SNAP_CANDIDATES: [u32; 3] = [16, 32, 64];
 /// Intro snap grid including mid-length 48-bar machine intros.
-const INTRO_SNAP_CANDIDATES: [u32; 5] = [8, 16, 32, 48, 64];
+const INTRO_SNAP_CANDIDATES: [u32; 4] = [16, 32, 48, 64];
 /// Long intro lengths using fill/shout/tension cues (earliest hit).
 /// Includes 64: energy-rise scoring misses tension-drop main entries, and a
 /// later 80 rebuild must not win. A 48-bar tension drop is checked first in
@@ -119,8 +119,6 @@ const SNAP_TOLERANCE: f64 = 0.25;
 const MIN_BOUNDARY_SCORE: f64 = 1.8;
 /// Minimum score margin for a unique candidate winner.
 const MIN_SCORE_MARGIN: f64 = 0.45;
-/// Minimum edge sharpness for an 8-bar section (must be very crisp).
-const MIN_SHARP_8: f64 = 3.2;
 /// Minimum edge sharpness for 16/32 when the before-window is not a gradual ramp.
 const MIN_SHARP_SHORT: f64 = 2.2;
 /// Stricter sharpness when the before-window already ramps (layering).
@@ -753,10 +751,18 @@ pub fn reconcile_intro_outro(
 /// leaves room for both sections and [`OUTRO_LEAD_BARS`]. The public
 /// two-argument compatibility API has no duration and retains 64 instead.
 pub(crate) fn reconcile_intro_outro_for_track_bars(
-    intro: SectionEstimate,
-    outro: SectionEstimate,
+    mut intro: SectionEstimate,
+    mut outro: SectionEstimate,
     track_bars: u32,
 ) -> (u32, u32, bool, bool) {
+    if (!intro.low_confidence && intro.bars > track_bars)
+        || (!outro.low_confidence && outro.bars > track_bars)
+        || (!intro.low_confidence && !outro.low_confidence
+            && intro.bars.saturating_add(outro.bars) > track_bars)
+    {
+        intro.low_confidence = true;
+        outro.low_confidence = true;
+    }
     if intro.low_confidence && outro.low_confidence {
         let section = SNAP_CANDIDATES.iter().copied()
             .filter(|bars| bars.saturating_mul(2).saturating_add(OUTRO_LEAD_BARS) <= track_bars)
@@ -2422,7 +2428,7 @@ fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
     }
 }
 
-/// Full energy-drop boundary from the file end, snapped to {8,16,32,64}.
+/// Full energy-drop boundary from the file end, snapped to {16,32,64}.
 ///
 /// Funkot outros often keep the kick, so RMS/mid body stay up; the collapse that
 /// DJs hear is mid/high content. Detect that via [`BarFeat::midhigh_ratio`]
@@ -2484,6 +2490,9 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
     let enter = (floor * 1.25).max(floor + (peak - floor) * 0.25);
     let soft = enter * 0.85;
     const SUSTAIN: usize = 3;
+    if ratio[floor_hi - SUSTAIN..floor_hi].iter().all(|&v| v >= soft) {
+        return None;
+    }
 
     let last = ratio.len().saturating_sub(SUSTAIN);
     for i in floor_hi..last {
@@ -2592,10 +2601,6 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
         .fold(0.0f64, f64::max);
     let margin = best_score - runner_up;
 
-    if best.bars == 8 && margin < MIN_SCORE_MARGIN * 2.0 {
-        return None;
-    }
-
     let accept = margin >= MIN_SCORE_MARGIN || best_score >= MIN_BOUNDARY_SCORE * 2.0;
     if accept {
         // The candidate boundary *is* the structural one; the mix lead-in is
@@ -2621,7 +2626,7 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
 ///
 /// Long/medium cues try a 48-bar tension drop, then the stricter 48-bar
 /// fill/shout/rise path, then {64,80,96}, then the earliest sustained short
-/// boundary. Short {8,16,32} lengths require a sharp boundary; gradual layering
+/// boundary. Short {16,32} lengths require a sharp boundary; gradual layering
 /// ramps are not accepted as short with high confidence. Mainness and candidate
 /// scoring prefer the earliest sustained boundary and reject later ones that
 /// already contain a clear earlier step.
@@ -2954,10 +2959,6 @@ fn pick_by_mainness_onset(feats: &[BarFeat]) -> Option<SectionEstimate> {
         if c + 4 > feats.len() {
             continue;
         }
-        // Mid-ramp 8-bar layer adds are not mains; crisp 8-bar intros are OK.
-        if bars == 8 && still_climbing_after(feats, c) {
-            continue;
-        }
         if before_has_clear_main_step(feats, c) {
             continue;
         }
@@ -3004,12 +3005,6 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
         if !passes_short_sharpness_gate(cand, before, after, sharpness) {
             continue;
         }
-        // 8-bar hits that keep climbing afterward are mid-intro layer adds.
-        // (Do not judge gradual on feats[..16] — that includes the after-window
-        // and rejects true crisp 8-bar intros.)
-        if cand == 8 && still_climbing_after(feats, c) {
-            continue;
-        }
         scored.push(SectionEstimate {
             bars: cand,
             low_confidence: false,
@@ -3031,12 +3026,7 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
     }
 
     // Prefer earliest credible boundary (short intros over mid-main false hits).
-    // 8-bar is only used when it is the sole survivor (else layer-adds win).
-    let mut pool: Vec<SectionEstimate> = scored.iter().copied().filter(|s| s.bars > 8).collect();
-    if pool.is_empty() {
-        pool = scored;
-    }
-    pool.sort_by(|a, b| {
+    scored.sort_by(|a, b| {
         a.bars.cmp(&b.bars).then_with(|| {
             b.score
                 .partial_cmp(&a.score)
@@ -3044,18 +3034,13 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
         })
     });
 
-    let best = pool.first()?;
-    let runner_up = pool
+    let best = scored.first()?;
+    let runner_up = scored
         .iter()
         .filter(|s| s.bars != best.bars)
         .map(|s| s.score)
         .fold(0.0f64, f64::max);
     let margin = best.score - runner_up;
-
-    // Reject early 8-bar hits unless they dominate clearly.
-    if best.bars == 8 && margin < MIN_SCORE_MARGIN * 2.0 && best.score < MIN_BOUNDARY_SCORE * 2.0 {
-        return None;
-    }
 
     let accept = margin >= MIN_SCORE_MARGIN || best.score >= MIN_BOUNDARY_SCORE * 2.0;
     if accept {
@@ -3156,7 +3141,6 @@ fn passes_short_sharpness_gate(
 
     let gradual = before_is_gradual(before);
     let min_sharp = match bars {
-        8 => MIN_SHARP_8,
         16 | 32 | 48 if gradual => MIN_SHARP_SHORT_GRADUAL,
         16 | 32 | 48 => MIN_SHARP_SHORT,
         // 64+ used to free-pass; require a real gate so mid-main builds lose.
@@ -3582,4 +3566,99 @@ fn measure_loudness(buffer: &AudioBuffer) -> (f64, f64) {
     let rms_dbfs = 20.0 * rms.log10();
     let gain_db = (TARGET_RMS_DBFS - rms_dbfs).clamp(-GAIN_CLAMP_DB, GAIN_CLAMP_DB);
     (rms_dbfs, gain_db)
+}
+
+
+#[cfg(test)]
+mod section_candidate_tests {
+    use super::*;
+
+    fn step_features(boundary: usize, total: usize) -> Vec<BarFeat> {
+        (0..total).map(|i| {
+            let (rms, ratio) = if i < boundary { (0.1, 0.02) } else { (0.5, 0.3) };
+            BarFeat { rms, midhigh_ratio: ratio, hf_energy: rms * rms * ratio,
+                mid_energy: rms * rms * (1.0 - ratio), centroid_hz: 2000.0 }
+        }).collect()
+    }
+
+    #[test]
+    fn auto_candidates_start_at_sixteen() {
+        assert_eq!(snap_intro_bars(16), (16, false));
+        assert_eq!(snap_bars(16), (16, false));
+        for raw in 0..(16 - SNAP_ABS_TOLERANCE) {
+            for (name, result) in [("intro snap", snap_intro_bars(raw)), ("outro snap", snap_bars(raw))] {
+                assert!(result.1, "{name} raw={raw} claimed {result:?}");
+            }
+        }
+        for boundary in [16, 32, 48, 64] {
+            assert_eq!(snap_intro_bars(boundary), (boundary, false));
+        }
+        for boundary in [16, 32, 64] {
+            assert_eq!(snap_bars(boundary), (boundary, false));
+        }
+    }
+
+    #[test]
+    fn eight_bar_steps_are_not_automatic_boundaries() {
+        let feats = step_features(8, 72);
+        let mut selected_eight = Vec::new();
+        for (name, estimate) in [
+            ("intro", Some(pick_section_bars(&feats))),
+            ("mainness", pick_by_mainness_onset(&feats)),
+            ("intro scores", pick_by_candidate_scores(&feats)),
+            ("outro", Some(pick_outro_bars(&feats))),
+            ("full drop", pick_outro_full_drop(&feats)),
+            ("outro scores", pick_by_candidate_scores_outro(&feats)),
+        ] {
+            if let Some(hit) = estimate {
+                println!("{name} bars={} low={}", hit.bars, hit.low_confidence);
+                if hit.bars == 8 { selected_eight.push(name); }
+                assert!(hit.low_confidence, "{name} invented a confident {}-bar boundary", hit.bars);
+            }
+        }
+        assert!(selected_eight.is_empty(), "8 selected by {selected_eight:?}");
+    }
+
+    #[test]
+    fn intermediate_eight_bar_layer_does_not_hide_sixteen_bar_main() {
+        let mut feats = step_features(16, 80);
+        for f in &mut feats[8..16] {
+            f.rms = 0.15;
+            f.midhigh_ratio = 0.04;
+            f.hf_energy = f.rms * f.rms * f.midhigh_ratio;
+            f.mid_energy = f.rms * f.rms * (1.0 - f.midhigh_ratio);
+        }
+        let hit = pick_section_bars(&feats);
+        assert_eq!(hit.bars, 16);
+        assert!(!hit.low_confidence);
+    }
+
+    #[test]
+    fn contradictory_or_short_sections_do_not_claim_confidence() {
+        for track_bars in [0, 8, 15, 16, 24, 31] {
+            let confident = SectionEstimate { bars: 16, low_confidence: false,
+                score: 20.0, sharpness: 20.0, structure_bars: 16 };
+            let (intro, structure, il, ol) =
+                reconcile_intro_outro_for_track_bars(confident, confident, track_bars);
+            assert!(il && ol, "{track_bars} bars");
+            assert!(intro >= 16 && structure >= 16);
+        }
+    }
+
+    #[test]
+    fn clear_sixteen_bar_feature_boundaries_survive_every_detector() {
+        let feats = step_features(16, 80);
+        for (name, estimate) in [
+            ("intro", Some(pick_section_bars(&feats))),
+            ("mainness", pick_by_mainness_onset(&feats)),
+            ("intro scores", pick_by_candidate_scores(&feats)),
+            ("outro", Some(pick_outro_bars(&feats))),
+            ("full drop", pick_outro_full_drop(&feats)),
+            ("outro scores", pick_by_candidate_scores_outro(&feats)),
+        ] {
+            let hit = estimate.unwrap_or_else(|| panic!("{name} missed the boundary"));
+            assert_eq!(hit.bars, 16, "{name}");
+            assert!(!hit.low_confidence, "{name}");
+        }
+    }
 }

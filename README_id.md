@@ -10,11 +10,12 @@ sebagai BGM tanpa putus dengan crossfade ala DJ.
 
 - BPM dasar 180. Track yang sedikit melenceng (mis. 178 atau 181) disesuaikan
   dengan time-stretch
-- Intro/outro adalah ritme mesin tetap untuk transisi. Intro: 8/16/32/48/64/80/96
+- Intro/outro adalah ritme mesin tetap untuk transisi. Intro: 16/32/48/64/80/96
   bar. Outro punya dua angka berbeda: *batas struktural* (titik lagu benar-benar
-  turun) bernilai 8/16/32/64 bar, sedangkan *pemicu mix* yang dipakai saat
-  transisi selalu berada 16 bar sebelum batas itu, sehingga nilainya salah satu
-  dari 24/32/48/80 bar. Panjang transisi 16 bar, jadi transisi *selesai* tepat di
+  turun) bernilai 16/32/64 bar, sedangkan *pemicu mix* yang dipakai saat
+  transisi berada 16 bar sebelum batas itu jika ruangnya cukup, sehingga nilainya
+  32/48/80 bar dari akhir. Track pendek membatasi pemicu ke bagian yang tersedia.
+  Panjang transisi 16 bar, jadi transisi *selesai* tepat di
   awal outro: campuran memakai 16 bar sebelum outro dan tidak pernah menimpa
   outro itu sendiri. BPM di tengah lagu tidak tetap/bisa berubah, jadi analisis
   hanya memakai awal dan akhir track
@@ -118,16 +119,22 @@ disimpan sebagai JSON dengan kunci hash isi file di `--cache-dir`. Jika
 estimasi otomatis `intro_bars` / `outro_bars` meleset, edit JSON secara
 manual lalu set `intro_bars_manual` / `outro_bars_manual` yang sesuai ke
 `true` (default `false`). Sisi yang manual tetap dipertahankan oleh
-`--purge-auto-cache` dan reanalisis. Jika estimasi kurang yakin, fallback ke 64 bar dengan
-`bars_estimated_low_confidence: true`. Flag per sisi
+`--purge-auto-cache` dan reanalisis. Kandidat struktur otomatis dimulai dari 16 bar;
+nilai manual 8 bar tetap berlaku. Jika kedua sisi kurang yakin, pilih nilai terbesar
+dari 16/32/64 yang memuat kedua bagian dan lead 16 bar. Jika tidak ada yang muat,
+pertahankan low-confidence dan batasi pemicu ke bagian track yang tersedia.
+Bagian high-confidence yang saling bertentangan juga menjadi low-confidence. Flag per sisi
 `intro_bars_low_confidence` / `outro_bars_low_confidence` juga dicatat.
 Jika kedua sisi high-confidence, `intro < outro` tetap dipertahankan
 (untuk intro pendek; sisi low-confidence tetap dikoreksi konservatif).
 Jika hanya mengubah `outro_bars`, sesuaikan juga `outro_start` =
 `total_frames − outro_bars × bar_len` (tidak dihitung ulang saat load).
-Perubahan format cache menaikkan `version` dan menonaktifkan JSON lama
-(saat ini v14). Cache v14 juga menyimpan score classify; verdict dihitung
-ulang saat load agar perubahan ambang berlaku tanpa decode ulang.
+Cache memakai nomor versi (saat ini v15). Entri v14 yang terbaca dianalisis ulang dengan aturan
+kandidat baru. Nilai intro, pemicu, dan batas struktur manual tetap dipertahankan,
+termasuk nilai 8 bar dan pembatalan manual. Hanya analisis ulang yang berhasil
+disimpan sebagai v15. Versi lebih lama atau tidak dikenal, data rusak, dan mode
+outro manual yang bertentangan menghasilkan error tanpa menimpa data asli.
+Kegagalan penulisan juga mempertahankan entri sebelumnya.
 
 `outro_structure_bars` adalah batas struktur yang terdengar; `outro_bars`
 adalah pemicu transisi, diturunkan dari batas itu dengan lead-in sesuai panjang

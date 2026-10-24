@@ -9,10 +9,11 @@ DJ-style for continuous BGM playback.
 ## Funkot assumptions
 
 - Base BPM is 180. Tracks that drift slightly (e.g. 178 or 181) are time-stretched to match
-- Intro/outro are fixed machine-rhythm sections for mixing. Intro: 8/16/32/48/64/80/96 bars.
+- Intro/outro are fixed machine-rhythm sections for mixing. Intro: 16/32/48/64/80/96 bars.
   The outro has two distinct numbers: the *structural boundary* (where the track actually
-  collapses) is one of 8/16/32/64 bars, while the *mix trigger* used for the transition sits a
-  fixed 16-bar lead-in ahead of it, so the trigger length is one of 24/32/48/80 bars. The
+  collapses) is one of 16/32/64 bars, while the *mix trigger* used for the transition sits a
+  16-bar lead-in ahead of it when room permits, giving 32/48/80 bars from the end.
+  Short tracks clip the trigger to the available body. The
   transition is 16 bars long, so it *finishes* exactly where the outro begins: the mix uses the
   16 bars leading up to the outro and never plays over the outro itself. Mid-track BPM is
   irregular/variable, so analysis uses only the start and end of each track
@@ -127,14 +128,22 @@ intro/outro bar estimates are wrong, edit `intro_bars` / `outro_bars` in the JSO
 and set the matching `intro_bars_manual` / `outro_bars_manual` to `true`
 (default is `false`. When a manual flag is set, those bar counts are kept across
 `--purge-auto-cache` and reanalysis).
-When confidence is low, estimation falls back to 64 bars and sets
-`bars_estimated_low_confidence: true`. Per-side flags
+Automatic structural candidates start at 16 bars. Manual 8-bar values remain valid.
+When both estimates are uncertain, use the largest of 16/32/64 that leaves room
+for both sections and the 16-bar lead. If none fits, retain low confidence and
+clip the trigger to the available track body. Contradictory confident sections
+also become low-confidence. Per-side flags
 `intro_bars_low_confidence` / `outro_bars_low_confidence` are also recorded.
 If both sides are high-confidence, `intro < outro` is kept as-is (for short-intro tracks;
 only the low-confidence side is corrected conservatively as before).
 When changing only `outro_bars`, also update `outro_start` to
 `total_frames − outro_bars × bar_len` (it is not recomputed on load).
-When the cache format changes, `version` is bumped and old JSON is invalidated (currently v14).
+Caches use a version number (currently v15). Readable v14 entries are reanalyzed under the new
+candidate rules. Manual intro, trigger and structure values survive conversion,
+including manual 8-bar values and explicit clears. Only successful reanalysis
+writes v15. Older or unknown versions, corrupt entries and conflicting manual
+outro modes report an error and preserve the original. Failed writes also
+preserve the previous entry.
 
 Startup options:
 

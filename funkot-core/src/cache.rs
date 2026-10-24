@@ -19,9 +19,12 @@ use crate::{
 /// from the old conditional rule, which collapsed onto the structural
 /// boundary on tracks whose outro starts 64 bars from the end — the
 /// transition ran inside the outro there.
+/// 15: automatic section candidates start at 16 bars; v14 manual values are
+/// preserved while its automatic fields are reanalyzed.
 /// 14: head/tail classify scores (`ClassifyScores`: z / z_ratio / half_ratio)
 /// are stored on `TrackAnalysis` so threshold retunes need no re-decode.
-pub const CACHE_VERSION: u32 = 14;
+pub const CACHE_VERSION: u32 = 15;
+const PREVIOUS_CACHE_VERSION: u32 = 14;
 
 const HASH_CHUNK: u64 = 64 * 1024;
 
@@ -94,6 +97,7 @@ pub enum CacheLookup {
 enum ReadError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    ConflictingManualOutros,
 }
 
 impl ReadError {
@@ -101,6 +105,9 @@ impl ReadError {
         match self {
             Self::Io(e) => Error::Cache(format!("cannot read cache '{}': {e}", path.display())),
             Self::Json(e) => Error::Cache(format!("corrupt cache JSON '{}': {e}", path.display())),
+            Self::ConflictingManualOutros => Error::Cache(format!(
+                "cache '{}' has conflicting manual trigger and structure", path.display()
+            )),
         }
     }
 }
@@ -112,8 +119,13 @@ fn read_entry(path: &Path) -> std::result::Result<CacheLookup, ReadError> {
         Err(e) => return Err(ReadError::Io(e)),
     };
     let mut analysis: TrackAnalysis = serde_json::from_slice(&data).map_err(ReadError::Json)?;
-    if analysis.version != CACHE_VERSION {
-        return Ok(CacheLookup::VersionMismatch(analysis.version));
+    match analysis.version {
+        CACHE_VERSION => {}
+        PREVIOUS_CACHE_VERSION => analysis.needs_reanalysis = true,
+        version => return Ok(CacheLookup::VersionMismatch(version)),
+    }
+    if analysis.outro_bars_manual && analysis.outro_structure_bars_manual {
+        return Err(ReadError::ConflictingManualOutros);
     }
     if let Some(ref scores) = analysis.classify_scores {
         analysis.is_funkot = scores.verdict();
@@ -129,8 +141,9 @@ fn read_entry(path: &Path) -> std::result::Result<CacheLookup, ReadError> {
     Ok(CacheLookup::Hit(analysis))
 }
 
-/// Read with diagnostics: missing/obsolete entries are ordinary outcomes; invalid
-/// hashes, corrupt JSON and I/O failures are errors identifying the operation.
+/// Read with diagnostics. v14 hits require reanalysis and retain their version.
+/// Missing entries and unsupported versions are ordinary outcomes; invalid
+/// hashes, conflicting manual modes, corrupt JSON and I/O failures are errors.
 /// This performs file I/O and must not run in an audio callback.
 pub fn load_checked(cache_dir: &Path, hash: &str) -> Result<CacheLookup> {
     let path = cache_path(cache_dir, hash)?;
@@ -139,9 +152,10 @@ pub fn load_checked(cache_dir: &Path, hash: &str) -> Result<CacheLookup> {
 
 /// Load a cached analysis, retaining the original quiet `Option` cache-miss API.
 /// Use [`load_checked`] for diagnostics. Analysis entry points report corrupt
-/// caches when repairing them and propagate I/O errors without running analysis;
+/// caches and propagate read errors without running analysis;
 /// this compatibility lookup is also used by polling callers and does not log.
 /// Stored classify scores are re-evaluated against the current verdict rule.
+/// A v14 hit remains incomplete until successful reanalysis.
 pub fn load(cache_dir: &Path, hash: &str) -> Option<TrackAnalysis> {
     match load_checked(cache_dir, hash) {
         Ok(CacheLookup::Hit(analysis)) => Some(analysis),
@@ -151,14 +165,13 @@ pub fn load(cache_dir: &Path, hash: &str) -> Option<TrackAnalysis> {
 
 fn load_for_analysis(cache_dir: &Path, hash: &str) -> Result<Option<TrackAnalysis>> {
     let path = cache_path(cache_dir, hash)?;
-    match read_entry(&path) {
-        Ok(CacheLookup::Hit(a)) => Ok(Some(a)),
-        Ok(_) => Ok(None),
-        Err(ReadError::Json(e)) => {
-            log::warn!("reanalyzing corrupt cache JSON '{}': {e}", path.display());
-            Ok(None)
-        }
-        Err(e) => Err(e.diagnostic(&path)),
+    match read_entry(&path).map_err(|e| e.diagnostic(&path))? {
+        CacheLookup::Hit(a) => Ok(Some(a)),
+        CacheLookup::Missing => Ok(None),
+        CacheLookup::VersionMismatch(version) => Err(Error::Cache(format!(
+            "cache '{}' has unsupported version {version}, expected {PREVIOUS_CACHE_VERSION} or {CACHE_VERSION}",
+            path.display()
+        ))),
     }
 }
 
@@ -263,16 +276,19 @@ fn reconcile_manual(latest: &TrackAnalysis, mut incoming: TrackAnalysis) -> Trac
     merged
 }
 
-fn commit_analysis(cache_dir: &Path, hash: &str, analysis: &TrackAnalysis, repair: bool) -> Result<TrackAnalysis> {
+fn commit_analysis(cache_dir: &Path, hash: &str, analysis: &TrackAnalysis) -> Result<TrackAnalysis> {
     let path = cache_path(cache_dir, hash)?;
+    if analysis.version != CACHE_VERSION {
+        return Err(Error::Cache(format!("cannot store analysis version {}, expected {CACHE_VERSION}", analysis.version)));
+    }
     let writer = CacheWriter::acquire(cache_dir)?;
-    let merged = match read_entry(&path) {
-        Ok(CacheLookup::Hit(latest)) => reconcile_manual(&latest, analysis.clone()),
-        Ok(CacheLookup::Missing | CacheLookup::VersionMismatch(_)) => analysis.clone(),
-        // Reanalysis has already diagnosed the damaged cache. Only that path may
-        // repair it; an arbitrary store must not silently destroy unreadable data.
-        Err(ReadError::Json(_)) if repair => analysis.clone(),
-        Err(e) => return Err(e.diagnostic(&path)),
+    let merged = match read_entry(&path).map_err(|e| e.diagnostic(&path))? {
+        CacheLookup::Hit(latest) => reconcile_manual(&latest, analysis.clone()),
+        CacheLookup::Missing => analysis.clone(),
+        CacheLookup::VersionMismatch(version) => return Err(Error::Cache(format!(
+            "cache '{}' has unsupported version {version}, expected {PREVIOUS_CACHE_VERSION} or {CACHE_VERSION}",
+            path.display()
+        ))),
     };
     writer.write(&path, &merged)?;
     Ok(merged)
@@ -280,11 +296,12 @@ fn commit_analysis(cache_dir: &Path, hash: &str, analysis: &TrackAnalysis, repai
 
 /// Store analysis as complete pretty JSON, preserving the latest existing manual
 /// state even if `analysis` is an older snapshot. Use the edit APIs for changing
-/// manual state. On a miss this initializes from the supplied trusted snapshot.
+/// manual state. Input must use the current version. On a miss this initializes
+/// from the supplied trusted snapshot; incomplete snapshots remain incomplete.
 /// Creates `cache_dir` if needed; never removes the previous file before replace.
 /// See `docs/local-data.md` for the trusted-directory and durability boundaries.
 pub fn store(cache_dir: &Path, hash: &str, analysis: &TrackAnalysis) -> Result<()> {
-    commit_analysis(cache_dir, hash, analysis, false).map(|_| ())
+    commit_analysis(cache_dir, hash, analysis).map(|_| ())
 }
 
 /// Counts from [`purge_auto`].
@@ -367,7 +384,7 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
     let structure_m = a.outro_structure_bars_manual;
     let outro_structure_bars = if structure_m { a.outro_structure_bars } else { 0 };
     *a = TrackAnalysis {
-        version: CACHE_VERSION,
+        version: a.version,
         file_name: a.file_name.clone(),
         sample_rate: a.sample_rate,
         total_frames: a.total_frames,
@@ -633,7 +650,7 @@ pub fn get_or_analyze(
     BEFORE_ANALYSIS_COMMIT.with(|hook| {
         if let Some(before_commit) = hook.borrow_mut().take() { before_commit(); }
     });
-    commit_analysis(cache_dir, &hash, &analysis, true)
+    commit_analysis(cache_dir, &hash, &analysis)
 }
 
 /// Hash the file, try load, else analyze `buffer` and store.
@@ -711,7 +728,7 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         intro_bars_manual: false,
         outro_bars_manual: false,
         outro_structure_bars_manual: false,
-        needs_reanalysis: false,
+        needs_reanalysis: true,
         is_funkot: true,
         classify_scores: None,
         rms_dbfs: TARGET_RMS_DBFS,
@@ -804,6 +821,174 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn v14_reanalysis_preserves_each_manual_mode_and_explicit_clears() {
+        let dir = TempDir::new("v14-modes");
+        let source = dir.path().join("source.wav");
+        fs::write(&source, b"same source hash through migration").unwrap();
+        let hash = content_hash(&source).unwrap();
+        let path = cache_path(dir.path(), &hash).unwrap();
+        let buffer = crate::testutil::synth_track(180.0, 16, 96, 16, 44_100);
+        for intro_manual in [false, true] {
+            for outro_mode in 0..3 {
+                let mut old = sample_analysis();
+                old.version = 14;
+                old.intro_bars = 8;
+                old.outro_bars = 8;
+                old.outro_structure_bars = 8;
+                old.intro_bars_manual = intro_manual;
+                old.outro_bars_manual = outro_mode == 1;
+                old.outro_structure_bars_manual = outro_mode == 2;
+                let original = serde_json::to_vec(&old).unwrap();
+                fs::write(&path, &original).unwrap();
+                let CacheLookup::Hit(stale) = load_checked(dir.path(), &hash).unwrap() else { panic!("v14 not read"); };
+                assert_eq!(stale.version, 14);
+                assert!(stale.needs_reanalysis);
+                assert_eq!(fs::read(&path).unwrap(), original);
+                assert!(store(dir.path(), &hash, &stale).is_err());
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let result = get_or_analyze(&source, dir.path(), &buffer).unwrap();
+                assert_eq!(result.intro_bars, if intro_manual { 8 } else { 16 });
+                assert_eq!(result.intro_bars_manual, intro_manual);
+                assert_eq!(result.outro_bars_manual, outro_mode == 1);
+                assert_eq!(result.outro_structure_bars_manual, outro_mode == 2);
+                match outro_mode {
+                    0 => {
+                        assert_eq!(result.outro_structure_bars, 16);
+                        assert_eq!(result.outro_bars, 32);
+                    }
+                    1 => {
+                        assert_eq!(result.outro_bars, 8);
+                        assert_eq!(result.outro_structure_bars, 8);
+                    }
+                    _ => {
+                        assert_eq!(result.outro_structure_bars, 8);
+                        assert_eq!(result.outro_bars, 24);
+                    }
+                }
+                assert_eq!(result.version, CACHE_VERSION);
+                assert!(!result.needs_reanalysis);
+                let persisted: TrackAnalysis = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                let (restarted, analyzed) = fill_missing(&source, dir.path(), &buffer).unwrap();
+                assert!(!analyzed);
+                assert_eq!(restarted, persisted);
+                store(dir.path(), &hash, &result).unwrap();
+                assert_eq!(load(dir.path(), &hash).unwrap(), persisted);
+            }
+        }
+    }
+
+    #[test]
+    fn v14_latest_clear_or_outro_mode_wins_during_reanalysis() {
+        let dir = TempDir::new("v14-concurrent-edit");
+        let source = dir.path().join("source.wav");
+        fs::write(&source, b"isolated edit during reanalysis").unwrap();
+        let hash = content_hash(&source).unwrap();
+        let path = cache_path(dir.path(), &hash).unwrap();
+        let buffer = crate::testutil::synth_track(180.0, 16, 96, 16, 44_100);
+        for edit in 0..3 {
+            let mut old = sample_analysis();
+            old.version = 14;
+            old.intro_bars_manual = true;
+            old.outro_bars_manual = edit == 1;
+            old.outro_structure_bars_manual = edit != 1;
+            fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            let cache = dir.path().to_path_buf();
+            let key = hash.clone();
+            BEFORE_ANALYSIS_COMMIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                match edit {
+                    0 => { edit_bars(&cache, &key, Some(16), Some(16), false).unwrap(); }
+                    1 => { set_manual_structure_bars(&cache, &key, 8).unwrap(); }
+                    _ => { set_manual_bars(&cache, &key, None, Some(8)).unwrap(); }
+                }
+            })));
+            let result = get_or_analyze(&source, dir.path(), &buffer).unwrap();
+            assert_eq!(result.intro_bars_manual, edit != 0);
+            assert_eq!(result.outro_bars_manual, edit == 2);
+            assert_eq!(result.outro_structure_bars_manual, edit == 1);
+            assert_eq!(result.intro_bars, if edit == 0 { 16 } else { 8 });
+            assert_eq!(result.outro_bars, [32, 24, 8][edit]);
+            assert_eq!(result.version, CACHE_VERSION);
+            assert!(!result.needs_reanalysis);
+        }
+    }
+
+    #[test]
+    fn reanalysis_preserves_unknown_corrupt_and_conflicting_entries() {
+        let dir = TempDir::new("migration-protected");
+        let source = dir.path().join("source.wav");
+        fs::write(&source, b"isolated rejected cache").unwrap();
+        let hash = content_hash(&source).unwrap();
+        let path = cache_path(dir.path(), &hash).unwrap();
+        let buffer = crate::testutil::synth_track(180.0, 16, 96, 16, 44_100);
+        let mut originals = vec![b"{broken".to_vec(), br#"{"version":14}"#.to_vec()];
+        for version in [13, 16] {
+            let mut old = sample_analysis();
+            old.version = version;
+            originals.push(serde_json::to_vec(&old).unwrap());
+        }
+        let mut conflicting = sample_analysis();
+        conflicting.version = 14;
+        conflicting.outro_bars_manual = true;
+        conflicting.outro_structure_bars_manual = true;
+        originals.push(serde_json::to_vec(&conflicting).unwrap());
+        for original in originals {
+            fs::write(&path, &original).unwrap();
+            assert!(get_or_analyze(&source, dir.path(), &buffer).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(store(dir.path(), &hash, &sample_analysis()).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        let mut previous = sample_analysis();
+        previous.version = 14;
+        previous.intro_bars_manual = true;
+        let original = serde_json::to_vec(&previous).unwrap();
+        for stage in [WriteStage::DuringWrite, WriteStage::BeforeReplace] {
+            fs::write(&path, &original).unwrap();
+            WRITE_FAILURE.with(|f| f.set(Some(stage)));
+            let result = get_or_analyze(&source, dir.path(), &buffer);
+            WRITE_FAILURE.with(|f| f.set(None));
+            assert!(result.is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        fs::write(&path, &original).unwrap();
+        let mut unknown = sample_analysis();
+        unknown.version = 16;
+        let newer = serde_json::to_vec(&unknown).unwrap();
+        let newer_copy = newer.clone();
+        let target = path.clone();
+        BEFORE_ANALYSIS_COMMIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            fs::write(&target, newer_copy).unwrap();
+        })));
+        assert!(get_or_analyze(&source, dir.path(), &buffer).is_err());
+        assert_eq!(fs::read(&path).unwrap(), newer);
+    }
+
+    #[test]
+    fn v14_purge_and_failed_analysis_keep_manual_state_pending() {
+        let dir = TempDir::new("v14-purge");
+        let source = dir.path().join("source.wav");
+        fs::write(&source, b"isolated purge source").unwrap();
+        let hash = content_hash(&source).unwrap();
+        let path = cache_path(dir.path(), &hash).unwrap();
+        let mut old = sample_analysis();
+        old.version = 14;
+        old.intro_bars_manual = true;
+        old.outro_structure_bars_manual = true;
+        let original = serde_json::to_vec(&old).unwrap();
+        fs::write(&path, &original).unwrap();
+        let empty = AudioBuffer { sample_rate: 44_100, frames: 0, samples: vec![] };
+        assert!(get_or_analyze(&source, dir.path(), &empty).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(purge_auto(dir.path()).unwrap().cleared, 1);
+        let pending = load(dir.path(), &hash).unwrap();
+        assert_eq!(pending.version, 14);
+        assert!(pending.needs_reanalysis);
+        assert!(pending.intro_bars_manual && pending.outro_structure_bars_manual);
+        assert_eq!((pending.intro_bars, pending.outro_structure_bars), (8, 16));
+        assert!(store(dir.path(), &hash, &pending).is_err());
     }
 
     #[test]
@@ -1089,7 +1274,7 @@ mod tests {
         let path = cache_path(dir.path(), TEST_HASH).unwrap();
         assert!(matches!(load_checked(dir.path(), TEST_HASH).unwrap(), CacheLookup::Missing));
         let mut old = sample_analysis();
-        old.version = CACHE_VERSION - 1;
+        old.version = PREVIOUS_CACHE_VERSION - 1;
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
         assert!(matches!(load_checked(dir.path(), TEST_HASH).unwrap(), CacheLookup::VersionMismatch(13)));
         assert!(set_manual_bars(dir.path(), TEST_HASH, Some(1), None).unwrap_err().to_string().contains("version 13"));

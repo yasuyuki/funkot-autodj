@@ -182,6 +182,22 @@ fn local_tempo_near_target_estimates_stretched_bpm() {
 }
 
 #[test]
+fn tracks_without_room_for_sixteen_bar_sections_remain_low_confidence() {
+    for total_bars in [8, 15, 16, 24] {
+        let buffer = synth_track(180.0, total_bars, 0, 0, 44_100);
+        let result = match analyze(&buffer, "short-pulse.wav") {
+            Ok(result) => result,
+            Err(Error::Analysis(message)) if message.contains("track too short") => continue,
+            Err(error) => panic!("{total_bars} bars: {error}"),
+        };
+        assert!(result.intro_bars_low_confidence, "{total_bars} bars");
+        assert!(result.outro_bars_low_confidence, "{total_bars} bars");
+        assert!(result.intro_bars >= 16 && result.outro_structure_bars >= 16);
+        assert!(result.outro_start <= result.total_frames);
+    }
+}
+
+#[test]
 fn bpm_178_intro32_outro8_keeps_sides() {
     let sr = 44_100;
     let bpm = 178.0;
@@ -629,7 +645,7 @@ fn reconcile_rules_unit() {
 fn both_low_sections_fit_track_geometry_at_candidate_boundaries() {
     let low = || SectionEstimate { bars: 64, low_confidence: true, score: 0.0, sharpness: 0.0, structure_bars: 64 };
     for (track_bars, expected, trigger) in [(90, 32, 48), (144, 64, 80), (143, 32, 48),
-        (80, 32, 48), (79, 16, 32), (31, 8, 23)] {
+        (80, 32, 48), (79, 16, 32), (31, 16, 15)] {
         let (intro, structure, intro_low, outro_low) = reconcile_intro_outro_for_track_bars(low(), low(), track_bars);
         assert_eq!((intro, structure), (expected, expected), "{track_bars}-bar track");
         assert!(intro_low && outro_low);
@@ -810,7 +826,7 @@ fn provisional_skips_analyze_and_cache_write() {
 }
 
 #[test]
-fn corrupt_cache_reanalyzes() {
+fn corrupt_cache_reports_error_and_preserves_original() {
     let dir = temp_dir("cache_corrupt");
     let wav_path = dir.join("track.wav");
     let cache_dir = dir.join("cache");
@@ -818,17 +834,14 @@ fn corrupt_cache_reanalyzes() {
     let buf = synth_track(180.0, 16, 16, 16, 44_100);
     write_wav(&wav_path, &buf).expect("write wav");
 
-    let a1 = get_or_analyze(&wav_path, &cache_dir, &buf).expect("first");
+    get_or_analyze(&wav_path, &cache_dir, &buf).expect("first");
     let hash = cache::content_hash(&wav_path).expect("hash");
     let json_path = cache_dir.join(format!("{hash}.json"));
-    std::fs::write(&json_path, "{not valid json!!!").expect("corrupt");
-
-    let a2 = get_or_analyze(&wav_path, &cache_dir, &buf).expect("re-analyze");
-    assert_eq!(a2.intro_bars, a1.intro_bars);
-    assert_eq!(a2.outro_bars, a1.outro_bars);
-    // Cache should have been overwritten with valid JSON.
-    let reloaded = cache::load(&cache_dir, &hash).expect("reloaded");
-    assert_eq!(reloaded, a2);
+    let original = "{not valid json!!!";
+    std::fs::write(&json_path, original).expect("corrupt");
+    let error = get_or_analyze(&wav_path, &cache_dir, &buf).unwrap_err();
+    assert!(error.to_string().contains("corrupt cache JSON"));
+    assert_eq!(std::fs::read_to_string(&json_path).unwrap(), original);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
