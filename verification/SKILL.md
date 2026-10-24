@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`6067a0e6b029a1b3615f75fbd002ecb5e8a5ddfc`. This is an audit anchor, not a pin.
+`12ba7283d2427e85ca8b70e905cc249b444afb1e`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
@@ -31,13 +31,15 @@ plan clips its fade to common remaining material.
 
 The adapter coverage is `engine.rs::bar_to_frames`, `build_manual_plan`,
 `commit_manual_plan`, `begin_transition_to`, `begin_transition`, `start_first`,
-`finish_prepare`, and `Engine::from_prepared`. Inspect every new path that moves
+`finish_prepare`, `Engine::new_with_source`, and `Engine::from_prepared`. Inspect every new path that moves
 their decks, entries, nudges or endpoints. The full target horizon comes from
 the absolute main marker and corrected entry, including a real frame at main.
 Manual rejection precedes queue/history consumption and start events.
 Automatic fallback discards a rejected correction, then uses a bounded simple
 fade or hard cut. Cached derived triggers are normalized by `cache.rs::read_entry`
 without changing manual input fields or stored bytes.
+Both engine constructors reject non-finite bar durations and durations below
+one output frame before starting workers or adopting tracks.
 
 ## Run and judge
 
@@ -81,7 +83,8 @@ mutations to the product branch. The ordinary entry must pass again afterward.
 
 The real-engine regressions also distinguish an absolute main at or before PCM
 end, reject empty or mismatched prepared PCM, retain exact admitted entry/start,
-and keep the last one-frame simple fade audible. Preserve those observable
+keep the last one-frame simple fade audible, and reject unrepresentable bar
+durations at both engine constructors. Preserve those observable
 boundaries when updating the checker after a code change.
 
 ## Limits and result record
