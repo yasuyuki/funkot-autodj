@@ -637,22 +637,9 @@ fn both_low_sections_fit_track_geometry_at_candidate_boundaries() {
     }
 }
 
-/// Regression for the invariant documented on
-/// [`crate::TrackAnalysis::outro_structure_bars`]: it must never exceed the
-/// reconciled `outro_bars`.
-///
-/// `TrackAnalysis::outro_structure_bars <= outro_bars` has to hold on every
-/// path, including the one that used to break it: `pick_outro_bars`'s final
-/// fallback is low-confidence with a `FALLBACK_BARS` (64) boundary, and when
-/// the intro is confident and short `reconcile_intro_outro` replaces that
-/// with a bound derived from the *intro* side. Before the trigger became one
-/// rule, `outro_bars` was whatever came out of reconcile and could sit below
-/// the outro's own structural estimate, so `analyze` needed a clamp. Now the
-/// trigger is derived from the reconciled boundary by `outro_trigger_bars`,
-/// which never returns less than what it is given -- the invariant holds by
-/// construction, and this pins that.
+/// A boundary within the track body keeps its ordering relative to the trigger.
 #[test]
-fn outro_structure_bars_never_exceeds_the_derived_trigger() {
+fn valid_outro_structure_does_not_exceed_the_derived_trigger() {
     let intro = SectionEstimate {
         bars: 16,
         low_confidence: false,
@@ -694,18 +681,17 @@ fn trigger_keeps_the_lead_in_at_the_deepest_boundary() {
     assert_eq!(outro_trigger_bars(8, 8, 400), 24);
 }
 
-/// The only thing that may shorten the lead-in is the track running out:
-/// the trigger cannot reach back past the intro, and never lands before the
-/// boundary it came from.
+/// Contradictory boundaries cannot create material before the intro end.
 #[test]
 fn trigger_gives_way_to_a_track_too_short_to_hold_it() {
     assert_eq!(outro_trigger_bars(8, 8, 24), 16, "24-bar track, 8-bar intro");
     assert_eq!(
         outro_trigger_bars(64, 32, 64),
-        64,
-        "no room for any lead-in: trigger falls back onto the boundary"
+        32,
+        "the structural boundary is outside the available track body"
     );
-    assert!(outro_trigger_bars(64, 200, 210) >= 64, "never before the boundary");
+    assert_eq!(outro_trigger_bars(64, 200, 210), 10);
+    assert_eq!(outro_trigger_bars(0, 0, 0), 0);
 }
 
 #[test]

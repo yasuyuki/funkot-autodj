@@ -127,37 +127,9 @@ const MIN_SHARP_SHORT: f64 = 2.2;
 const MIN_SHARP_SHORT_GRADUAL: f64 = 3.6;
 /// Before-window RMS spread (dB) treated as a gradual layering ramp.
 const GRADUAL_SPREAD_DB: f64 = 2.5;
-/// Bars before the structural outro boundary that the mix trigger sits at.
-///
-/// The transition is [`crate::MAIN_GAP_BARS`] + two fades = 16 bars long, so
-/// starting it this far ahead means it *finishes* exactly where the outro
-/// begins: the mix uses the 16 bars leading up to the outro, and the outro
-/// itself is never mixed over. Real Funkot full-drop ≈ end−32, so the trigger
-/// lands ≈ end−48.
-const OUTRO_LEAD_BARS: u32 = 16;
+pub(crate) use crate::transition_geometry::outro_trigger_bars;
+use crate::transition_geometry::OUTRO_LEAD_BARS;
 
-/// Where the transition starts, given the structural boundary: one fixed
-/// rule, applied to every track.
-///
-/// It used to be conditional — the lead was dropped when the outro analysis
-/// window was too short to also cover it, and the result was clamped to
-/// [`FALLBACK_BARS`]. Both conditions fired on real material: a track whose
-/// outro starts 64 bars from the end got trigger == boundary, so the whole
-/// transition ran *inside* the outro, which is the one place it must not
-/// (measured: 3 of the 34 masters in the working cache). Neither condition
-/// was about the trigger being right — the lead is arithmetic on the
-/// boundary, not something the analysis window has to cover.
-///
-/// The only real limit is the track: the trigger cannot precede the intro it
-/// would cut into, and never sits before the structural boundary it is
-/// derived from.
-pub(crate) fn outro_trigger_bars(structure_bars: u32, intro_bars: u32, track_bars: u32) -> u32 {
-    let room = track_bars.saturating_sub(intro_bars).max(structure_bars);
-    structure_bars
-        .saturating_add(OUTRO_LEAD_BARS)
-        .min(room)
-        .max(SNAP_CANDIDATES[0])
-}
 /// Short full-drop snaps (≤16) whose after-window sits in this fraction of the
 /// far-body mid/high median are mid-outro plateaus (recovered vs floor, but not
 /// yet full main). Below the band = still sparse (Sakura); at/above ~1.0 = main
@@ -713,11 +685,8 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
     let (intro_bars, outro_structure_bars, intro_low_conf, outro_low_conf) =
         reconcile_intro_outro_for_track_bars(intro_est, outro_est, track_bars);
 
-    // One rule, every track: start the transition `OUTRO_LEAD_BARS` before the
-    // outro so it finishes exactly where the outro begins. This is also what
-    // keeps the exported invariant `outro_structure_bars <= outro_bars` true
-    // by construction (`outro_trigger_bars` never returns less than the
-    // boundary it is given).
+    // A valid structural boundary gets up to OUTRO_LEAD_BARS of lead without
+    // crossing the intro end. Contradictory markers clip to the available body.
     let outro_bars = outro_trigger_bars(outro_structure_bars, intro_bars, track_bars);
 
     let bars_estimated_low_confidence = intro_low_conf || outro_low_conf;

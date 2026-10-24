@@ -105,61 +105,7 @@ pub struct PreparedTrack {
     pub head_only: bool,
 }
 
-/// Pure transition schedule in bars relative to T = previous track's outro start
-/// (= next entry). Anchored so the next track's main (intro end, T0) falls at
-/// `T + m`, with a compact fade pair and [`MAIN_GAP_BARS`] of next-intro solo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransitionPlan {
-    pub f_eff: u32,
-    /// Bars from T until the next track's main section starts (`2·f_eff + MAIN_GAP`).
-    pub m: u32,
-    /// Bars of the next track's intro skipped before entry (`I − m`).
-    pub skip: u32,
-    pub fadeout_start: u32,
-    pub fadeout_end: u32,
-}
-
-/// Compute the bar-grid transition schedule.
-///
-/// Timeline relative to next-intro end T0 (main start):
-/// - T0−`m`: next enters (HPF, vol 0); `m = 2·F + MAIN_GAP` when it fits
-/// - T0−`m`+`F`: next fade-in done; HPF flips to prev; prev fade-out starts
-/// - T0−[`MAIN_GAP_BARS`]: prev at vol 0 → deck dropped
-/// - T0: next main
-///
-/// `F` = requested fade bars, `I` = next intro bars, `O` = previous outro bars.
-/// Short `I`/`O` shrink `F` so the compact window still fits; `m` is never
-/// stretched to fill a long intro (long intros are entered mid-way via `skip`).
-pub fn plan_transition(fade_bars: u32, intro_bars: u32, outro_bars: u32) -> TransitionPlan {
-    let f = fade_bars;
-    let i = intro_bars;
-    let o = outro_bars;
-
-    // Need 2·F bars of outro (fade-in+out) and F+(F)+MAIN_GAP of intro.
-    let f_eff = {
-        let from_intro = i.saturating_sub(MAIN_GAP_BARS) / 2;
-        let from_outro = o / 2;
-        f.min(from_intro).min(from_outro).max(1)
-    };
-
-    let m = (2 * f_eff + MAIN_GAP_BARS).min(i);
-    let skip = i.saturating_sub(m);
-
-    // Ideal: fade-out occupies [f_eff, 2·f_eff]. Clamp when m is short so
-    // MAIN_GAP still remains after fade-out (may yield a zero-length fade).
-    let fadeout_end = (2 * f_eff).min(m.saturating_sub(MAIN_GAP_BARS)).min(o);
-    let fadeout_start = fadeout_end
-        .saturating_sub(f_eff)
-        .max(f_eff.min(fadeout_end));
-
-    TransitionPlan {
-        f_eff,
-        m,
-        skip,
-        fadeout_start,
-        fadeout_end,
-    }
-}
+pub use crate::transition_geometry::{plan_transition, TransitionPlan};
 
 /// Linear fade-in gain over `n` frames at frame index `i` (`i` in `0..n`).
 ///
@@ -713,6 +659,8 @@ struct ActiveTransition {
     simple: bool,
 }
 
+use crate::transition_geometry::admit_frames;
+
 #[derive(Clone)]
 enum PendingNav {
     Planned(ManualPlan),
@@ -749,6 +697,7 @@ struct ManualPlan {
     fade_in_end: u64,
     fade_out_start: u64,
     fade_out_end: u64,
+    target_horizon: u64,
     simple: bool,
     reason: &'static str,
 }
@@ -802,13 +751,15 @@ fn manual_key(action: NavAction, active: &PreparedTrack, target: &PreparedTrack)
 /// Pure, off-audio-thread local plan builder.  A repeating beat may validate
 /// propagation from an existing structural marker, but never invents one.
 fn build_manual_plan(request: ManualRequest) -> ManualPlan {
-    let simple_at = |reason, entry| {
+    let simple_at = |reason, entry: u64| {
+        let entry = entry.min(request.key.target_frames.saturating_sub(1));
         let available = request.key.active_frames.saturating_sub(request.playhead)
             .min(request.key.target_frames.saturating_sub(entry));
         let fade = bar_to_frames(request.fade_bars.max(1), request.bar_frames).min(available);
         ManualPlan { generation: request.generation, key: request.key.clone(),
             start: request.playhead, entry, prev_nudge: 0,
             fade_in_end: fade, fade_out_start: 0, fade_out_end: fade,
+            target_horizon: fade,
             simple: true, reason }
     };
     let simple = |reason| simple_at(reason, request.key.target_first);
@@ -817,6 +768,12 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
         || request.key.active_first >= request.key.active_frames
         || request.key.target_first >= request.key.target_frames {
         return simple("unprepared material");
+    }
+    let target_main = request.key.target_first.saturating_add(bar_to_frames(
+        request.key.target_intro, request.bar_frames,
+    ));
+    if target_main >= request.key.target_frames {
+        return simple("main outside material");
     }
     // A file's analysed first pulse is an existing structural anchor, not a
     // new origin selected from the request window. Reject markers preceded by
@@ -891,8 +848,7 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
             ));
             let overlap = bar_to_frames(schedule.fadeout_end, request.bar_frames);
             if start.saturating_add(overlap) > request.key.active_frames
-                || nominal.saturating_add(bar_to_frames(schedule.m, request.bar_frames))
-                    > request.key.target_frames
+                || target_main >= request.key.target_frames
             {
                 return simple("insufficient remaining material");
             }
@@ -935,8 +891,7 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
             let target_end = entry.saturating_add(overlap);
             if prev_end > request.key.active_frames
                 || target_end > request.key.target_frames
-                || entry.saturating_add(bar_to_frames(schedule.m, request.bar_frames))
-                    > request.key.target_frames
+                || entry >= target_main
             {
                 return simple("corrected entry exceeds material");
             }
@@ -1029,6 +984,7 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
                 fade_in_end: bar_to_frames(schedule.f_eff, request.bar_frames),
                 fade_out_start: bar_to_frames(schedule.fadeout_start, request.bar_frames),
                 fade_out_end: overlap, simple: false, reason,
+                target_horizon: target_main.saturating_sub(entry).saturating_add(1),
             };
         }
     }
@@ -1339,6 +1295,17 @@ impl Engine {
         }
         if !(options.rate.is_finite() && options.rate > 0.0) {
             return Err(Error::Engine(format!("invalid rate: {}", options.rate)));
+        }
+        for track in &tracks {
+            if track.samples.is_empty()
+                || !track.samples.len().is_multiple_of(2)
+                || track.frames != (track.samples.len() / 2) as u64
+            {
+                return Err(Error::Engine(format!(
+                    "prepared track '{}' has invalid PCM frame count",
+                    track.path.display()
+                )));
+            }
         }
 
         let bar_frames = options.bar_frames();
@@ -2045,6 +2012,27 @@ impl Engine {
 
     fn commit_manual_plan(&mut self, plan: ManualPlan) {
         if !self.manual_plan_matches(&plan) { return; }
+        let admission = {
+            let active = self.active.as_ref().expect("matched active");
+            let target = match plan.key.action {
+                NavAction::RestartCurrent => &active.track,
+                NavAction::TransitionToPrev => self.last_track.as_ref().expect("matched previous"),
+                NavAction::TransitionToNext => self.next_track.as_ref().expect("matched next"),
+                _ => return,
+            };
+            admit_frames(
+                active.track.frames,
+                target.frames,
+                plan.start.saturating_add(plan.prev_nudge),
+                plan.entry,
+                plan.fade_in_end,
+                plan.fade_out_start,
+                plan.fade_out_end,
+                plan.target_horizon,
+                plan.simple,
+            )
+        };
+        let Some(admission) = admission else { return };
         let action = plan.key.action;
         let target = match action {
             NavAction::RestartCurrent => match self.active.as_ref() { Some(d) => d.track.clone(), None => return },
@@ -2052,6 +2040,11 @@ impl Engine {
             NavAction::TransitionToNext => match self.take_next() { Some(t) => t, None => return },
             _ => return,
         };
+        let mut plan = plan;
+        plan.entry = admission.entry;
+        plan.fade_in_end = admission.fade_in_end;
+        plan.fade_out_start = admission.fade_out_start;
+        plan.fade_out_end = admission.fade_out_end;
         self.last_manual_plan = Some(plan.clone());
         self.begin_transition_to(target, plan, matches!(action, NavAction::RestartCurrent));
     }
@@ -2064,12 +2057,14 @@ impl Engine {
             NavAction::TransitionToNext => self.next_track.as_ref()?,
             _ => return None,
         };
+        let entry = target.first_downbeat_out.min(target.frames.saturating_sub(1));
         let available = active.track.frames.saturating_sub(active.playhead)
-            .min(target.frames.saturating_sub(target.first_downbeat_out));
+            .min(target.frames.saturating_sub(entry));
         let fade = bar_to_frames(self.options.fade_bars.max(1), self.bar_frames).min(available);
         Some(ManualPlan { generation: self.nav_gen, key: manual_key(action, &active.track, target),
-            start: active.playhead, entry: target.first_downbeat_out, prev_nudge: 0,
-            fade_in_end: fade, fade_out_start: 0, fade_out_end: fade, simple: true, reason })
+            start: active.playhead, entry, prev_nudge: 0,
+            fade_in_end: fade, fade_out_start: 0, fade_out_end: fade, target_horizon: fade,
+            simple: true, reason })
     }
 
     fn abort_active_transition(&mut self) {
@@ -2466,7 +2461,7 @@ impl Engine {
         self.cancel_pending_nav();
         let path = track.path.clone();
         let index = track.playlist_index;
-        let playhead = track.first_downbeat_out.min(track.frames);
+        let playhead = track.first_downbeat_out.min(track.frames.saturating_sub(1));
         let filter = StereoHighPass::new(self.options.output_sample_rate, self.options.highpass_hz);
         self.active = Some(Deck {
             track,
@@ -2557,36 +2552,24 @@ impl Engine {
     /// `bars_already_into_outro`: 0 for on-time start; >0 when delayed (O reduced).
     fn begin_transition(&mut self, bars_already_into_outro: u32) {
         self.cancel_pending_nav();
-        let next = match self.take_next() {
-            Some(t) => t,
-            None => return,
-        };
-        let Some(active) = self.active.take() else {
-            self.push_front_next(next);
-            return;
-        };
-
-        let o = active
-            .track
-            .outro_bars
-            .saturating_sub(bars_already_into_outro);
-        let plan = plan_transition(self.options.fade_bars, next.intro_bars, o);
-
-        let nominal = next
-            .first_downbeat_out
-            .saturating_add(bar_to_frames(plan.skip, self.bar_frames));
-        let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
         self.poll_phase_align();
+        let phase_align = self.phase_align_ready.take();
+        self.clear_phase_align();
+        let Some(active) = self.active.as_ref() else { return };
+        let Some(next) = self.next_track.as_ref() else { return };
+        let o = active.track.outro_bars.saturating_sub(bars_already_into_outro);
+        let plan = plan_transition(self.options.fade_bars, next.intro_bars, o);
+        let nominal = next.first_downbeat_out.saturating_add(bar_to_frames(plan.skip, self.bar_frames));
+        let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
         // Prefer the background align when it matches this trigger playhead.
         // Realtime hosts must not fall back to in-callback kick/hat search —
         // that stalls the audio thread under load (noise / dropouts). Offline
         // render keeps the sync compute for bit-stable WAVs.
         // Manual navigation supplies its correction in a prepared plan instead.
-        let (entry, prev_nudge) = match self.phase_align_ready.take() {
+        let (entry, prev_nudge) = match phase_align {
             Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
             _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
-                &active.track.samples,
-                active.playhead,
+                &active.track.samples, active.playhead,
                 &next.samples,
                 nominal,
                 active.track.outro_start_out,
@@ -2596,13 +2579,34 @@ impl Engine {
             ),
             _ => (nominal, 0),
         };
-        self.clear_phase_align();
         let entry = if next.head_only { next.first_downbeat_out } else { entry };
-        let entry = if next.frames == 0 {
-            0
-        } else {
-            entry.min(next.frames - 1)
+        let fade_in_end = bar_to_frames(plan.f_eff, self.bar_frames);
+        let fade_out_start = bar_to_frames(plan.fadeout_start, self.bar_frames);
+        let fade_out_end = bar_to_frames(plan.fadeout_end, self.bar_frames);
+        let target_main = next.first_downbeat_out
+            .saturating_add(bar_to_frames(next.intro_bars, self.bar_frames));
+        let full_at = |entry, prev_start| {
+            if plan.f_eff == 0 || entry >= target_main { return None; }
+            admit_frames(
+                active.track.frames, next.frames, prev_start, entry,
+                fade_in_end, fade_out_start, fade_out_end,
+                target_main.saturating_sub(entry).saturating_add(1), false,
+            )
         };
+        let full = full_at(entry, active.playhead.saturating_add(prev_nudge))
+            .or_else(|| full_at(nominal, active.playhead));
+        let entry = nominal.min(next.frames.saturating_sub(1));
+        let simple_fade = if plan.fadeout_end == 0 { 0 } else {
+            bar_to_frames(self.options.fade_bars.max(1), self.bar_frames)
+        };
+        let admission = full.or_else(|| admit_frames(
+            active.track.frames, next.frames, active.playhead, entry,
+            simple_fade, 0, simple_fade, 0, true,
+        ));
+        let Some(admission) = admission else { return };
+
+        let active = self.active.take().expect("admitted active");
+        let next = self.take_next().expect("admitted next");
 
         let from_path = active.track.path.clone();
         let to_path = next.path.clone();
@@ -2610,44 +2614,37 @@ impl Engine {
 
         let next_deck = Deck {
             track: next,
-            playhead: entry,
-            highpass_enabled: true,
+            playhead: admission.entry,
+            highpass_enabled: full.is_some(),
             filter: StereoHighPass::new(self.options.output_sample_rate, self.options.highpass_hz),
             upgrade_fade: None,
         };
 
         let mut prev_deck = active;
         prev_deck.highpass_enabled = false;
-        if prev_nudge > 0 {
-            let max_ph = prev_deck.track.frames.saturating_sub(1);
-            prev_deck.playhead = prev_deck.playhead.saturating_add(prev_nudge).min(max_ph);
-        }
-
-        let fade_in_end = bar_to_frames(plan.f_eff, self.bar_frames);
-        let fade_out_start = bar_to_frames(plan.fadeout_start, self.bar_frames);
-        let fade_out_end = bar_to_frames(plan.fadeout_end, self.bar_frames);
+        prev_deck.playhead = admission.prev_start;
 
         self.pending_events.push(EngineEvent::TransitionStarted {
             from: from_path,
             to: to_path.clone(),
-            entry_frame_out: entry,
+            entry_frame_out: admission.entry,
         });
         self.pending_events.push(EngineEvent::TrackStarted {
             index: next_index,
             path: to_path,
-            entry_frame_out: entry,
+            entry_frame_out: admission.entry,
         });
 
         self.prev = Some(prev_deck);
         self.active = Some(next_deck);
-        let handoff_start = hpf_handoff_start(fade_in_end, self.bar_frames);
+        let handoff_start = hpf_handoff_start(admission.fade_in_end, self.bar_frames);
         self.transition = Some(ActiveTransition {
             frames_into: 0,
-            fade_in_end,
+            fade_in_end: admission.fade_in_end,
             handoff_start,
-            fade_out_start,
-            fade_out_end,
-            simple: false,
+            fade_out_start: admission.fade_out_start,
+            fade_out_end: admission.fade_out_end,
+            simple: full.is_none(),
         });
         self.arm_third_permit_if_needed();
     }
@@ -3279,6 +3276,9 @@ fn finish_prepare(
     }
 
     let out_frames = (rendered.len() / 2) as u64;
+    if out_frames == 0 {
+        return Err(Error::Engine("empty prepared audio buffer".into()));
+    }
     let scale = position_scale(in_frames, out_frames);
     let bar_frames = options.bar_frames();
 
@@ -3701,6 +3701,167 @@ mod tests {
             }
         }
         panic!("realtime transition did not report the final clamped entry");
+    }
+
+    #[test]
+    fn auto_corrected_entry_requires_a_real_frame_at_the_absolute_main() {
+        for frames in [128, 129] {
+            let mut engine = phase_test_engine(true, 8, 44_100);
+            engine.bar_frames = 2.0;
+            let active = engine.active.as_mut().unwrap();
+            active.track.frames = 512;
+            active.track.samples = Arc::new(vec![0.25; 1024]);
+            active.track.outro_bars = 16;
+            active.playhead = 16;
+            let next = engine.next_track.as_mut().unwrap();
+            next.frames = frames;
+            next.samples = Arc::new(vec![0.5; frames as usize * 2]);
+            next.first_downbeat_out = 0;
+            next.intro_bars = 64;
+            engine.phase_align_ready = Some((16, 95, 0));
+            engine.phase_align_rx = None;
+
+            engine.begin_transition(0);
+
+            assert_eq!(engine.transition.as_ref().unwrap().simple, frames == 128);
+            assert_eq!(engine.active.as_ref().unwrap().playhead, if frames == 128 { 96 } else { 95 });
+        }
+    }
+
+    #[test]
+    fn auto_nominal_fallback_discards_the_rejected_nudge() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        engine.bar_frames = 2.0;
+        let active = engine.active.as_mut().unwrap();
+        active.track.frames = 512;
+        active.track.samples = Arc::new(vec![0.25; 1024]);
+        active.track.outro_bars = 8;
+        active.playhead = 496;
+        let next = engine.next_track.as_mut().unwrap();
+        next.frames = 512;
+        next.samples = Arc::new(vec![0.5; 1024]);
+        next.first_downbeat_out = 0;
+        next.intro_bars = 16;
+        engine.phase_align_ready = Some((496, 511, 1));
+        engine.phase_align_rx = None;
+
+        engine.begin_transition(0);
+
+        let transition = engine.transition.as_ref().unwrap();
+        assert!(!transition.simple);
+        assert_eq!(transition.fade_out_end, 16);
+        assert_eq!(engine.prev.as_ref().unwrap().playhead, 496);
+        assert_eq!(engine.active.as_ref().unwrap().playhead, 0);
+    }
+
+    #[test]
+    fn first_track_end_marker_still_starts_on_a_real_frame() {
+        let mut first = future_track(0);
+        first.frames = 8;
+        first.samples = Arc::new(vec![0.5; 16]);
+        first.first_downbeat_out = u64::MAX;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![first]).unwrap();
+        assert_eq!(engine.active.as_ref().unwrap().playhead, 7);
+        assert!(engine.poll_events().iter().any(|event| matches!(event,
+            EngineEvent::TrackStarted { entry_frame_out: 7, .. })));
+        assert_eq!(engine.render_one_frame(), (0.5, 0.5));
+    }
+
+    #[test]
+    fn auto_near_end_correction_uses_a_one_frame_simple_fallback() {
+        let mut active = future_track(0);
+        active.frames = 16;
+        active.samples = Arc::new(vec![0.25; 32]);
+        active.first_downbeat_out = 0;
+        active.outro_start_out = 0;
+        active.outro_end_anchored_out = 0;
+        active.outro_bars = 8;
+
+        let mut next = future_track(1);
+        next.frames = 8;
+        next.samples = Arc::new(vec![0.5; 16]);
+        next.first_downbeat_out = 7;
+        next.intro_bars = 16;
+
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![active, next]).unwrap();
+        engine.active.as_mut().unwrap().playhead = 15;
+        engine.phase_align_ready = Some((15, 7, 1));
+        engine.phase_align_rx = None;
+        engine.poll_events();
+
+        engine.begin_transition(0);
+
+        let transition = engine.transition.as_ref().expect("simple fallback transition");
+        assert!(transition.simple);
+        assert_eq!(transition.fade_in_end, 1);
+        assert_eq!(transition.fade_out_end, 1);
+        assert_eq!(engine.active.as_ref().unwrap().playhead, 7);
+        assert_eq!(engine.prev.as_ref().unwrap().playhead, 15);
+        assert_eq!(engine.render_one_frame(), (0.5, 0.5));
+    }
+
+    #[test]
+    fn invalid_manual_correction_keeps_decks_queues_and_events_unchanged() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let active = engine.active.as_mut().unwrap();
+        active.track.frames = 16;
+        active.track.samples = Arc::new(vec![0.25; 32]);
+        active.playhead = 14;
+        let next = engine.next_track.as_mut().unwrap();
+        next.frames = 16;
+        next.samples = Arc::new(vec![0.5; 32]);
+        next.first_downbeat_out = 0;
+        engine.poll_events();
+
+        let mut plan = controlled_manual_plan(&engine, NavAction::TransitionToNext, 14, 0);
+        plan.simple = false;
+        plan.prev_nudge = 1;
+        plan.fade_in_end = 2;
+        plan.fade_out_end = 2;
+        plan.target_horizon = 2;
+        engine.commit_manual_plan(plan);
+
+        assert_eq!(engine.current_index(), Some(0));
+        assert_eq!(engine.active.as_ref().unwrap().playhead, 14);
+        assert_eq!(engine.next_track.as_ref().unwrap().playlist_index, 1);
+        assert!(engine.prev.is_none());
+        assert!(engine.transition.is_none());
+        assert!(engine.poll_events().is_empty());
+    }
+
+    #[test]
+    fn manual_simple_plan_clamps_an_end_marker_to_audible_material() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let active = engine.active.as_mut().unwrap();
+        active.track.frames = 16;
+        active.track.samples = Arc::new(vec![0.25; 32]);
+        active.playhead = 15;
+        let next = engine.next_track.as_mut().unwrap();
+        next.frames = 8;
+        next.samples = Arc::new(vec![0.5; 16]);
+        next.first_downbeat_out = 8;
+        engine.poll_events();
+
+        let plan = engine.manual_simple_plan(NavAction::TransitionToNext, "end marker").unwrap();
+        assert!(plan.simple);
+        assert_eq!(plan.entry, 7);
+        engine.commit_manual_plan(plan);
+
+        assert!(engine.transition.as_ref().unwrap().simple);
+        assert_eq!(engine.render_one_frame(), (0.5, 0.5));
+    }
+
+    #[test]
+    fn from_prepared_rejects_empty_or_mismatched_pcm_before_starting() {
+        let mut empty = future_track(0);
+        empty.frames = 0;
+        empty.samples = Arc::new(Vec::new());
+        assert!(Engine::from_prepared(EngineOptions::default(), vec![empty]).is_err());
+
+        let mut mismatched = future_track(0);
+        mismatched.frames = 8;
+        mismatched.samples = Arc::new(vec![0.25; 14]);
+        assert!(Engine::from_prepared(EngineOptions::default(), vec![mismatched]).is_err());
     }
 
     // Private controlled decoder seam: production activation/channels/permits,
@@ -4414,7 +4575,7 @@ mod tests {
         assert_eq!(
             p,
             TransitionPlan {
-                f_eff: 1,
+                f_eff: 0,
                 m: 8,
                 skip: 0,
                 fadeout_start: 0,
@@ -4442,7 +4603,7 @@ mod tests {
             for &o in &[8u32, 16, 32, 64] {
                 for f in 1u32..=8 {
                     let p = plan_transition(f, i, o);
-                    assert!(p.f_eff >= 1, "f_eff I={i} O={o} F={f}");
+                    assert!(p.f_eff <= f, "f_eff I={i} O={o} F={f}");
                     assert!(p.skip <= i);
                     assert!(p.m <= i);
                     assert!(p.fadeout_start <= p.fadeout_end);
@@ -5284,7 +5445,7 @@ mod tests {
         };
         ManualPlan { generation: engine.nav_gen, key: manual_key(action, &active.track, target),
             start, entry, prev_nudge: 0, fade_in_end: 1, fade_out_start: 0,
-            fade_out_end: 1, simple: true, reason: "controlled reply" }
+            fade_out_end: 1, target_horizon: 1, simple: true, reason: "controlled reply" }
     }
 
     #[test]
