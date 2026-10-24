@@ -572,8 +572,8 @@ fn nav_prev_jump_after_natural_transition() {
     let path_b = dir.join("b.wav");
     let sr = 44_100u32;
     // Short main so natural transition arrives quickly.
-    write_wav(&path_a, &synth_track(180.0, 8, 8, 8, sr)).unwrap();
-    write_wav(&path_b, &synth_track(180.0, 8, 16, 8, sr)).unwrap();
+    write_wav(&path_a, &synth_track(180.0, 16, 8, 16, sr)).unwrap();
+    write_wav(&path_b, &synth_track(180.0, 16, 16, 16, sr)).unwrap();
 
     let options = engine_opts(cache);
     let tracks =
@@ -597,6 +597,10 @@ fn nav_prev_jump_after_natural_transition() {
         }
     }
     assert!(saw_b, "should reach track B via natural transition");
+    while engine.transition_frames_into().is_some() {
+        assert!(engine.render(&mut buf) > 0, "natural transition must finish before EOF");
+        engine.poll_events();
+    }
 
     engine.request_nav(NavAction::JumpToPrevIntro);
     let _ = engine.render(&mut buf);

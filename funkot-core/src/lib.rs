@@ -188,7 +188,7 @@ pub struct TrackAnalysis {
     /// analyzer would be scored against a boundary a human typed in.
     #[serde(default)]
     pub outro_structure_bars_manual: bool,
-    /// Auto fields were stripped; next load reanalyzes and merges manual bars.
+    /// Auto fields are incomplete or obsolete; next load reanalyzes and merges manual bars.
     #[serde(default)]
     pub needs_reanalysis: bool,
     /// `true` when the low-band onsets lock hard enough onto the 172–188 BPM

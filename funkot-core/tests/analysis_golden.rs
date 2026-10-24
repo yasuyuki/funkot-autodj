@@ -86,6 +86,14 @@ fn golden_downbeat_and_section_tolerances() {
         if let Some(bars) = expect["outro_bars"].as_u64() {
             assert_eq!(a.outro_bars as u64, bars, "{file}: outro_bars");
         }
+        for (key, actual) in [
+            ("intro_bars_low_confidence", a.intro_bars_low_confidence),
+            ("outro_bars_low_confidence", a.outro_bars_low_confidence),
+        ] {
+            if let Some(expected) = expect[key].as_bool() {
+                assert_eq!(actual, expected, "{file}: {key}");
+            }
+        }
         if let Some(min) = expect["intro_bars_min"].as_u64() {
             assert!(
                 a.intro_bars as u64 >= min,

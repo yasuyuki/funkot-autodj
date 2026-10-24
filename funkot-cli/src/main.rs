@@ -3588,7 +3588,7 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
     let owned = checkout.open(SystemTime::now());
     let sr = 44_100u32;
 
-    // Short sections: enough for 8/16 detection, small enough for optional on-disk WAV.
+    // Eight-bar sections exercise low-confidence fallback below the structural minimum.
     let specs: Vec<(&str, SynthOptions, serde_json::Value)> = vec![
         (
             "classic_180_i8_m8_o8.wav",
@@ -3601,16 +3601,16 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
                 ..SynthOptions::default()
             },
             json!({
-                "intro_bars": 8,
-                // 8-bar structural outro; the mix trigger is that plus the
-                // lead-in, clamped by a 24-bar track with an 8-bar intro.
-                "outro_structure_bars": 8,
-                "outro_bars": 16,
+                "intro_bars": 16,
+                "outro_structure_bars": 16,
+                "outro_bars": 8,
+                "intro_bars_low_confidence": true,
+                "outro_bars_low_confidence": true,
                 "first_downbeat_secs": 0.0,
                 "first_downbeat_tol_secs": 0.05,
                 "intro_bpm": 180.0,
                 "bpm_tol": 0.3,
-                "outro_start_bars_from_fd": 8,
+                "outro_start_bars_from_fd": 16,
                 "outro_start_tol_secs": 0.12
             }),
         ),
@@ -3626,14 +3626,16 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
                 ..SynthOptions::default()
             },
             json!({
-                "intro_bars": 8,
-                "outro_structure_bars": 8,
-                "outro_bars": 16,
+                "intro_bars": 16,
+                "outro_structure_bars": 16,
+                "outro_bars": 8,
+                "intro_bars_low_confidence": true,
+                "outro_bars_low_confidence": true,
                 "first_downbeat_secs": 0.25,
                 "first_downbeat_tol_secs": 0.05,
                 "intro_bpm": 180.0,
                 "bpm_tol": 0.3,
-                "outro_start_bars_from_fd": 8,
+                "outro_start_bars_from_fd": 16,
                 "outro_start_tol_secs": 0.12
             }),
         ),
@@ -3648,7 +3650,7 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
                 ..SynthOptions::default()
             },
             json!({
-                "intro_bars_min": 8,
+                "intro_bars_min": 16,
                 "outro_bars_max": 16,
                 "require_intro_ge_outro": true,
                 "first_downbeat_secs": 0.0,
