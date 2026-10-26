@@ -1,8 +1,9 @@
 #!/bin/sh
 # Run a command inside the dev container with the repo mounted at /work.
 # Cargo registry and target dir live in named volumes so rebuilds are fast.
-# Each checkout path has its own target volume, DEV_TARGET_PREFIX-<path hash>
-# (default prefix funkot-target), labelled org.funkot.dev-source=<path>.
+# DEV_TARGET_PREFIX names one shared target volume (default funkot-target).
+# dev_source_guard.py invalidates only checkout-local Cargo fingerprints when
+# the mounted sources cannot be attributed to recorded content.
 #
 # Usage: ./dev.sh cargo build --workspace
 # Optional: DEV_BIND_SRC=/host/path DEV_BIND_DST=/host/path (default: same as src)
@@ -75,13 +76,11 @@ fi
 # Preserve the command as argv throughout: no shell evaluation of context or
 # user arguments. Build Docker options before the image/command boundary.
 #
-# Cargo keys workspace-member outputs without the checkout path, so a target
-# shared by two checkouts runs the other one's test binary. Within one path,
-# dev_source_guard.py rebuilds units whose sources were replaced by files
-# no newer than their last build.
+# Cargo's mtime freshness cannot distinguish restored or metadata-preserving
+# source edits. The content guard invalidates affected local fingerprints.
 SOURCE_PATH=$(pwd -P)
-TARGET_VOLUME=${DEV_TARGET_PREFIX:-funkot-target}-$(printf '%s' "$SOURCE_PATH" | sha256sum | cut -c 1-16)
-docker volume create --label org.funkot.dev-source="$SOURCE_PATH" "$TARGET_VOLUME" >/dev/null
+TARGET_VOLUME=${DEV_TARGET_PREFIX:-funkot-target}
+docker volume create "$TARGET_VOLUME" >/dev/null
 # HEAD names the build only when the checkout does not differ from it.
 SOURCE_REVISION=
 if [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$SOURCE_PATH" ] \
@@ -92,6 +91,7 @@ set -- "$IMAGE" sh -c 'python3 tools/dev_source_guard.py "$@"; status=$?; '"$CHO
 set -- -v "$PWD":/work \
     -v funkot-cargo-registry:/usr/local/cargo/registry \
     -v "$TARGET_VOLUME":/work/target \
+    -e CARGO_TARGET_DIR=/work/target \
     -e CARGO_TERM_COLOR=never \
     -e FUNKOT_TESTDATA_DIR="${FUNKOT_TESTDATA_DIR:-}" \
     -e FUNKOT_SOURCE_REVISION="$SOURCE_REVISION" \

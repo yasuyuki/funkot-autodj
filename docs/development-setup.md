@@ -50,20 +50,17 @@ RUST_TEST_THREADS=1 ./dev.sh cargo test --workspace --release
 Notes:
 
 - The first run, and the first run after a Dockerfile change, builds the `funkot-autodj-dev` image.
-- Each checkout path has its own Cargo target volume, `funkot-target-<hash of the path>`,
-  labelled `org.funkot.dev-source=<path>`, because Cargo keys workspace-member outputs
-  without the checkout path and a shared target ran another checkout's test binary.
-  The first build in a new checkout, or in a newly extracted archive, compiles the
-  dependencies once. Repeated builds of one checkout reuse them.
-  `DEV_TARGET_PREFIX` replaces `funkot-target` in the name for a separately kept set.
-- Cargo decides freshness by mtime. `tools/dev_source_guard.py` records the checkout files
-  each build read and rebuilds a unit when one of them is replaced by a file that is not
-  newer than that build, such as an archive extracted over the tree or a change reverted
-  with `cp -p`. To compare an older revision, run its tree with this `dev.sh` and
-  `tools/dev_source_guard.py`; an older `dev.sh` shares one target volume across
-  checkouts. The regression check is `./scripts/test-dev-source-attribution.sh`.
-- A checkout's target volume stays until its owner removes it after the checkout is
-  released: `docker volume ls --filter label=org.funkot.dev-source=<path>`.
+- Checkouts share the `funkot-target` Cargo target volume. `DEV_TARGET_PREFIX` selects
+  a separate volume. Compatible registry dependencies remain compiled across checkout
+  switches. The target remains shared after an individual checkout is released.
+- `tools/dev_source_guard.py` checks the bytes of local rustc inputs and build-script
+  tracked inputs, including tracked directories. It invalidates affected local Cargo
+  fingerprints when those bytes change, even when inode, size and mtime are unchanged.
+  A target-wide lock covers checking, command execution and the source record update.
+  Keep source inputs stable during each command, as with ordinary Cargo builds.
+  Use the current `dev.sh` and guard when comparing older trees. Direct execution of a
+  known stale target executable is refused. The regression check is
+  `./scripts/test-dev-source-attribution.sh`.
 - Optional managed WAV ownership uses host Python 3 and a short-lived local socket through `dev.sh`.
   The container contains Python for the fixed registration client; it does not receive the host lifecycle
   state or PID namespace. The ordinary unmanaged Docker workflow needs no lifecycle installation.
