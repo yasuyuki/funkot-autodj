@@ -198,3 +198,4 @@ host は元の lifecycle lease と登録 argv を使い、受領側は durable �
 container へ公開しない。container 終了後に socket を除去する。
 completion callback にも同じ task context を与え、checkout の退役より先に実行する。
 `FUNKOT_SOURCE_REVISION` は build 元を呼出側が確認済みの場合の明示的な revision 指定に使える。
+`dev.sh` は checkout が HEAD から変更されていない場合だけ HEAD を渡す。未コミットの変更や未追跡 file があれば、receipt の source revision は実行ファイルの SHA-256 だけになる。

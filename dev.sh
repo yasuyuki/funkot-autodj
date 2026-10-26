@@ -1,6 +1,8 @@
 #!/bin/sh
 # Run a command inside the dev container with the repo mounted at /work.
 # Cargo registry and target dir live in named volumes so rebuilds are fast.
+# Each checkout path has its own target volume, DEV_TARGET_PREFIX-<path hash>
+# (default prefix funkot-target), labelled org.funkot.dev-source=<path>.
 #
 # Usage: ./dev.sh cargo build --workspace
 # Optional: DEV_BIND_SRC=/host/path DEV_BIND_DST=/host/path (default: same as src)
@@ -72,13 +74,27 @@ fi
 # (work.sh playlists with /mnt/c/... paths). Quoted -v keeps spaces safe.
 # Preserve the command as argv throughout: no shell evaluation of context or
 # user arguments. Build Docker options before the image/command boundary.
-set -- "$IMAGE" sh -c '"$@"; status=$?; '"$CHOWN_WORK"'; exit $status' -- "$@"
+#
+# Cargo keys workspace-member outputs without the checkout path, so a target
+# shared by two checkouts runs the other one's test binary. Within one path,
+# dev_source_guard.py rebuilds units whose sources were replaced by files
+# no newer than their last build.
+SOURCE_PATH=$(pwd -P)
+TARGET_VOLUME=${DEV_TARGET_PREFIX:-funkot-target}-$(printf '%s' "$SOURCE_PATH" | sha256sum | cut -c 1-16)
+docker volume create --label org.funkot.dev-source="$SOURCE_PATH" "$TARGET_VOLUME" >/dev/null
+# HEAD names the build only when the checkout does not differ from it.
+SOURCE_REVISION=
+if [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$SOURCE_PATH" ] \
+    && [ -z "$(git status --porcelain)" ]; then
+    SOURCE_REVISION=$(git rev-parse HEAD)
+fi
+set -- "$IMAGE" sh -c 'python3 tools/dev_source_guard.py "$@"; status=$?; '"$CHOWN_WORK"'; exit $status' -- "$@"
 set -- -v "$PWD":/work \
     -v funkot-cargo-registry:/usr/local/cargo/registry \
-    -v funkot-target:/work/target \
+    -v "$TARGET_VOLUME":/work/target \
     -e CARGO_TERM_COLOR=never \
     -e FUNKOT_TESTDATA_DIR="${FUNKOT_TESTDATA_DIR:-}" \
-    -e FUNKOT_SOURCE_REVISION="$(git rev-parse HEAD)" \
+    -e FUNKOT_SOURCE_REVISION="$SOURCE_REVISION" \
     -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     -e CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
     -e RUST_TEST_THREADS="$RUST_TEST_THREADS" \
