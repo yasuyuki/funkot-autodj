@@ -1,9 +1,11 @@
 //! Real-audio acceptance probe for one controlled manual-navigation request.
 //!
 //! The requested position is in the first prepared track's output-frame domain:
-//! `--at-seconds 30` means frame `30 * --sample-rate`, not 30 seconds of wall
-//! time.  `from_prepared` begins at `first_downbeat_out`, so a requested frame
-//! before that marker is rejected instead of silently measuring another start.
+//! `--at-frame 1323000` is an exact active-playhead frame in the first prepared
+//! track's output-frame domain. `--at-seconds 30` remains a convenience mode
+//! and rounds `30 * --sample-rate`. `from_prepared` begins at
+//! `first_downbeat_out`, so a requested frame before that marker is rejected
+//! instead of silently measuring another start.
 //!
 //! Example (the cache directory must be explicit and empty):
 //! ```sh
@@ -20,9 +22,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent, NavAction, PreparedTrack};
+use funkot_core::engine::{prepare_tracks_parallel, Engine, EngineEvent, NavigationTrace, NavAction, PreparedTrack};
 use funkot_core::{EngineOptions, PitchMode};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy)]
 enum Action { Next, Restart, Prev }
@@ -42,8 +45,9 @@ impl Action {
 
 struct Args {
     files: [PathBuf; 2], cache_dir: PathBuf, output: PathBuf,
-    at_seconds: Option<f64>, before_outro_seconds: Option<f64>,
+    at_frame: Option<u64>, at_seconds: Option<f64>, before_outro_seconds: Option<f64>,
     sample_rate: u32, rate: f64, chunk: usize, realtime: bool, action: Action,
+    reuse_cache: bool, engine_options: Option<PathBuf>,
 }
 
 fn main() {
@@ -60,7 +64,7 @@ fn run() -> Result<(), String> {
     }
     if args.cache_dir.exists() {
         if !args.cache_dir.is_dir() { return Err("--cache-dir exists but is not a directory".into()); }
-        if std::fs::read_dir(&args.cache_dir).map_err(|e| e.to_string())?.next().is_some() {
+        if !args.reuse_cache && std::fs::read_dir(&args.cache_dir).map_err(|e| e.to_string())?.next().is_some() {
             return Err("--cache-dir must be empty for this acceptance run".into());
         }
     } else {
@@ -71,11 +75,21 @@ fn run() -> Result<(), String> {
         .unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() { return Err("--output parent directory does not exist".into()); }
 
-    let options = EngineOptions {
+    let mut options = EngineOptions {
         rate: args.rate, pitch_mode: PitchMode::Preserve, fade_bars: 4,
         output_sample_rate: args.sample_rate, cache_dir: args.cache_dir.clone(),
         loop_playlist: false, ..EngineOptions::default()
     };
+    if let Some(file) = &args.engine_options {
+        let header: Value = serde_json::from_slice(&std::fs::read(file).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("read captured engine options: {e}"))?;
+        options = serde_json::from_value(header.get("options").cloned()
+            .ok_or("captured header has no options")?).map_err(|e| format!("captured options: {e}"))?;
+        if options.output_sample_rate != args.sample_rate {
+            return Err("captured options and --sample-rate differ".into());
+        }
+        options.cache_dir = args.cache_dir.clone();
+    }
     // Initial track preparation completes before the measured render calls.
     let prepared = prepare_tracks_parallel(&options, &args.files, 1)
         .map_err(|e| format!("prepare real input: {e}"))?;
@@ -92,8 +106,7 @@ fn run() -> Result<(), String> {
     if matches!(args.action, Action::Prev) {
         return Err("--action prev needs a prior deck, which a two-file fresh from_prepared run does not have; use next or restart".into());
     }
-    let input_hashes: Vec<String> = args.files.iter()
-        .map(|path| funkot_core::cache::content_hash(path).map_err(|e| e.to_string()))
+    let input_hashes: Vec<String> = args.files.iter().map(|path| sha256_file(path))
         .collect::<Result<_, _>>()?;
     let local_tempo = funkot_core::analysis::analyze_local_tempo(
         &prepared[0].samples, request_frame, args.sample_rate, options.target_bpm(),
@@ -105,6 +118,7 @@ fn run() -> Result<(), String> {
     let mut engine = Engine::from_prepared(options.clone(), prepared)
         .map_err(|e| format!("from_prepared: {e}"))?;
     engine.set_realtime(args.realtime);
+    let trace_rx = engine.enable_navigation_trace(32);
 
     let bar_frames = options.bar_frames().round() as u64;
     let capture_start = request_frame.saturating_sub(4 * bar_frames);
@@ -117,13 +131,21 @@ fn run() -> Result<(), String> {
     let mut transition_wall = None;
     let mut automatic_before_request = false;
     let mut events = Vec::new();
+    let mut navigation_trace = Vec::new();
+    let mut accepted_generation = None;
+    let mut accepted_render_frame = None;
+    let mut planned = false;
+    let mut trace_transition_started = false;
+    let mut fade_completed = false;
     let mut durations: Vec<(Duration, usize)> = Vec::new();
     let mut finite = true;
     let mut peak = 0.0f32;
     let mut over_one = 0u64;
+    let mut wav_frame_zero_render_frame = None;
     let mut next_deadline = None;
 
-    while rendered < capture_end {
+    let fade_deadline = request_frame.saturating_add(40 * bar_frames);
+    while rendered < capture_end || (request_wall.is_some() && !fade_completed && rendered < fade_deadline) {
         if request_wall.is_none() && rendered == request_frame {
             request_wall = Some(Instant::now());
             engine.request_nav(args.action.nav());
@@ -142,6 +164,9 @@ fn run() -> Result<(), String> {
         if rendered >= capture_start { durations.push((elapsed, frames)); }
         if frame_end > capture_start {
             let first = capture_start.saturating_sub(rendered) as usize;
+            wav_frame_zero_render_frame.get_or_insert_with(|| {
+                engine.render_frame().saturating_sub(frames as u64).saturating_add(first as u64)
+            });
             let slice = &buffer[first * 2..frames * 2];
             inspect_samples(slice, &mut finite, &mut peak, &mut over_one);
             write_samples(&mut wav, slice)?;
@@ -150,12 +175,28 @@ fn run() -> Result<(), String> {
             let event_json = event_json(&event, &args.files);
             if matches!(event, EngineEvent::TransitionStarted { .. }) {
                 if request_wall.is_none() { automatic_before_request = true; }
-                if request_wall.is_some() && transition_frame.is_none() {
-                    transition_frame = engine.transition_frames_into().map(|into| frame_end.saturating_sub(into));
-                    transition_wall = Some(Instant::now());
-                }
             }
             events.push(json!({"frame_observed_after_render": frame_end, "event": event_json}));
+        }
+        for trace in trace_rx.try_iter() {
+            match trace {
+                NavigationTrace::Accepted { generation, action, render_frame, .. } if action == args.action.nav() => {
+                    accepted_generation = Some(generation);
+                    accepted_render_frame = Some(render_frame);
+                }
+                NavigationTrace::PlanApplied { generation, .. }
+                    if Some(generation) == accepted_generation => planned = true,
+                NavigationTrace::TransitionStarted { generation, render_frame, .. }
+                    if Some(generation) == accepted_generation => {
+                        trace_transition_started = true;
+                        transition_frame = Some(render_frame);
+                        transition_wall = Some(Instant::now());
+                    }
+                NavigationTrace::FadeCompleted { generation, .. }
+                    if Some(generation) == accepted_generation => fade_completed = true,
+                _ => {}
+            }
+            navigation_trace.push(serde_json::to_value(trace).expect("trace is serializable"));
         }
         rendered = frame_end;
         if args.realtime && rendered >= capture_start {
@@ -171,31 +212,52 @@ fn run() -> Result<(), String> {
         Some("automatic transition occurred before the requested navigation frame")
     } else if request_wall.is_none() {
         Some("render ended before the requested navigation frame")
-    } else if transition_frame.is_none() {
-        Some("manual navigation did not produce an observed transition within the captured audio")
+    } else if accepted_generation.is_none() {
+        Some("manual navigation was not accepted")
+    } else if !planned {
+        Some("accepted navigation did not apply a manual plan")
+    } else if !trace_transition_started || transition_frame.is_none() {
+        Some("accepted navigation did not start a transition")
+    } else if !fade_completed {
+        Some("manual transition fade did not complete before the capture deadline")
     } else if transition_frame.is_some_and(|frame| frame < request_frame) {
         Some("observed transition predates navigation request")
     } else { None };
     let request_wall = request_wall.unwrap_or_else(Instant::now);
     let transition_wall = transition_wall.unwrap_or_else(Instant::now);
     let manual_diagnostic = manual_plan_json(&engine);
+    let wav_file = wav_path.display().to_string();
     let attribution = if manual_diagnostic.is_null() {
         "observed_after_request_pending_manual_plan_proof"
     } else { "manual_plan_confirmed" };
     let measurement = json!({
-        "input": {"track_ids": [0, 1], "cache_content_hashes": input_hashes},
+        "schema": 1,
+        "executable_sha256": sha256_file(&std::env::current_exe().map_err(|e| e.to_string())?)?,
+        "core_source_sha256": format!("{:x}", Sha256::digest(include_bytes!("../src/engine.rs"))),
+        "driver_source_sha256": format!("{:x}", Sha256::digest(include_bytes!("manual_nav_acceptance.rs"))),
+        "input": {"track_ids": [0, 1], "content_hashes": input_hashes},
+        "engine_options": options,
         "local_tempo_at_request": local_tempo,
-        "options": {"sample_rate": args.sample_rate, "rate": args.rate, "chunk_frames": args.chunk,
+        "options": {"sample_rate": args.sample_rate, "output_sample_rate": args.sample_rate,
+            "rate": options.rate, "chunk_frames": args.chunk,
             "realtime": args.realtime, "action": args.action.name(), "fade_bars": options.fade_bars},
         "markers": marker_json,
-        "positions": {"initial_playhead_frame": initial_playhead, "request_frame": request_frame,
+        "positions": {"frame_domain": "active_playhead_output_frames", "initial_playhead_frame": initial_playhead, "request_frame": request_frame,
             "capture_start_frame": capture_start, "capture_end_limit_frame": capture_end,
-            "rendered_end_frame": rendered, "transition_frame": transition_frame,
+            "fade_deadline_frame": fade_deadline, "rendered_end_frame": rendered,
+            "request_render_frame": accepted_render_frame,
+            "engine_rendered_output_frames": engine.render_frame(), "transition_frame": transition_frame,
             "request_to_transition_frames": transition_frame.and_then(|frame| frame.checked_sub(request_frame))},
         "request_to_transition_wall_ms": transition_wall.duration_since(request_wall).as_secs_f64() * 1000.0,
         "render_calls": render_stats(&durations, args.sample_rate),
-        "audio": {"finite": finite, "peak": peak, "samples_abs_gt_1": over_one},
+        "audio": {"file": wav_file, "sample_rate": args.sample_rate,
+            "engine_start_frame": wav_frame_zero_render_frame,
+            "finite": finite, "peak": peak, "samples_abs_gt_1": over_one},
+        "output_wav": {"format": "f32_stereo_wav", "sample_rate": args.sample_rate,
+            "channels": 2, "wav_frame_zero_render_frame": wav_frame_zero_render_frame},
         "events": events,
+        "navigation_trace": navigation_trace,
+        "navigation_trace_dropped": engine.navigation_trace_dropped(),
         "manual_plan_diagnostic": manual_diagnostic,
         "transition_attribution": attribution,
         "outcome": outcome,
@@ -209,10 +271,11 @@ fn run() -> Result<(), String> {
 }
 
 fn requested_frame(args: &Args, first: &PreparedTrack) -> Result<u64, String> {
-    match (args.at_seconds, args.before_outro_seconds) {
-        (Some(at), None) => Ok((at * args.sample_rate as f64).round() as u64),
-        (None, Some(before)) => Ok(first.outro_start_out.saturating_sub((before * args.sample_rate as f64).round() as u64)),
-        _ => Err("provide exactly one of --at-seconds or --before-outro-seconds".into()),
+    match (args.at_frame, args.at_seconds, args.before_outro_seconds) {
+        (Some(frame), None, None) => Ok(frame),
+        (None, Some(at), None) => Ok((at * args.sample_rate as f64).round() as u64),
+        (None, None, Some(before)) => Ok(first.outro_start_out.saturating_sub((before * args.sample_rate as f64).round() as u64)),
+        _ => Err("provide exactly one of --at-frame, --at-seconds, or --before-outro-seconds".into()),
     }
 }
 
@@ -280,14 +343,18 @@ fn render_stats(durations: &[(Duration, usize)], sample_rate: u32) -> Value {
 
 fn parse_args() -> Result<Args, String> {
     let mut files = Vec::new(); let mut cache_dir = None; let mut output = None;
-    let mut at_seconds = None; let mut before_outro_seconds = None;
+    let mut at_frame = None; let mut at_seconds = None; let mut before_outro_seconds = None;
     let mut sample_rate = 44_100u32; let mut rate = 1.10f64; let mut chunk = 1024usize;
     let mut realtime = false; let mut action = Action::Next;
+    let mut reuse_cache = false; let mut engine_options = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cache-dir" => cache_dir = Some(PathBuf::from(next_value("--cache-dir", &mut args)?)),
+            "--reuse-cache" => reuse_cache = true,
+            "--engine-options" => engine_options = Some(PathBuf::from(next_value("--engine-options", &mut args)?)),
             "--output" => output = Some(PathBuf::from(next_value("--output", &mut args)?)),
+            "--at-frame" => at_frame = Some(next_value("--at-frame", &mut args)?.parse().map_err(|_| "invalid --at-frame")?),
             "--at-seconds" => at_seconds = Some(parse_positive("--at-seconds", &next_value("--at-seconds", &mut args)?)?),
             "--before-outro-seconds" => before_outro_seconds = Some(parse_positive("--before-outro-seconds", &next_value("--before-outro-seconds", &mut args)?)?),
             "--sample-rate" => sample_rate = next_value("--sample-rate", &mut args)?.parse().map_err(|_| "invalid --sample-rate")?,
@@ -302,7 +369,7 @@ fn parse_args() -> Result<Args, String> {
     }
     if files.len() != 2 { return Err(format!("need exactly two input files\n\n{}", usage())); }
     if sample_rate == 0 || chunk == 0 { return Err("--sample-rate and --chunk must be > 0".into()); }
-    Ok(Args { files: [files.remove(0), files.remove(0)], cache_dir: cache_dir.ok_or("--cache-dir is required")?, output: output.ok_or("--output is required")?, at_seconds, before_outro_seconds, sample_rate, rate, chunk, realtime, action })
+    Ok(Args { files: [files.remove(0), files.remove(0)], cache_dir: cache_dir.ok_or("--cache-dir is required")?, output: output.ok_or("--output is required")?, at_frame, at_seconds, before_outro_seconds, sample_rate, rate, chunk, realtime, action, reuse_cache, engine_options })
 }
 
 fn next_value<I: Iterator<Item = String>>(name: &str, args: &mut I) -> Result<String, String> {
@@ -315,5 +382,12 @@ fn parse_positive(name: &str, value: &str) -> Result<f64, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: manual_nav_acceptance A B --cache-dir EMPTY_DIR --output PREFIX (--at-seconds SECONDS | --before-outro-seconds SECONDS) [--sample-rate 44100] [--rate 1.10] [--chunk 1024] [--realtime] [--action next|restart|prev]"
+    "Usage: manual_nav_acceptance A B --cache-dir DIR [--reuse-cache] [--engine-options CAPTURE_HEADER.json] --output PREFIX (--at-frame ACTIVE_PLAYHEAD_FRAME | --at-seconds SECONDS | --before-outro-seconds SECONDS) [--sample-rate 44100] [--rate 1.10] [--chunk 1024] [--realtime] [--action next|restart|prev]"
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hash = Sha256::new();
+    std::io::copy(&mut file, &mut hash).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", hash.finalize()))
 }
