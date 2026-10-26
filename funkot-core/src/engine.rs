@@ -30,7 +30,8 @@ use crate::stretch::{self, position_scale};
 use crate::{cache, decode, EngineOptions, Error, Result, BEATS_PER_BAR, MAIN_GAP_BARS};
 
 /// Live skip / rewind request (CLI / host). Multiple presses are coalesced by the host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NavAction {
     /// Left ×1: transition to the current track's normal entry.
     RestartCurrent,
@@ -703,7 +704,7 @@ struct ManualPlan {
 }
 
 /// Value-only local-sync decision for host diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ManualPlanDiagnostic {
     pub generation: u64,
     /// Previous deck's scheduled frame, before any fractional phase nudge.
@@ -717,6 +718,86 @@ pub struct ManualPlanDiagnostic {
     pub fade_out_end: u64,
     pub simple: bool,
     pub reason: &'static str,
+}
+
+/// Lifecycle observation for a navigation action that the engine accepted.
+///
+/// `render_frame` is the cumulative number of output PCM frames emitted before
+/// the observed boundary. It includes loader and preview silence returned by
+/// [`Engine::render`]. `generation` identifies one accepted navigation action;
+/// a refused or coalesced action has no accepted trace record. A later accepted
+/// action can supersede an earlier one, leaving the earlier trace incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NavigationTrace {
+    Accepted {
+        generation: u64,
+        action: NavAction,
+        render_frame: u64,
+        active_playhead: u64,
+        current_index: usize,
+        source_generation: u64,
+        active_preview: bool,
+        active_head_only: bool,
+        target_index: usize,
+        target_source_generation: u64,
+        target_preview: bool,
+        target_head_only: bool,
+    },
+    /// A validated manual plan reached the deck-application boundary.
+    PlanApplied {
+        generation: u64,
+        render_frame: u64,
+        target_index: usize,
+        target_source_generation: u64,
+        plan: ManualPlanDiagnostic,
+    },
+    /// The first PCM frame of the plan's transition is about to be emitted.
+    TransitionStarted {
+        generation: u64,
+        action: NavAction,
+        render_frame: u64,
+        previous_playhead: u64,
+        current_index: usize,
+        source_generation: u64,
+        target_index: usize,
+        target_source_generation: u64,
+    },
+    /// The final fade-out frame has been emitted.
+    FadeCompleted {
+        generation: u64,
+        action: NavAction,
+        render_frame: u64,
+        active_playhead: u64,
+        current_index: usize,
+        source_generation: u64,
+        target_index: usize,
+        target_source_generation: u64,
+    },
+    /// An accepted intro jump installed its target without a transition fade.
+    JumpApplied {
+        generation: u64,
+        action: NavAction,
+        render_frame: u64,
+        current_index: usize,
+        source_generation: u64,
+        target_index: usize,
+        target_source_generation: u64,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct ActiveNavigationTrace {
+    generation: u64,
+    action: NavAction,
+    target_index: usize,
+    target_source_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingNavigationTrace {
+    active: ActiveNavigationTrace,
+    plan: ManualPlanDiagnostic,
 }
 
 struct ManualRequest {
@@ -1178,6 +1259,10 @@ pub struct Engine {
     deferred_nav: VecDeque<NavAction>,
     pending_nav: Option<PendingNav>,
     nav_gen: u64,
+    render_frame: u64,
+    navigation_trace_tx: Option<SyncSender<NavigationTrace>>,
+    navigation_trace_dropped: AtomicUsize,
+    active_navigation_trace: Option<ActiveNavigationTrace>,
     /// One long-lived local planner.  The request channel is capacity one;
     /// when it is occupied the engine retains just the newest snapshot.
     manual_tx: SyncSender<ManualRequest>,
@@ -1279,6 +1364,10 @@ impl Engine {
             deferred_nav: VecDeque::new(),
             pending_nav: None,
             nav_gen: 0,
+            render_frame: 0,
+            navigation_trace_tx: None,
+            navigation_trace_dropped: AtomicUsize::new(0),
+            active_navigation_trace: None,
             manual_tx, manual_rx, manual_pending: None, manual_in_flight: false, manual_deadline: None, manual_action: None, last_manual_plan: None,
         })
     }
@@ -1385,6 +1474,10 @@ impl Engine {
             deferred_nav: VecDeque::new(),
             pending_nav: None,
             nav_gen: 0,
+            render_frame: 0,
+            navigation_trace_tx: None,
+            navigation_trace_dropped: AtomicUsize::new(0),
+            active_navigation_trace: None,
             manual_tx, manual_rx, manual_pending: None, manual_in_flight: false, manual_deadline: None, manual_action: None, last_manual_plan: None,
         };
         if let Some(track) = first {
@@ -1505,6 +1598,31 @@ impl Engine {
         self.render_diagnostics
     }
 
+    /// Cumulative output PCM frames returned by [`Self::render`].
+    ///
+    /// The count advances for silence returned while waiting for preparation or
+    /// a realtime preview upgrade. It does not advance after `render` returns
+    /// zero.
+    pub fn render_frame(&self) -> u64 {
+        self.render_frame
+    }
+
+    /// Enable a bounded, value-only navigation trace and return its receiver.
+    ///
+    /// The render thread uses `try_send`; a full or disconnected receiver never
+    /// blocks rendering. Query [`Self::navigation_trace_dropped`] to distinguish
+    /// an incomplete trace from an action that was never accepted.
+    pub fn enable_navigation_trace(&mut self, capacity: usize) -> Receiver<NavigationTrace> {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        self.navigation_trace_tx = Some(tx);
+        rx
+    }
+
+    /// Cumulative number of trace records not delivered by this engine.
+    pub fn navigation_trace_dropped(&self) -> usize {
+        self.navigation_trace_dropped.load(Ordering::Relaxed)
+    }
+
     /// Fill `out` (interleaved stereo at `options.output_sample_rate`).
     /// Returns frames written; 0 means playback finished.
     /// Outputs silence while the first track is being prepared. If a head
@@ -1528,7 +1646,11 @@ impl Engine {
 
         // Still waiting for the first track (or between tracks): silence.
         if self.active.is_none() && self.prev.is_none() {
-            if self.future_fence.is_some() { out.fill(0.0); return want_frames; }
+            if self.future_fence.is_some() {
+                out.fill(0.0);
+                self.render_frame = self.render_frame.saturating_add(want_frames as u64);
+                return want_frames;
+            }
             self.drain_loader();
             if let Some(track) = self.take_next() {
                 self.start_first(track);
@@ -1540,6 +1662,7 @@ impl Engine {
                 for s in out.iter_mut() {
                     *s = 0.0;
                 }
+                self.render_frame = self.render_frame.saturating_add(want_frames as u64);
                 return want_frames;
             }
         }
@@ -1584,6 +1707,7 @@ impl Engine {
             out[frames_done * 2] = l;
             out[frames_done * 2 + 1] = r;
             frames_done += 1;
+            self.render_frame = self.render_frame.saturating_add(1);
         }
 
         frames_done
@@ -1603,12 +1727,7 @@ impl Engine {
 
     /// Most recently adopted local plan, without retaining audio ownership.
     pub fn last_manual_plan_diagnostic(&self) -> Option<ManualPlanDiagnostic> {
-        self.last_manual_plan.as_ref().map(|p| ManualPlanDiagnostic { generation: p.generation,
-            start: p.start, entry: p.entry, prev_nudge: p.prev_nudge,
-            next_main: p.key.target_first.saturating_add(bar_to_frames(p.key.target_intro, self.bar_frames)).saturating_sub(p.entry),
-            fade_in_end: p.fade_in_end,
-            fade_out_start: p.fade_out_start, fade_out_end: p.fade_out_end,
-            simple: p.simple, reason: p.reason })
+        self.last_manual_plan.as_ref().map(|p| self.manual_plan_diagnostic(p))
     }
 
     /// Path of the track prepared to follow the active one, if any.
@@ -1855,18 +1974,30 @@ impl Engine {
             return;
         }
 
+        let target_index = match action {
+            NavAction::RestartCurrent => self.active.as_ref().expect("checked active").track.playlist_index,
+            NavAction::TransitionToPrev | NavAction::JumpToPrevIntro => {
+                self.last_track.as_ref().expect("checked previous").playlist_index
+            }
+            NavAction::TransitionToNext | NavAction::JumpToNextIntro => {
+                self.next_track.as_ref().expect("checked next").playlist_index
+            }
+        };
+
         // Immediate jumps skip BPM / bar wait.
         if matches!(
             action,
             NavAction::JumpToPrevIntro | NavAction::JumpToNextIntro
         ) {
             self.cancel_pending_nav();
-            self.execute_jump(action);
+            let trace = self.accept_navigation_trace(action, target_index);
+            self.execute_jump(action, Some(trace));
             return;
         }
 
         self.cancel_pending_nav();
         self.nav_gen = self.nav_gen.wrapping_add(1);
+        self.accept_navigation_trace(action, target_index);
         let Some(active) = self.active.as_ref() else { return };
         // The worker gets only the material that can still be used.  When that
         // deadline passes we make one bounded simple transition, never restart
@@ -1886,6 +2017,68 @@ impl Engine {
         self.manual_deadline = None;
         self.manual_action = None;
         self.nav_gen = self.nav_gen.wrapping_add(1);
+    }
+
+    fn accept_navigation_trace(&mut self, action: NavAction, target_index: usize) -> ActiveNavigationTrace {
+        let (active_playhead, current_index, active_preview, active_head_only,
+            target_preview, target_head_only) = {
+            let active = self.active.as_ref().expect("accepted navigation has active deck");
+            let target = match action {
+                NavAction::RestartCurrent => &active.track,
+                NavAction::TransitionToPrev | NavAction::JumpToPrevIntro => {
+                    self.last_track.as_ref().expect("accepted previous target")
+                }
+                NavAction::TransitionToNext | NavAction::JumpToNextIntro => {
+                    self.next_track.as_ref().expect("accepted next target")
+                }
+            };
+            (active.playhead, active.track.playlist_index, active.track.preview,
+                active.track.head_only, target.preview, target.head_only)
+        };
+        let trace = ActiveNavigationTrace {
+            generation: self.nav_gen,
+            action,
+            target_index,
+            target_source_generation: self.source_generation,
+        };
+        self.emit_navigation_trace(NavigationTrace::Accepted {
+            generation: trace.generation,
+            action,
+            render_frame: self.render_frame,
+            active_playhead,
+            current_index,
+            source_generation: self.source_generation,
+            active_preview,
+            active_head_only,
+            target_index,
+            target_source_generation: trace.target_source_generation,
+            target_preview,
+            target_head_only,
+        });
+        trace
+    }
+
+    fn emit_navigation_trace(&self, trace: NavigationTrace) {
+        if self.navigation_trace_tx.as_ref().is_some_and(|tx| tx.try_send(trace).is_err()) {
+            self.navigation_trace_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn manual_plan_diagnostic(&self, plan: &ManualPlan) -> ManualPlanDiagnostic {
+        ManualPlanDiagnostic {
+            generation: plan.generation,
+            start: plan.start,
+            entry: plan.entry,
+            prev_nudge: plan.prev_nudge,
+            next_main: plan.key.target_first
+                .saturating_add(bar_to_frames(plan.key.target_intro, self.bar_frames))
+                .saturating_sub(plan.entry),
+            fade_in_end: plan.fade_in_end,
+            fade_out_start: plan.fade_out_start,
+            fade_out_end: plan.fade_out_end,
+            simple: plan.simple,
+            reason: plan.reason,
+        }
     }
 
     fn poll_nav_tempo(&mut self) {
@@ -1909,8 +2102,10 @@ impl Engine {
                 self.manual_action = None;
                 self.manual_pending = None;
                 self.pending_nav = None;
+                let accepted_generation = self.nav_gen;
                 self.nav_gen = self.nav_gen.wrapping_add(1);
-                if let Some(plan) = self.manual_simple_plan(action, "deadline fallback") {
+                if let Some(mut plan) = self.manual_simple_plan(action, "deadline fallback") {
+                    plan.generation = accepted_generation;
                     self.commit_manual_plan(plan);
                 }
                 return;
@@ -2052,7 +2247,16 @@ impl Engine {
         plan.fade_out_start = admission.fade_out_start;
         plan.fade_out_end = admission.fade_out_end;
         self.last_manual_plan = Some(plan.clone());
-        self.begin_transition_to(target, plan, matches!(action, NavAction::RestartCurrent));
+        let trace = PendingNavigationTrace {
+            active: ActiveNavigationTrace {
+                generation: plan.generation,
+                action,
+                target_index: plan.key.target_index,
+                target_source_generation: self.source_generation,
+            },
+            plan: self.manual_plan_diagnostic(&plan),
+        };
+        self.begin_transition_to(target, plan, matches!(action, NavAction::RestartCurrent), Some(trace));
     }
 
     fn manual_simple_plan(&self, action: NavAction, reason: &'static str) -> Option<ManualPlan> {
@@ -2074,6 +2278,7 @@ impl Engine {
     }
 
     fn abort_active_transition(&mut self) {
+        self.active_navigation_trace = None;
         self.transition = None;
         self.awaiting_next_at_outro = false;
         if let Some(deck) = self.prev.take() {
@@ -2089,7 +2294,7 @@ impl Engine {
         self.clear_phase_align();
     }
 
-    fn execute_jump(&mut self, action: NavAction) {
+    fn execute_jump(&mut self, action: NavAction, trace: Option<ActiveNavigationTrace>) {
         match action {
             NavAction::JumpToPrevIntro => {
                 let Some(prev) = self.last_track.take() else {
@@ -2101,6 +2306,17 @@ impl Engine {
                     self.push_front_next(deck_track_retiring_upgrade(cur));
                 }
                 self.start_first(prev);
+                if let Some(trace) = trace {
+                    self.emit_navigation_trace(NavigationTrace::JumpApplied {
+                        generation: trace.generation,
+                        action: trace.action,
+                        render_frame: self.render_frame,
+                        current_index: self.current_index().expect("started previous"),
+                        source_generation: self.source_generation,
+                        target_index: trace.target_index,
+                        target_source_generation: trace.target_source_generation,
+                    });
+                }
             }
             NavAction::JumpToNextIntro => {
                 let Some(next) = self.take_next() else {
@@ -2111,13 +2327,25 @@ impl Engine {
                     self.push_history(deck_track_retiring_upgrade(cur));
                 }
                 self.start_first(next);
+                if let Some(trace) = trace {
+                    self.emit_navigation_trace(NavigationTrace::JumpApplied {
+                        generation: trace.generation,
+                        action: trace.action,
+                        render_frame: self.render_frame,
+                        current_index: self.current_index().expect("started next"),
+                        source_generation: self.source_generation,
+                        target_index: trace.target_index,
+                        target_source_generation: trace.target_source_generation,
+                    });
+                }
             }
             _ => {}
         }
     }
 
     /// Commit an already validated manual plan. No analysis or planning runs here.
-    fn begin_transition_to(&mut self, next: PreparedTrack, plan: ManualPlan, restart_same: bool) {
+    fn begin_transition_to(&mut self, next: PreparedTrack, plan: ManualPlan, restart_same: bool,
+        trace: Option<PendingNavigationTrace>) {
         self.abort_active_transition();
         // Replacing the active deck invalidates every uncommitted local reply.
         self.cancel_pending_nav();
@@ -2183,6 +2411,27 @@ impl Engine {
         });
         self.awaiting_next_at_outro = false;
         self.arm_third_permit_if_needed();
+
+        if let Some(trace) = trace {
+            self.emit_navigation_trace(NavigationTrace::PlanApplied {
+                generation: trace.active.generation,
+                render_frame: self.render_frame,
+                target_index: trace.active.target_index,
+                target_source_generation: trace.active.target_source_generation,
+                plan: trace.plan,
+            });
+            self.emit_navigation_trace(NavigationTrace::TransitionStarted {
+                generation: trace.active.generation,
+                action: trace.active.action,
+                render_frame: self.render_frame,
+                previous_playhead: self.prev.as_ref().expect("transition previous").playhead,
+                current_index: self.current_index().expect("transition active"),
+                source_generation: self.source_generation,
+                target_index: trace.active.target_index,
+                target_source_generation: trace.active.target_source_generation,
+            });
+            self.active_navigation_trace = Some(trace.active);
+        }
 
         // RestartCurrent: both decks share one permit; tag so drop_prev won't
         // treat prev as an extra slot. push_history on drop still OK (replace).
@@ -2403,7 +2652,7 @@ impl Engine {
                 // Labeling mode was just turned off: hand off to the upcoming
                 // full-length track via the existing hard-jump path instead of
                 // looping a track that will never be replaced.
-                self.execute_jump(NavAction::JumpToNextIntro);
+                self.execute_jump(NavAction::JumpToNextIntro, None);
                 return;
             }
         }
@@ -2667,6 +2916,18 @@ impl Engine {
             self.drop_prev();
             if past_fade_out {
                 self.transition = None;
+                if let Some(trace) = self.active_navigation_trace.take() {
+                    self.emit_navigation_trace(NavigationTrace::FadeCompleted {
+                        generation: trace.generation,
+                        action: trace.action,
+                        render_frame: self.render_frame,
+                        active_playhead: self.active.as_ref().map_or(0, |deck| deck.playhead),
+                        current_index: self.current_index().unwrap_or(trace.target_index),
+                        source_generation: self.source_generation,
+                        target_index: trace.target_index,
+                        target_source_generation: trace.target_source_generation,
+                    });
+                }
             }
         }
 
@@ -2779,6 +3040,18 @@ impl Engine {
             if should_drop {
                 self.drop_prev();
                 self.transition = None;
+                if let Some(trace) = self.active_navigation_trace.take() {
+                    self.emit_navigation_trace(NavigationTrace::FadeCompleted {
+                        generation: trace.generation,
+                        action: trace.action,
+                        render_frame: self.render_frame.saturating_add(1),
+                        active_playhead: self.active.as_ref().map_or(0, |deck| deck.playhead),
+                        current_index: self.current_index().unwrap_or(trace.target_index),
+                        source_generation: self.source_generation,
+                        target_index: trace.target_index,
+                        target_source_generation: trace.target_source_generation,
+                    });
+                }
             }
         }
 
@@ -5532,6 +5805,44 @@ mod tests {
         assert_eq!(diagnostic.reason, "deadline fallback");
         engine.tick_pending_nav();
         assert_eq!(engine.last_manual_plan_diagnostic().unwrap(), diagnostic);
+    }
+
+    #[test]
+    fn deadline_fallback_trace_keeps_the_accepted_generation() {
+        let mut engine = phase_test_engine(true, 8, 180);
+        let trace_rx = engine.enable_navigation_trace(8);
+        engine.begin_nav(NavAction::TransitionToNext);
+        let now = engine.active.as_ref().expect("active").playhead;
+        engine.manual_deadline = Some(now);
+        engine.tick_pending_nav();
+
+        let mut output = [0.0; 2];
+        for _ in 0..512 {
+            engine.render(&mut output);
+            if engine.transition.is_none() {
+                break;
+            }
+        }
+        let trace: Vec<_> = trace_rx.try_iter().collect();
+        let accepted = trace.iter().find_map(|event| match event {
+            NavigationTrace::Accepted { generation, .. } => Some(*generation),
+            _ => None,
+        }).expect("accepted request");
+        let lifecycle: Vec<_> = trace.iter().filter_map(|event| match event {
+            NavigationTrace::PlanApplied { generation, plan, .. }
+                if *generation == accepted => Some(("plan", plan.reason)),
+            NavigationTrace::TransitionStarted { generation, .. }
+                if *generation == accepted => Some(("started", "")),
+            NavigationTrace::FadeCompleted { generation, .. }
+                if *generation == accepted => Some(("completed", "")),
+            _ => None,
+        }).collect();
+        assert_eq!(lifecycle, vec![
+            ("plan", "deadline fallback"),
+            ("started", ""),
+            ("completed", ""),
+        ]);
+        assert_ne!(engine.nav_gen, accepted, "late worker replies remain stale");
     }
 
     #[test]

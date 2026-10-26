@@ -1,12 +1,12 @@
 //! Integration tests for the pull-based mixing engine.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use funkot_core::engine::{
     align_next_entry_with_phase_hypotheses, plan_transition, prepare_tracks_parallel, Engine,
-    EngineEvent,
+    EngineEvent, NavAction, NavigationTrace, PreparedTrack,
 };
 use funkot_core::testutil::{synth_track, write_wav};
 use funkot_core::{EngineOptions, PitchMode, BEATS_PER_BAR};
@@ -67,6 +67,70 @@ fn render_all(engine: &mut Engine, chunk_frames: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+fn trace_prepared_tracks() -> Vec<PreparedTrack> {
+    let frames = 24_000u64;
+    (0..2usize)
+        .map(|index| {
+            let mut samples = Vec::with_capacity(frames as usize * 2);
+            for frame in 0..frames {
+                let sample = ((frame + index as u64 * 17) % 97) as f32 / 97.0 - 0.5;
+                samples.extend([sample, -sample]);
+            }
+            PreparedTrack {
+                path: PathBuf::from(format!("trace-{index}.wav")),
+                playlist_index: index,
+                samples: Arc::new(samples),
+                frames,
+                first_downbeat_out: 7,
+                outro_start_out: 20_000,
+                outro_end_anchored_out: 20_000,
+                intro_bars: 8,
+                outro_bars: 8,
+                gain_linear: 1.0,
+                preview: false,
+                head_only: false,
+            }
+        })
+        .collect()
+}
+
+fn trace_case(chunk: usize, trace_capacity: Option<usize>) -> (Vec<f32>, Vec<NavigationTrace>, usize) {
+    let dir = temp_dir("navigation_trace");
+    let mut options = engine_opts(dir.join("cache"));
+    options.output_sample_rate = 1_000;
+    options.fade_bars = 1;
+    let mut engine = Engine::from_prepared(options, trace_prepared_tracks()).expect("engine");
+    let trace_rx = trace_capacity.map(|capacity| engine.enable_navigation_trace(capacity));
+    let request_at = 37u64;
+    let end_at = 8_000u64;
+    let mut output = Vec::new();
+    let mut requested = false;
+    while engine.render_frame() < end_at {
+        if !requested && engine.render_frame() == request_at {
+            engine.request_nav(NavAction::TransitionToNext);
+            requested = true;
+        }
+        let until_request = if requested { u64::MAX } else { request_at - engine.render_frame() };
+        let wanted = (chunk as u64)
+            .min(end_at - engine.render_frame())
+            .min(until_request) as usize;
+        assert!(wanted > 0, "render request must make progress");
+        let mut buffer = vec![0.0; wanted * 2];
+        let written = engine.render(&mut buffer);
+        assert_eq!(written, wanted, "prepared trace source must remain playable");
+        output.extend_from_slice(&buffer);
+    }
+    assert!(requested, "must request at an exact output frame");
+    let trace = trace_rx
+        .as_ref()
+        .map(|rx| rx.try_iter().collect())
+        .unwrap_or_default();
+    let dropped = engine.navigation_trace_dropped();
+    drop(engine);
+    let _ = std::fs::remove_dir_all(dir);
+    (output, trace, dropped)
 }
 
 fn assert_finite_peak(samples: &[f32], peak_limit: f32) {
@@ -559,6 +623,96 @@ fn nav_jump_next_intro_and_restart() {
         "same-track restart must not emit TrackStarted, got {events:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn navigation_trace_is_sample_exact_bounded_and_pcm_neutral() {
+    let _lock = engine_test_lock();
+    let (single_frame_pcm, single_frame_trace, single_frame_dropped) = trace_case(1, Some(16));
+    let (small_chunk_pcm, small_chunk_trace, small_chunk_dropped) = trace_case(192, Some(16));
+    let (large_chunk_pcm, large_chunk_trace, large_chunk_dropped) = trace_case(1024, Some(16));
+    let (disabled_pcm, disabled_trace, disabled_dropped) = trace_case(1024, None);
+
+    assert_eq!(single_frame_pcm, small_chunk_pcm);
+    assert_eq!(single_frame_pcm, large_chunk_pcm);
+    assert_eq!(single_frame_pcm, disabled_pcm, "trace must not alter PCM");
+    assert_eq!(single_frame_trace, small_chunk_trace);
+    assert_eq!(single_frame_trace, large_chunk_trace);
+    assert_eq!(single_frame_dropped, 0);
+    assert_eq!(small_chunk_dropped, 0);
+    assert_eq!(large_chunk_dropped, 0);
+    assert!(disabled_trace.is_empty());
+    assert_eq!(disabled_dropped, 0);
+
+    let accepted = single_frame_trace.iter().find_map(|event| match event {
+        NavigationTrace::Accepted {
+            generation,
+            action: NavAction::TransitionToNext,
+            render_frame,
+            active_playhead,
+            current_index,
+            source_generation,
+            target_index,
+            target_source_generation,
+            ..
+        } => Some((*generation, *render_frame, *active_playhead, *current_index,
+            *source_generation, *target_index, *target_source_generation)),
+        _ => None,
+    }).expect("accepted transition trace");
+    assert_eq!(accepted.1, 37);
+    assert!(accepted.2 > 0, "from_prepared's nonzero entry must be reported");
+    assert_eq!((accepted.3, accepted.4, accepted.5, accepted.6), (0, 0, 1, 0));
+
+    let plan = single_frame_trace.iter().find_map(|event| match event {
+        NavigationTrace::PlanApplied { generation, render_frame, plan, .. }
+            if *generation == accepted.0 => Some((*render_frame, *plan)),
+        _ => None,
+    }).expect("applied plan trace");
+    let started = single_frame_trace.iter().find_map(|event| match event {
+        NavigationTrace::TransitionStarted { generation, render_frame, .. }
+            if *generation == accepted.0 => Some(*render_frame),
+        _ => None,
+    }).expect("transition start trace");
+    let completed = single_frame_trace.iter().find_map(|event| match event {
+        NavigationTrace::FadeCompleted { generation, render_frame, .. }
+            if *generation == accepted.0 => Some(*render_frame),
+        _ => None,
+    }).expect("fade completion trace");
+    assert_eq!(plan.0, started, "plan application and actual transition share a boundary");
+    assert!(completed > started);
+    assert!(plan.1.fade_out_end > 0);
+
+    let overflow_dir = temp_dir("navigation_trace_overflow");
+    let mut options = engine_opts(overflow_dir.join("cache"));
+    options.output_sample_rate = 1_000;
+    let mut overflowing = Engine::from_prepared(options, trace_prepared_tracks()).expect("engine");
+    let rx = overflowing.enable_navigation_trace(0);
+    overflowing.request_nav(NavAction::JumpToNextIntro);
+    assert!(rx.try_iter().next().is_none());
+    assert_eq!(overflowing.navigation_trace_dropped(), 2, "accepted and jump records must expose overflow");
+    drop(overflowing);
+    let _ = std::fs::remove_dir_all(overflow_dir);
+
+    let replaced_dir = temp_dir("navigation_trace_replaced");
+    let mut replaced = Engine::from_prepared(engine_opts(replaced_dir.join("cache")), trace_prepared_tracks()).expect("engine");
+    let rx = replaced.enable_navigation_trace(16);
+    replaced.request_nav(NavAction::TransitionToNext);
+    replaced.request_nav(NavAction::JumpToNextIntro);
+    let records: Vec<_> = rx.try_iter().collect();
+    let first = records.iter().find_map(|event| match event {
+        NavigationTrace::Accepted { generation, action: NavAction::TransitionToNext, .. } => Some(*generation),
+        _ => None,
+    }).expect("first action was accepted before replacement");
+    assert!(records.iter().all(|event| !matches!(event,
+        NavigationTrace::PlanApplied { generation, .. }
+        | NavigationTrace::TransitionStarted { generation, .. }
+        | NavigationTrace::FadeCompleted { generation, .. } if *generation == first)),
+        "replaced request must not look like a successful transition");
+    assert!(records.iter().any(|event| matches!(event,
+        NavigationTrace::JumpApplied { action: NavAction::JumpToNextIntro, .. })),
+        "replacement jump must be explicit");
+    drop(replaced);
+    let _ = std::fs::remove_dir_all(replaced_dir);
 }
 
 #[test]
