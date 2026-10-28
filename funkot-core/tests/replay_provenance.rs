@@ -36,6 +36,16 @@ fn build_revision_requires_a_clean_identified_checkout() {
         String::from_utf8(output.stdout).unwrap()
     };
     assert!(run(false).contains(&format!("cargo:rustc-env=FUNKOT_REPLAY_BUILD_REVISION={revision}\n")));
+    #[cfg(unix)]
+    {
+        let replacement = repo.join("replacement");
+        std::fs::write(&replacement, b"original").unwrap();
+        std::fs::rename(replacement, repo.join("tracked")).unwrap();
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        assert!(run(false).contains(&format!("cargo:rustc-env=FUNKOT_REPLAY_BUILD_REVISION={revision}\n")));
+        assert_eq!(std::fs::read(index).unwrap(), before, "provenance lookup must not refresh the Git index");
+    }
     let other = temp.path().join("other");
     std::fs::create_dir(&other).unwrap();
     git(&other, &["init", "-q"]);
