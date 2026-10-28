@@ -36,6 +36,15 @@ fn build_revision_requires_a_clean_identified_checkout() {
         String::from_utf8(output.stdout).unwrap()
     };
     assert!(run(false).contains(&format!("cargo:rustc-env=FUNKOT_REPLAY_BUILD_REVISION={revision}\n")));
+    let other = temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    git(&other, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "other"]);
+    let spoofed = Command::new(&build).env("CARGO_MANIFEST_DIR", repo.join("funkot-core"))
+        .env("GIT_DIR", other.join(".git")).env("GIT_WORK_TREE", &repo)
+        .output().unwrap();
+    assert!(spoofed.status.success());
+    assert!(String::from_utf8(spoofed.stdout).unwrap().contains(&format!("cargo:rustc-env=FUNKOT_REPLAY_BUILD_REVISION={revision}\n")));
     std::fs::write(repo.join("tracked"), b"changed").unwrap();
     assert!(run(false).contains("cargo:rustc-env=FUNKOT_REPLAY_BUILD_REVISION=\n"));
     std::fs::write(repo.join("tracked"), b"original").unwrap();

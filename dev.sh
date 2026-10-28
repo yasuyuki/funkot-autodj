@@ -100,22 +100,6 @@ set -- -v "$PWD":/work \
     -e RUST_TEST_THREADS="$RUST_TEST_THREADS" \
     -e CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" \
     -e CARGO_INCREMENTAL="$CARGO_INCREMENTAL" "$@"
-git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null || true)
-git_common=$(git rev-parse --git-common-dir 2>/dev/null || true)
-if [ -n "$git_dir" ] && [ -n "$git_common" ]; then
-    git_common=$(cd "$git_common" && pwd -P)
-    case "$git_dir" in
-        "$git_common") container_git_dir=/funkot-git ;;
-        "$git_common"/*) container_git_dir=/funkot-git/${git_dir#"$git_common"/} ;;
-        *) container_git_dir= ;;
-    esac
-    if [ -n "$container_git_dir" ]; then
-        set -- -v "$git_common":/funkot-git:ro \
-            -e GIT_DIR="$container_git_dir" -e GIT_WORK_TREE=/work \
-            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory \
-            -e GIT_CONFIG_VALUE_0=/work "$@"
-    fi
-fi
 if [ -n "${DEV_BIND_SRC:-}" ]; then
     set -- -v "$DEV_BIND_SRC:${DEV_BIND_DST:-$DEV_BIND_SRC}:ro" "$@"
 fi

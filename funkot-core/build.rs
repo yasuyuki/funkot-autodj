@@ -2,7 +2,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").arg("-C").arg(root).args(args).output().ok()?;
+    let mut command = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().to_ascii_uppercase().starts_with("GIT_") { command.env_remove(name); }
+    }
+    let output = command.arg("-c").arg(format!("safe.directory={}", root.display()))
+        .arg("-C").arg(root).args(args).output().ok()?;
     if !output.status.success() { return None; }
     Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
 }
