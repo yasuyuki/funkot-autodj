@@ -6,7 +6,7 @@
 #   ./dev.sh cargo build --workspace
 #   ./dev.sh cargo test --workspace
 #   ./dev.sh cargo run -p funkot-cli -- -l playlist.txt --render out.wav
-FROM rust:1.93-slim-trixie
+FROM rust:1.98-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # C++ toolchain for the signalsmith-stretch native code
