@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`12ba7283d2427e85ca8b70e905cc249b444afb1e`. This is an audit anchor, not a pin.
+`b60e4e0e68704c6567468f8475daffc40f731fe6`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
