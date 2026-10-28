@@ -6,6 +6,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     for (name, _) in std::env::vars_os() {
         if name.to_string_lossy().to_ascii_uppercase().starts_with("GIT_") { command.env_remove(name); }
     }
+    command.env("GIT_OPTIONAL_LOCKS", "0");
     let output = command.arg("-c").arg(format!("safe.directory={}", root.display()))
         .arg("-C").arg(root).args(args).output().ok()?;
     if !output.status.success() { return None; }
