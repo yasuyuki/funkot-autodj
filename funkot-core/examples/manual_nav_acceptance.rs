@@ -27,6 +27,8 @@ use funkot_core::{EngineOptions, PitchMode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+const BUILD_PROVENANCE: &str = concat!("FUNKOT_REPLAY_CORE_REVISION:", env!("FUNKOT_REPLAY_BUILD_REVISION"), ":END");
+
 #[derive(Clone, Copy)]
 enum Action { Next, Restart, Prev }
 
@@ -232,6 +234,7 @@ fn run() -> Result<(), String> {
     } else { "manual_plan_confirmed" };
     let measurement = json!({
         "schema": 1,
+        "runtime": {"core_revision": std::hint::black_box(BUILD_PROVENANCE).strip_prefix("FUNKOT_REPLAY_CORE_REVISION:").and_then(|s| s.strip_suffix(":END")).filter(|s| !s.is_empty())},
         "executable_sha256": sha256_file(&std::env::current_exe().map_err(|e| e.to_string())?)?,
         "core_source_sha256": format!("{:x}", Sha256::digest(include_bytes!("../src/engine.rs"))),
         "driver_source_sha256": format!("{:x}", Sha256::digest(include_bytes!("manual_nav_acceptance.rs"))),

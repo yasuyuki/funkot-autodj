@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     # libclang for bindgen (signalsmith-stretch FFI bindings)
     libclang-dev \
+    git \
     # ALSA headers + pkg-config for cpal on Linux
     pkg-config \
     # Optional managed WAV generation uses a fixed Python socket client.
