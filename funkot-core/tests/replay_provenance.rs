@@ -39,7 +39,10 @@ fn build_revision_requires_a_clean_identified_checkout() {
     let other = temp.path().join("other");
     std::fs::create_dir(&other).unwrap();
     git(&other, &["init", "-q"]);
-    git(&other, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "other"]);
+    std::fs::write(other.join("tracked"), b"original").unwrap();
+    git(&other, &["add", "tracked"]);
+    git(&other, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "other"]);
+    assert_ne!(git(&other, &["rev-parse", "HEAD"]), revision);
     let spoofed = Command::new(&build).env("CARGO_MANIFEST_DIR", repo.join("funkot-core"))
         .env("GIT_DIR", other.join(".git")).env("GIT_WORK_TREE", &repo)
         .output().unwrap();
