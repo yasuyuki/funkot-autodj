@@ -9,7 +9,7 @@
 # Android host. The GUI app links funkot-core as a Cargo dependency, so this
 # target exists as a regression guard (a new dep that breaks the NDK build should
 # fail here, not downstream) and to ship a C-ABI SDK bundle like the other targets.
-FROM rust:1.93-slim-trixie
+FROM rust:1.98-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Host C++ + libclang for bindgen (signalsmith-stretch)
