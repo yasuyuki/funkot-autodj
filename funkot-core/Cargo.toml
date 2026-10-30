@@ -8,6 +8,10 @@ description = "Funkot auto-DJ mixing engine: analysis, tempo-sync, DJ-style cros
 [lib]
 crate-type = ["rlib", "staticlib", "cdylib"]
 
+[[example]]
+name = "manual_nav_acceptance"
+test = true
+
 [dependencies]
 symphonia = { version = "0.6", default-features = false, features = [
     "mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "wav", "pcm", "alac", "id3v2",
