@@ -6803,6 +6803,7 @@ mod tests {
             let now = engine.active.as_ref().expect("active").playhead;
             let reply = controlled_manual_plan(&engine, NavAction::TransitionToNext, now, 7);
             let generation = engine.nav_gen;
+            engine.manual_deadline = Some(now + 1);
             if replace_active {
                 let active = engine.active.as_mut().expect("active");
                 active.track.samples = Arc::new(vec![0.0; active.track.samples.len()]);
@@ -6811,10 +6812,11 @@ mod tests {
                 target.samples = Arc::new(vec![0.0; target.samples.len()]);
             }
 
+            assert_eq!(engine.nav_gen, generation, "replacement did not cancel navigation");
             reply_tx.send(reply).expect("identity-mismatched reply");
             engine.poll_nav_tempo();
+            engine.tick_pending_nav();
 
-            assert_eq!(engine.nav_gen, generation, "replacement did not cancel navigation");
             assert_eq!(engine.current_index(), Some(0));
             assert!(engine.next_track_path().is_some());
             let trace: Vec<_> = trace_rx.try_iter().collect();
