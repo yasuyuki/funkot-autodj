@@ -18,7 +18,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::analysis::{local_grid_continuous, local_sync_span, refine_groove_phase};
 use crate::filter::StereoHighPass;
+use crate::first_live::{self, FailedPermit, PreviewWait};
 use crate::stretch::{self, position_scale};
 use crate::{cache, decode, EngineOptions, Error, Result, BEATS_PER_BAR, MAIN_GAP_BARS};
 
@@ -747,6 +748,21 @@ fn energy_xcorr_at_win(a: &[f64], b: &[f64], lag: i64, win: usize) -> f64 {
     corr / denom
 }
 
+#[derive(Clone)]
+enum FailedAttempt {
+    BeforeReady,
+    AfterPreview(Weak<Vec<f32>>),
+}
+
+impl FailedAttempt {
+    fn permit(&self) -> FailedPermit {
+        match self {
+            Self::BeforeReady => FailedPermit::Untransferred,
+            Self::AfterPreview(_) => FailedPermit::TransferredToPreview,
+        }
+    }
+}
+
 enum LoaderMsg {
     Ready(PreparedTrack, Option<FirstLiveProvenance>),
     /// Replace the playing (or queued) first-track preview with the full stretch.
@@ -755,6 +771,7 @@ enum LoaderMsg {
         index: usize,
         path: PathBuf,
         message: String,
+        attempt: FailedAttempt,
     },
     Exhausted,
 }
@@ -1379,6 +1396,7 @@ pub struct Engine {
     /// ends before Upgrade (CPU-speed pulls / offline). Realtime hosts set
     /// this false via [`Self::set_realtime`] so the audio callback never sleeps.
     block_on_preview_upgrade: bool,
+    failed_preview: Option<Weak<Vec<f32>>>,
     render_diagnostics: RenderDiagnostics,
     first_live_ready_frame: Option<u64>,
     first_live_evidence: Option<FirstLiveReplayEvidence>,
@@ -1495,6 +1513,7 @@ impl Engine {
             third_permit_armed: false,
             loader_exhausted: false,
             block_on_preview_upgrade: true,
+            failed_preview: None,
             render_diagnostics: RenderDiagnostics::default(),
             first_live_ready_frame: None,
             first_live_evidence: None,
@@ -1614,6 +1633,7 @@ impl Engine {
             third_permit_armed: false,
             loader_exhausted: rest_empty,
             block_on_preview_upgrade: true,
+            failed_preview: None,
             render_diagnostics: RenderDiagnostics::default(),
             first_live_ready_frame: None,
             first_live_evidence: None,
@@ -2032,7 +2052,7 @@ impl Engine {
         self.resume_fade = None;
         self.shutdown.store(true, Ordering::SeqCst);
         while let Ok(msg) = self.loader_rx.try_recv() {
-            if let LoaderMsg::Failed { index, path, message } = msg {
+            if let LoaderMsg::Failed { index, path, message, .. } = msg {
                 self.pending_events
                     .push(EngineEvent::TrackFailed { index, path, message });
             }
@@ -2853,11 +2873,18 @@ impl Engine {
                 Ok(LoaderMsg::Upgrade(track, provenance)) => {
                     self.apply_upgrade(track, provenance);
                 }
-                Ok(LoaderMsg::Failed { index, path, message }) => {
+                Ok(LoaderMsg::Failed { index, path, message, attempt }) => {
+                    let permit = attempt.permit();
+                    if let FailedAttempt::AfterPreview(preview) = attempt {
+                        if self.failed_preview.is_none() {
+                            self.failed_preview = Some(preview);
+                        }
+                    }
                     self.pending_events
                         .push(EngineEvent::TrackFailed { index, path, message });
-                    // Failed prep consumed a permit; allow another attempt.
-                    self.release_permit();
+                    if first_live::release_failed_permit(permit) {
+                        self.release_permit();
+                    }
                 }
                 Ok(LoaderMsg::Exhausted) => {
                     self.loader_exhausted = true;
@@ -2871,79 +2898,106 @@ impl Engine {
         }
     }
 
-    /// Swap preview samples/markers for the full first track without restarting.
+    fn target_failed(&self, samples: &Arc<Vec<f32>>) -> bool {
+        self.failed_preview
+            .as_ref()
+            .is_some_and(|failed| std::ptr::eq(failed.as_ptr(), Arc::as_ptr(samples)))
+    }
+
+    /// Swap a live preview for its full first-track buffer without restarting.
     fn apply_upgrade(&mut self, track: PreparedTrack, provenance: Option<FirstLiveProvenance>) {
-        if let Some(deck) = self.active.as_mut() {
-            if deck.track.path == track.path && deck.track.playlist_index == track.playlist_index {
-                // A second Upgrade is not normally emitted, but do not leave
-                // its already-retained preview to drop on this callback.
-                retire_upgrade_fade(deck.upgrade_fade.take());
-                let old_playhead = deck.playhead;
-                let preview_upgrade = deck.track.preview && !track.preview;
-                let preview_frames = deck.track.frames;
-                let playlist_index = deck.track.playlist_index;
-                let playhead = old_playhead.min(track.frames);
-                let old = std::mem::replace(&mut deck.track, track);
-                if preview_upgrade {
-                    self.render_diagnostics.preview_upgrades = self
-                        .render_diagnostics
-                        .preview_upgrades
-                        .saturating_add(1);
-                    self.render_diagnostics.last_preview_upgrade = Some(PreviewUpgrade {
-                        playlist_index,
-                        playhead: old_playhead,
-                        preview_frames,
-                        render_frame: self.render_frame,
-                        evidence: provenance.as_ref().map(|p| p.evidence),
-                    });
-                    if let Some(provenance) = provenance {
-                        self.first_live_evidence = Some(provenance.evidence);
-                        self.first_live_recipe = Some(provenance.recipe);
-                    }
-                    self.replay_upgrade_pending = false;
-                }
-                deck.playhead = playhead;
-                deck.upgrade_fade = Some(UpgradeFade { track: old, playhead: old_playhead,
-                    frames_into: 0, frames: declick_frames(self.options.output_sample_rate) });
-                // Markers / buffer changed — any in-flight align is stale.
-                self.clear_phase_align();
-                self.cancel_pending_nav();
-                self.kick_phase_align_if_needed();
-                return;
+        let active_allowed = self.active.as_ref().is_some_and(|deck| {
+            first_live::upgrade_allowed(
+                deck.track.path == track.path && deck.track.playlist_index == track.playlist_index,
+                deck.track.preview,
+                deck.track.head_only,
+                self.target_failed(&deck.track.samples),
+                track.preview,
+            )
+        });
+        if active_allowed {
+            let deck = self.active.as_mut().expect("allowed active deck");
+            let old_playhead = deck.playhead;
+            let preview_frames = deck.track.frames;
+            let playlist_index = deck.track.playlist_index;
+            let playhead = old_playhead.min(track.frames);
+            let old = std::mem::replace(&mut deck.track, track);
+            self.render_diagnostics.preview_upgrades = self
+                .render_diagnostics
+                .preview_upgrades
+                .saturating_add(1);
+            self.render_diagnostics.last_preview_upgrade = Some(PreviewUpgrade {
+                playlist_index,
+                playhead: old_playhead,
+                preview_frames,
+                render_frame: self.render_frame,
+                evidence: provenance.as_ref().map(|p| p.evidence),
+            });
+            if let Some(provenance) = provenance {
+                self.first_live_evidence = Some(provenance.evidence);
+                self.first_live_recipe = Some(provenance.recipe);
             }
+            self.replay_upgrade_pending = false;
+            deck.playhead = playhead;
+            deck.upgrade_fade = Some(UpgradeFade {
+                track: old,
+                playhead: old_playhead,
+                frames_into: 0,
+                frames: declick_frames(self.options.output_sample_rate),
+            });
+            self.clear_phase_align();
+            self.cancel_pending_nav();
+            self.kick_phase_align_if_needed();
+            return;
         }
-        if let Some(next) = self.next_track.as_mut() {
-            if next.path == track.path && next.playlist_index == track.playlist_index {
-                let queued_preview_upgrade = next.preview && !track.preview;
-                let old = std::mem::replace(next, track);
-                if queued_preview_upgrade {
-                    if let Some(provenance) = provenance {
-                        self.pending_first_live_provenance = Some(provenance);
-                        self.queued_first_live_upgrade_frame = Some(self.render_frame);
-                    }
-                    self.replay_upgrade_pending = false;
-                }
-                retire_prepared(old);
-                self.clear_phase_align();
-                self.cancel_pending_nav();
-                self.kick_phase_align_if_needed();
-                return;
+
+        let next_allowed = self.next_track.as_ref().is_some_and(|next| {
+            first_live::upgrade_allowed(
+                next.path == track.path && next.playlist_index == track.playlist_index,
+                next.preview,
+                next.head_only,
+                self.target_failed(&next.samples),
+                track.preview,
+            )
+        });
+        if next_allowed {
+            let next = self.next_track.as_mut().expect("allowed queued track");
+            let old = std::mem::replace(next, track);
+            if let Some(provenance) = provenance {
+                self.pending_first_live_provenance = Some(provenance);
+                self.queued_first_live_upgrade_frame = Some(self.render_frame);
             }
+            self.replay_upgrade_pending = false;
+            retire_prepared(old);
+            self.clear_phase_align();
+            self.cancel_pending_nav();
+            self.kick_phase_align_if_needed();
+            return;
         }
-        // Else: already left this track; drop upgrade (no permit — same slot).
+
         retire_prepared(track);
     }
 
-    fn apply_queued_first_live_upgrade(&mut self, track: PreparedTrack, provenance: FirstLiveProvenance) {
-        let Some(initial) = self.replay_initial_track.as_mut() else {
+    fn apply_queued_first_live_upgrade(
+        &mut self,
+        track: PreparedTrack,
+        provenance: FirstLiveProvenance,
+    ) {
+        let Some(initial) = self.replay_initial_track.as_ref() else {
             self.apply_upgrade(track, Some(provenance));
             return;
         };
-        if initial.path != track.path || initial.playlist_index != track.playlist_index
-            || !initial.preview || track.preview {
+        if !first_live::upgrade_allowed(
+            initial.path == track.path && initial.playlist_index == track.playlist_index,
+            initial.preview,
+            initial.head_only,
+            self.target_failed(&initial.samples),
+            track.preview,
+        ) {
             retire_prepared(track);
             return;
         }
+        let initial = self.replay_initial_track.as_mut().expect("replay initial");
         let old = std::mem::replace(initial, track);
         retire_prepared(old);
         self.pending_first_live_provenance = Some(provenance);
@@ -2999,47 +3053,58 @@ impl Engine {
         }
     }
 
+    fn end_failed_preview(&mut self) {
+        self.retire_active();
+        self.drop_prev();
+        if let Some(next) = self.take_next() {
+            self.start_first(next);
+        } else if self.loader_exhausted {
+            self.mark_finished();
+        }
+    }
+
     /// Wait (or not) until Upgrade replaces an exhausted head preview.
     ///
-    /// Realtime hosts (`set_realtime(true)`) must not sleep here — under CPU
-    /// load the full stretch can exceed the ~20s head and a sleep in the audio
-    /// callback causes underruns. They get silence until Upgrade arrives.
-    /// CPU-speed pullers (tests, offline render) keep the spin-wait so they do
-    /// not insert a gap into the rendered timeline.
+    /// Realtime hosts never sleep here. CPU-speed pullers wait only while a
+    /// live preview still has a possible full upgrade.
     fn await_preview_upgrade(&mut self) {
-        if !self.preview_exhausted_awaiting_upgrade() {
-            return;
-        }
-        if !self.block_on_preview_upgrade || self.replay_upgrade_pending {
-            // Realtime: never sleep. If the loader already gave up, end the deck
-            // the same way the blocking path does; otherwise silence until Upgrade.
-            if self.loader_exhausted && !self.replay_upgrade_pending {
-                self.retire_active();
-                self.drop_prev();
-                if self.ready_ahead() == 0 {
-                    self.mark_finished();
-                }
-            }
-            return;
-        }
         loop {
-            if self.stopped || self.finished {
-                return;
-            }
-            self.drain_loader();
-            if !self.preview_exhausted_awaiting_upgrade() {
-                return;
-            }
-            // Full stretch failed or loader quit without Upgrade: end the deck.
-            if self.loader_exhausted {
-                self.retire_active();
-                self.drop_prev();
-                if self.ready_ahead() == 0 {
-                    self.mark_finished();
+            let awaiting = self.preview_exhausted_awaiting_upgrade();
+            let failed = self.active.as_ref().is_some_and(|deck| self.target_failed(&deck.track.samples));
+            match first_live::preview_wait(
+                awaiting,
+                self.stopped,
+                self.finished,
+                failed,
+                self.loader_exhausted,
+                self.replay_upgrade_pending,
+                self.block_on_preview_upgrade,
+            ) {
+                PreviewWait::Idle | PreviewWait::Yield => return,
+                PreviewWait::EndDeck => {
+                    self.end_failed_preview();
+                    return;
                 }
-                return;
+                PreviewWait::Poll => {
+                    self.drain_loader();
+                    let awaiting = self.preview_exhausted_awaiting_upgrade();
+                    let failed = self.active.as_ref().is_some_and(|deck| self.target_failed(&deck.track.samples));
+                    if matches!(
+                        first_live::preview_wait(
+                            awaiting,
+                            self.stopped,
+                            self.finished,
+                            failed,
+                            self.loader_exhausted,
+                            self.replay_upgrade_pending,
+                            self.block_on_preview_upgrade,
+                        ),
+                        PreviewWait::Poll
+                    ) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
             }
-            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -3633,6 +3698,7 @@ fn loader_main_mode(
                         index: idx,
                         path: path.clone(),
                         message: e.to_string(),
+                        attempt: FailedAttempt::BeforeReady,
                     };
                     if !send_msg(&tx, msg, &shutdown) {
                         return;
@@ -3746,6 +3812,7 @@ fn prepare_first_live(
                     index,
                     path: path.to_path_buf(),
                     message: e.to_string(),
+                    attempt: FailedAttempt::BeforeReady,
                 },
                 shutdown,
             );
@@ -3765,6 +3832,7 @@ fn prepare_first_live(
                         index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
+                        attempt: FailedAttempt::BeforeReady,
                     },
                     shutdown,
                 );
@@ -3779,6 +3847,7 @@ fn prepare_first_live(
         .max(1);
     let has_preview = head_frames < buffer.frames;
     let mut preview_prepared_sha256 = None;
+    let mut post_preview_failure = None;
     if has_preview {
         let head = decode::AudioBuffer {
             sample_rate: buffer.sample_rate,
@@ -3788,9 +3857,11 @@ fn prepare_first_live(
         match finish_prepare(options, path, index, head, &initial_analysis, true, false) {
             Ok(preview) => {
                 preview_prepared_sha256 = Some(hash_track(&preview));
+                let failed_attempt = FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples));
                 if !send_msg(tx, LoaderMsg::Ready(preview, None), shutdown) {
                     return false;
                 }
+                post_preview_failure = Some(failed_attempt);
             }
             Err(e) => {
                 return send_msg(
@@ -3799,6 +3870,7 @@ fn prepare_first_live(
                         index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
+                        attempt: FailedAttempt::BeforeReady,
                     },
                     shutdown,
                 );
@@ -3820,6 +3892,7 @@ fn prepare_first_live(
                         index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
+                        attempt: post_preview_failure.clone().unwrap_or(FailedAttempt::BeforeReady),
                     },
                     shutdown,
                 );
@@ -3842,6 +3915,7 @@ fn prepare_first_live(
                     index,
                     path: path.to_path_buf(),
                     message: e.to_string(),
+                    attempt: post_preview_failure.clone().unwrap_or(FailedAttempt::BeforeReady),
                 },
                 shutdown,
             );
@@ -4797,7 +4871,7 @@ mod tests {
 
     #[test]
     fn future_commit_retires_prepared_preparing_and_old_messages_and_permits() {
-        for late in [LoaderMsg::Ready(future_track(3), None), LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "old failure".into() }, LoaderMsg::Exhausted] {
+        for late in [LoaderMsg::Ready(future_track(3), None), LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "old failure".into(), attempt: FailedAttempt::BeforeReady }, LoaderMsg::Exhausted] {
             let mut engine = future_engine(&[1, 2]);
             let (old_tx, old_rx) = mpsc::sync_channel(1);
             engine.loader_rx = old_rx;
@@ -4861,7 +4935,7 @@ mod tests {
         assert_eq!(engine.current_index(), Some(1));
         let (tx, rx) = mpsc::sync_channel(1);
         engine.loader_rx = rx;
-        tx.try_send(LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "bad".into() }).unwrap();
+        tx.try_send(LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "bad".into(), attempt: FailedAttempt::BeforeReady }).unwrap();
         engine.drain_loader();
         let token = engine.begin_future_update().unwrap();
         drop(engine.commit_future_update(token, future_replacement(vec![future_track(4)])));
@@ -5080,7 +5154,9 @@ mod tests {
             index: preview.playlist_index,
             path: preview.path.clone(),
             message: "final stretch failed".into(),
-        }).unwrap();
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
         assert_eq!(engine.render(&mut [0.0; 2]), 1);
 
         assert!(permit_receiver.try_recv().is_err(),
@@ -5117,7 +5193,9 @@ mod tests {
             index: preview.playlist_index,
             path: preview.path.clone(),
             message: "final stretch failed".into(),
-        }).unwrap();
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
 
         let mut middle = [0.0; 2];
         assert_eq!(engine.render(&mut middle), 1);
@@ -5168,7 +5246,9 @@ mod tests {
             index: preview.playlist_index,
             path: preview.path.clone(),
             message: "final stretch failed".into(),
-        }).unwrap();
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
         engine.poll_events();
 
         assert_eq!(permit_receiver.try_recv(), Ok(()));
@@ -5270,7 +5350,9 @@ mod tests {
             index: preview.playlist_index,
             path: preview.path.clone(),
             message: "final stretch failed".into(),
-        }).unwrap();
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
         engine.drain_loader();
         messages.send(LoaderMsg::Upgrade(late_full, None)).unwrap();
         engine.drain_loader();
@@ -5279,6 +5361,116 @@ mod tests {
         assert!(Arc::ptr_eq(&active.track.samples, &preview.samples),
             "a final failure makes its preview terminal for later Upgrade messages");
         assert!(active.upgrade_fade.is_none());
+    }
+
+    #[test]
+    fn queued_terminal_preview_retires_when_started_at_eof() {
+        let mut preview = upgrade_test_track("queued-terminal.wav", 2, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
+        engine.set_realtime(true);
+        let (messages, receiver) = mpsc::sync_channel(2);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+
+        messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
+        engine.drain_loader();
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        engine.drain_loader();
+
+        let queued = engine.take_next().expect("queued preview");
+        engine.start_first(queued);
+        let mut audible = [0.0; 4];
+        assert_eq!(engine.render(&mut audible), 2);
+        assert_eq!(audible, [0.25; 4]);
+        let mut after_eof = [1.0; 2];
+        assert_eq!(engine.render(&mut after_eof), 0);
+        assert_eq!(after_eof, [0.0; 2]);
+        assert!(engine.active.is_none());
+        assert!(Arc::ptr_eq(
+            &engine.last_track.as_ref().expect("terminal history").samples,
+            &preview.samples,
+        ));
+    }
+
+    #[test]
+    fn terminal_preview_survives_source_commit_and_previous_jump() {
+        let mut preview = upgrade_test_track("committed-terminal.wav", 2, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut late_full = upgrade_test_track("committed-terminal.wav", 16, 0.5, 1.0, false);
+        late_full.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
+        engine.set_realtime(true);
+        let (messages, receiver) = mpsc::sync_channel(2);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+
+        messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
+        engine.drain_loader();
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        engine.drain_loader();
+        let queued = engine.take_next().expect("queued preview");
+        engine.start_first(queued);
+        assert_eq!(engine.render(&mut [0.0; 4]), 2);
+        assert_eq!(engine.render(&mut [0.0; 2]), 0);
+        assert!(engine.active.is_none());
+
+        let token = engine.begin_future_update().expect("terminal preview no longer blocks source commit");
+        drop(engine.commit_future_update(token, future_replacement(vec![future_track(9)])));
+        wait_future(&mut engine);
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        assert_eq!(engine.current_index(), Some(9));
+
+        engine.request_nav(NavAction::JumpToPrevIntro);
+        assert_eq!(engine.current_index(), Some(preview.playlist_index));
+        engine.apply_upgrade(late_full, None);
+        let active = engine.active.as_ref().expect("previous preview restarted");
+        assert!(Arc::ptr_eq(&active.track.samples, &preview.samples));
+        assert!(active.upgrade_fade.is_none());
+    }
+
+    #[test]
+    fn ordinary_same_occurrence_failure_releases_its_own_permit_after_preview_terminal() {
+        let mut preview = upgrade_test_track("reused-occurrence.wav", 8, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+        let (messages, receiver) = mpsc::sync_channel(2);
+        engine.loader_rx = receiver;
+        let (permits, permit_receiver) = mpsc::sync_channel(1);
+        engine.permit_tx = permits;
+
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        engine.drain_loader();
+        assert!(permit_receiver.try_recv().is_err());
+
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "later ordinary prepare failed".into(),
+            attempt: FailedAttempt::BeforeReady,
+        })
+            .unwrap();
+        engine.drain_loader();
+        assert_eq!(permit_receiver.try_recv(), Ok(()));
+        assert!(permit_receiver.try_recv().is_err());
     }
 
     #[test]
@@ -5517,6 +5709,44 @@ mod tests {
             Ok(_) => panic!("unknown producer became comparable"), Err(error) => error,
         };
         assert!(error.to_string().contains("producer build revision"));
+    }
+
+    #[test]
+    fn prepare_first_live_reports_preview_permit_transfer_only_after_ready() {
+        for (name, bars, transferred) in [("before-ready", 1, false), ("after-preview", 8, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{name}.wav"));
+            let buffer = crate::testutil::synth_track(180.0, bars, bars, bars, 8_000);
+            crate::testutil::write_wav(&path, &buffer).unwrap();
+            let cache_file = directory.path().join("cache-is-a-file");
+            std::fs::write(&cache_file, b"not a directory").unwrap();
+            let options = EngineOptions {
+                output_sample_rate: 8_000,
+                rate: 1.0,
+                cache_dir: cache_file,
+                loop_playlist: false,
+                ..EngineOptions::default()
+            };
+            let (sender, receiver) = mpsc::sync_channel(2);
+            assert!(prepare_first_live(&options, &path, 0, &sender, &AtomicBool::new(false)));
+
+            let messages: Vec<_> = receiver.try_iter().collect();
+            match (transferred, messages.as_slice()) {
+                (false, [LoaderMsg::Failed { attempt: FailedAttempt::BeforeReady, .. }]) => {}
+                (true, [
+                    LoaderMsg::Ready(preview, None),
+                    LoaderMsg::Failed {
+                        attempt: FailedAttempt::AfterPreview(failed_preview),
+                        ..
+                    },
+                ]) => {
+                    assert!(preview.preview);
+                    let failed_preview = failed_preview.upgrade().expect("sent preview remains alive");
+                    assert!(Arc::ptr_eq(&failed_preview, &preview.samples));
+                }
+                (_, other) => panic!("unexpected first-live producer messages for {name}: {}", other.len()),
+            }
+        }
     }
 
     #[test]
