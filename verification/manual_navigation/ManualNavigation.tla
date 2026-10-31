@@ -6,7 +6,7 @@ vars == <<e, w, m, sent, used>>
 Ops == 1..2
 Actions == {"Next", "Prev", "Restart"}
 Deck(occ, pcm, preview) == [occ |-> occ, pcm |-> pcm, preview |-> preview]
-NoDeck == Deck(3,0,FALSE)
+NoDeck == Deck(4,0,FALSE)
 NoOverlap == [live |-> FALSE, outgoing |-> NoDeck]
 NoSnapshot == [active |-> NoDeck, target |-> NoDeck, action |-> "None", epoch |-> 0]
 NoPlan == [gen |-> 0, epoch |-> 0, action |-> "None", active |-> NoDeck,
@@ -26,7 +26,6 @@ MakePlan(start, admit) == [gen |-> e.op, epoch |-> e.epoch, action |-> e.action,
                           start |-> start, admit |-> admit]
 Live(replies, op) == IF CheckGeneration THEN {msg \in replies : msg.plan.gen = op} ELSE replies
 Rekey(op) == [w EXCEPT !.replies = Live(@,op),
-                      !.stale = @ + Cardinality(w.replies \ Live(w.replies,op)),
                       !.attempts = IF op = 0 \/ op # e.op THEN 0 ELSE @]
 Cancelled == [e EXCEPT !.op = 0, !.action = "None", !.deadline = 0,
                        !.demand = FALSE, !.pending = NoPlan]
@@ -35,14 +34,14 @@ Settle(nextEngine, nextMonitor) ==
     /\ m' = [nextMonitor EXCEPT !.accepted = IF nextEngine.op = 0 THEN NoSnapshot ELSE @]
     /\ UNCHANGED <<sent, used>>
 Init == /\ e \in {[op |-> 0, action |-> "None", deadline |-> 0, now |-> 0,
-                   active |-> Deck(2,0,ap), next |-> Deck(1,0,np), history |-> Deck(0,0,FALSE),
+                   active |-> Deck(2,0,ap), next |-> Deck(3,0,np), history |-> Deck(0,0,FALSE),
                    hasNext |-> TRUE, hasHistory |-> TRUE, epoch |-> 0,
                    overlap |-> overlap, fence |-> FALSE, stopped |-> FALSE,
                    demand |-> FALSE, pending |-> NoPlan, deferred |-> <<>>, readyEpochs |-> {}] :
                    ap \in BOOLEAN, np \in BOOLEAN,
                    overlap \in {NoOverlap, [live |-> TRUE, outgoing |-> Deck(1,0,FALSE)],
                                           [live |-> TRUE, outgoing |-> Deck(2,0,FALSE)]}}
-        /\ w = [replies |-> {}, stale |-> 0, connected |-> TRUE, attempts |-> 0]
+        /\ w = [replies |-> {}, connected |-> TRUE, attempts |-> 0]
         /\ m = [accepted |-> NoSnapshot, adopted |-> [g \in Ops |-> 0], starts |-> 0,
                  generationSafe |-> TRUE, identitySafe |-> TRUE, epochSafe |-> TRUE,
                  frameSafe |-> TRUE, targetSafe |-> TRUE, fenceSafe |-> TRUE,
@@ -80,8 +79,6 @@ PollReply == /\ w.replies # {}
                   /\ e' = IF Current(message.plan) THEN [e EXCEPT !.pending = message.plan] ELSE e
                   /\ w' = [w EXCEPT !.replies = @ \ {message}]
              /\ UNCHANGED <<m,sent,used>>
-PollStale == /\ w.stale > 0 /\ w' = [w EXCEPT !.stale = @-1]
-             /\ UNCHANGED <<e,m,sent,used>>
 Apply(p, reply) ==
     LET nextEngine == [Cancelled EXCEPT
           !.active = IF p.admit THEN p.target ELSE @,
@@ -138,18 +135,25 @@ FutureAbort == /\ e.fence /\ e' = [e EXCEPT !.fence = FALSE] /\ UNCHANGED <<w,m,
 FutureCommit == /\ e.fence /\ e.epoch = 0
                 /\ Settle([Cancelled EXCEPT !.epoch = 1, !.fence = FALSE, !.deferred = <<>>,
                                            !.next = NoDeck, !.hasNext = FALSE],m)
+LiveOccurrences == {e.active.occ}
+    \cup (IF e.hasHistory THEN {e.history.occ} ELSE {})
+    \cup (IF e.overlap.live THEN {e.overlap.outgoing.occ} ELSE {})
+FreshOccurrence == CHOOSE occurrence \in (0..3) \ LiveOccurrences : TRUE
+ReadyDecks == {Deck(FreshOccurrence,0,FALSE), Deck(e.active.occ,1-e.active.pcm,FALSE)}
 ReadyNext == /\ ~e.hasNext /\ e.epoch \notin e.readyEpochs /\ ~e.fence /\ ~e.stopped
-             /\ e' = [e EXCEPT !.next = Deck(1,0,FALSE), !.hasNext = TRUE,
-                               !.readyEpochs = @ \cup {e.epoch}]
+             /\ \E ready \in ReadyDecks:
+                  e' = [e EXCEPT !.next = ready, !.hasNext = TRUE,
+                                !.readyEpochs = @ \cup {e.epoch}]
              /\ UNCHANGED <<w,m,sent,used>>
 Stop == /\ ~Stable /\ ~e.stopped
         /\ Settle([Cancelled EXCEPT !.stopped = TRUE, !.deferred = <<>>],m)
-Next == SendNav \/ DrainNav \/ Dispatch \/ WorkerFailure \/ PollReply \/ PollStale
+Next == SendNav \/ DrainNav \/ Dispatch \/ WorkerFailure \/ PollReply
         \/ Tick \/ Advance \/ Cancel \/ UpgradeActive \/ UpgradeNext \/ HistoryRollover
         \/ FutureBegin \/ FutureAbort \/ FutureCommit \/ ReadyNext \/ Stop \/ UNCHANGED vars
-Spec == Init /\ [][Next]_vars /\ WF_vars(Advance) /\ WF_vars(Tick)
+SafetySpec == Init /\ [][Next]_vars
+Spec == SafetySpec /\ WF_vars(Advance) /\ WF_vars(Tick)
 TypeOK == /\ e.op \in 0..2 /\ e.epoch \in 0..1 /\ e.now \in 0..2
-          /\ sent \in 0..2 /\ used \in 0..2 /\ w.stale \in 0..8 /\ w.attempts \in 0..2
+          /\ sent \in 0..2 /\ used \in 0..2 /\ w.attempts \in 0..2
 GenerationOrder == /\ used <= sent /\ e.op \in {0,used}
                    /\ \A msg \in w.replies: msg.plan.gen \in 1..used
 GenerationSafe == m.generationSafe

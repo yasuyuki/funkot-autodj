@@ -150,7 +150,8 @@ def main():
                 anchor = constant + " = TRUE"
                 if cfg.count(anchor) != 1:
                     raise RuntimeError(label + ": sensitivity edit no longer matches")
-                mutated = cfg.replace(anchor, constant + " = FALSE")
+                mutation_cfg = stable_cfg if label == "deadline" else cfg
+                mutated = mutation_cfg.replace(anchor, constant + " = FALSE")
                 summary["sensitivity"][label] = run_tlc(tree, out, args.java, jar, label, mutated,
                                                        started, violation)
             summary["status"] = "PASS"

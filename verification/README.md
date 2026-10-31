@@ -108,10 +108,13 @@ revision and hashes, state counts, elapsed time and peak child RSS.
 
 ### Bounds and assumptions
 
-The model has two accepted-operation identifiers, two source epochs, three
-occurrence identities and two PCM identities per occurrence. Three occurrences
-are necessary for the actual A-to-B-to-C history counterexample in #44; a
-two-occurrence model cannot distinguish that accepted target from both decks.
+The model has two accepted-operation identifiers, two source epochs, four
+occurrence identities and two PCM identities per occurrence. Four identities distinguish history A, outgoing B, active C and an independent
+ready-next D. Three suffice for the actual history counterexample in #44,
+but aliasing D to B loses the Next-to-Next distinct-target case. Ready outcomes
+cover a fresh occurrence and a repeated current occurrence with different PCM.
+Fresh labels are canonical representatives outside the live occurrence set;
+other aliases with older history entries are outside this bounded model.
 It includes two successive commands, at most two preparation attempts per
 accepted operation, and zero, one or two copies of each reply. This covers one
 replan and delayed, reordered, lost or duplicate replies. The current worker
@@ -127,18 +130,21 @@ Preparation is abstracted as an eventual mailbox outcome at dispatch. Arbitrary
 poll delay represents a slow worker; zero copies represent loss. Worker failure
 prevents further dispatch. The model permits dispatch earlier than a busy real
 worker, so it covers additional event orders. It does not equate worker execution
-with the Engine's `manual_in_flight` flag. Stale replies retain their count and
-are individually discarded. Their payload is removed only when the enabled
-generation guard makes it permanently unobservable. The generation mutation
-keeps the full stale payload. No TLC VIEW quotient removes mailbox exits.
+with the Engine's `manual_in_flight` flag. A stale reply poll is an Engine-observable stutter. Its only scheduling effect,
+clearing `manual_in_flight`, is already covered by earlier abstract dispatch.
+After generation invalidation, the model removes these unobservable old replies.
+No dispatch capacity, deadline, invariant or fair Advance/Tick action depends on
+their count. The shared Rust predicate proof and stale-reply Engine regressions
+justify this boundary. The generation mutation keeps the full stale payload.
+No TLC VIEW quotient removes mailbox exits.
 
 Engine changes are serialized. Reply checks and adoption form one indivisible
 step. Accept/dispatch and poll/dispatch are split conservatively, admitting
 additional mailbox scheduling orders rather than parallel Engine mutations.
 A counterexample from that overapproximation requires replay against Rust.
 
-The ordinary config checks that accepted intent eventually resolves, including
-cancellation or rejection. The stable config additionally requires adoption
+The ordinary config checks safety across the complete bounded event graph.
+Progress is checked separately in the stable config, which requires adoption
 under fair frame advance and ticking, successful admission, stable identities,
 and no superseding command, stop, cancellation, upgrade or source replacement.
 Neither result proves progress for an unbounded or permanently stopped system.
@@ -148,9 +154,9 @@ Neither result proves progress for an unbounded or permanently stopped system.
 | Model action | Product operation and observable boundary |
 |---|---|
 | `SendNav`, `DrainNav` | `drain_nav_commands` and `begin_nav` coalesce normal commands, defer them during a future fence, and preserve duplicate Next's target/deadline. |
-| `Dispatch`, `PollReply`, `PollStale`, `WorkerFailure` | `kick_manual_plan_if_idle`, the worker channel and `poll_nav_tempo` choose a current reply or discard it. Zero/two copies abstract loss/duplication. |
+| `Dispatch`, `PollReply`, `WorkerFailure` | `kick_manual_plan_if_idle`, the worker channel and `poll_nav_tempo` choose a current reply or discard it. Zero/two copies abstract loss/duplication. |
 | `Tick`, `DeadlineFallback` | `tick_decision` and `tick_pending_nav` give an exact reply precedence at its deadline, replan late work without extending the deadline, or make a current simple fallback. |
-| `Apply` | `commit_manual_plan` checks identity and `admit_frames` before taking next/history or emitting a start, then `begin_transition_to` installs decks atomically. |
+| `Apply` | `commit_manual_plan` checks identity and `admit_frames` before taking next/history or emitting a start, invalidates rejected work, then `begin_transition_to` installs admitted decks atomically. |
 | `Advance` | `render_one_frame` advances the active playhead. DSP and frame lengths are abstracted away. |
 | `Cancel`, `Stop` | `cancel_pending_nav` and `stop` invalidate outstanding work. |
 | `UpgradeActive`, `UpgradeNext`, `ReadyNext` | `drain_loader` and `apply_upgrade` adopt current loader messages. The future fence prevents those adoptions. |
