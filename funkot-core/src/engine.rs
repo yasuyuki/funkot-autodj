@@ -6552,6 +6552,102 @@ mod tests {
     }
 
     #[test]
+    fn history_rollover_cancels_an_accepted_previous_navigation() {
+        let mut options = EngineOptions::default();
+        options.output_sample_rate = 44_100;
+        options.loop_playlist = false;
+        let mut engine = Engine::from_prepared(options, vec![
+            phase_test_track(0, 8, 16),
+            phase_test_track(1, 8, 16),
+            phase_test_track(2, 8, 16),
+        ]).expect("prepared history engine");
+        engine.set_realtime(true);
+        engine.bar_frames = 2.0;
+        engine.active.as_mut().expect("active").playhead = 16;
+        engine.clear_phase_align();
+        let (work_tx, work_rx) = mpsc::sync_channel(2);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(2);
+        engine.manual_tx = work_tx;
+        engine.manual_rx = reply_rx;
+
+        engine.begin_nav(NavAction::TransitionToNext);
+        let _to_b = work_rx.try_recv().expect("A to B request");
+        let start = engine.active.as_ref().expect("A active").playhead;
+        reply_tx.send(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, start, 0,
+        )).expect("B reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), Some(1));
+        engine.render(&mut [0.0; 2]);
+        assert_eq!(engine.last_track.as_ref().map(|track| track.playlist_index), Some(0));
+
+        wait_future(&mut engine);
+        assert_eq!(engine.next_track.as_ref().map(|track| track.playlist_index), Some(2));
+
+        engine.begin_nav(NavAction::TransitionToNext);
+        let _to_c = work_rx.try_recv().expect("B to C request");
+        let start = engine.active.as_ref().expect("B active").playhead;
+        reply_tx.send(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, start, 0,
+        )).expect("C reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), Some(2));
+        assert_eq!(engine.prev.as_ref().map(|deck| deck.track.playlist_index), Some(1));
+
+        let trace_rx = engine.enable_navigation_trace(8);
+        engine.begin_nav(NavAction::TransitionToPrev);
+        let previous_request = work_rx.try_recv().expect("C to A request");
+        let accepted_generation = engine.nav_gen;
+        let deadline = engine.manual_deadline.expect("accepted rewind deadline");
+        assert_eq!(previous_request.key.target_index, 0);
+
+        engine.render(&mut [0.0; 2]);
+        assert_eq!(engine.last_track.as_ref().map(|track| track.playlist_index), Some(1));
+        reply_tx.send(build_manual_plan(previous_request)).expect("stale A reply");
+        engine.poll_nav_tempo();
+        assert!(engine.pending_nav.is_none(), "the A reply must not match replacement history");
+
+        let now = engine.active.as_ref().expect("C active").playhead;
+        for _ in 0..=deadline.saturating_sub(now) {
+            engine.render(&mut [0.0; 2]);
+            if engine.transition.is_some() {
+                break;
+            }
+        }
+
+        assert!(engine.transition.is_none(), "history replacement must cancel the accepted rewind");
+        assert_eq!(engine.current_index(), Some(2));
+        assert_eq!(engine.last_track.as_ref().map(|track| track.playlist_index), Some(1));
+        let trace: Vec<_> = trace_rx.try_iter().collect();
+        assert!(trace.iter().any(|event| matches!(event,
+            NavigationTrace::Accepted { generation, action: NavAction::TransitionToPrev, target_index: 0, .. }
+                if *generation == accepted_generation
+        )));
+        assert!(!trace.iter().any(|event| matches!(event,
+            NavigationTrace::PlanApplied { generation, .. } if *generation == accepted_generation
+        )));
+    }
+
+    #[test]
+    fn history_rollover_preserves_pending_next_and_restart() {
+        for action in [NavAction::TransitionToNext, NavAction::RestartCurrent] {
+            let mut engine = phase_test_engine(true, 8, 44_100);
+            engine.push_history(phase_test_track(2, 8, 16));
+            let (tx, _rx) = mpsc::sync_channel(1);
+            engine.manual_tx = tx;
+            engine.begin_nav(action);
+            let generation = engine.nav_gen;
+            let deadline = engine.manual_deadline;
+            engine.push_history(phase_test_track(3, 8, 16));
+            assert_eq!(engine.nav_gen, generation);
+            assert_eq!(engine.manual_action, Some(action));
+            assert_eq!(engine.manual_deadline, deadline);
+        }
+    }
+
+    #[test]
     fn target_replacement_revocation_and_stop_invalidate_accepted_plan() {
         let mut engine = phase_test_engine(true, 8, 44_100);
         let now = engine.active.as_ref().unwrap().playhead;
