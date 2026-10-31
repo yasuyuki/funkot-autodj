@@ -5149,6 +5149,139 @@ mod tests {
     }
 
     #[test]
+    fn revoked_queued_preview_then_final_failure_releases_only_one_permit() {
+        let mut preview = upgrade_test_track("revoked-preview.wav", 32, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+        let (permits, permit_receiver) = mpsc::sync_channel(2);
+        engine.permit_tx = permits;
+
+        messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
+        engine.poll_events();
+        assert_eq!(engine.ready_ahead(), 1);
+        assert_eq!(engine.revoke_next(), Some(preview.path.clone()));
+
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+        }).unwrap();
+        engine.poll_events();
+
+        assert_eq!(permit_receiver.try_recv(), Ok(()));
+        assert!(permit_receiver.try_recv().is_err(),
+            "revoke_next already returned the preview attempt permit");
+    }
+
+    #[test]
+    fn duplicate_full_upgrade_keeps_the_first_full_pcm_and_preview_fade() {
+        let mut preview = upgrade_test_track("duplicate-upgrade.wav", 32, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut first_full = upgrade_test_track("duplicate-upgrade.wav", 32, 0.5, 1.0, false);
+        first_full.playlist_index = 7;
+        let mut duplicate_full = upgrade_test_track("duplicate-upgrade.wav", 32, 0.75, 1.0, false);
+        duplicate_full.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        messages.send(LoaderMsg::Upgrade(first_full.clone(), None)).unwrap();
+        engine.drain_loader();
+
+        let first_samples = engine.active.as_ref().unwrap().track.samples.clone();
+        let first_fade_samples = engine.active.as_ref().unwrap().upgrade_fade
+            .as_ref().expect("first upgrade creates a fade").track.samples.clone();
+        assert!(Arc::ptr_eq(&first_samples, &first_full.samples));
+        assert!(Arc::ptr_eq(&first_fade_samples, &preview.samples));
+
+        messages.send(LoaderMsg::Upgrade(duplicate_full.clone(), None)).unwrap();
+        engine.drain_loader();
+        let active = engine.active.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&active.track.samples, &first_full.samples),
+            "a duplicate full upgrade must not replace the adopted PCM");
+        assert!(Arc::ptr_eq(
+            &active.upgrade_fade.as_ref().expect("first fade remains active").track.samples,
+            &preview.samples,
+        ), "a duplicate full upgrade must not replace the retained preview fade");
+    }
+
+    #[test]
+    fn upgrade_rejects_head_only_and_preview_payloads() {
+        for (head_only, incoming_preview) in [(true, false), (false, true)] {
+            let mut preview = upgrade_test_track("guarded-upgrade.wav", 32, 0.25, 1.0, true);
+            preview.playlist_index = 7;
+            preview.head_only = head_only;
+            let mut incoming = upgrade_test_track("guarded-upgrade.wav", 32, 0.5, 1.0, incoming_preview);
+            incoming.playlist_index = 7;
+            let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+            let (messages, receiver) = mpsc::sync_channel(1);
+            engine.loader_rx = receiver;
+            messages.send(LoaderMsg::Upgrade(incoming, None)).unwrap();
+            engine.drain_loader();
+
+            let active = engine.active.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&active.track.samples, &preview.samples));
+            assert!(active.upgrade_fade.is_none());
+        }
+    }
+
+    #[test]
+    fn upgrade_ignores_wrong_occurrence_identity() {
+        for incoming in [
+            {
+                let mut track = upgrade_test_track("same-path.wav", 32, 0.5, 1.0, false);
+                track.playlist_index = 8;
+                track
+            },
+            {
+                let mut track = upgrade_test_track("other-path.wav", 32, 0.5, 1.0, false);
+                track.playlist_index = 7;
+                track
+            },
+        ] {
+            let mut preview = upgrade_test_track("same-path.wav", 32, 0.25, 1.0, true);
+            preview.playlist_index = 7;
+            let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+            let (messages, receiver) = mpsc::sync_channel(1);
+            engine.loader_rx = receiver;
+            messages.send(LoaderMsg::Upgrade(incoming, None)).unwrap();
+            engine.drain_loader();
+
+            let active = engine.active.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&active.track.samples, &preview.samples));
+            assert!(active.upgrade_fade.is_none());
+        }
+    }
+
+    #[test]
+    fn late_upgrade_after_final_preview_failure_does_not_revive_the_terminal_occurrence() {
+        let mut preview = upgrade_test_track("failed-upgrade.wav", 32, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut late_full = upgrade_test_track("failed-upgrade.wav", 32, 0.5, 1.0, false);
+        late_full.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+        }).unwrap();
+        engine.drain_loader();
+        messages.send(LoaderMsg::Upgrade(late_full, None)).unwrap();
+        engine.drain_loader();
+
+        let active = engine.active.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&active.track.samples, &preview.samples),
+            "a final failure makes its preview terminal for later Upgrade messages");
+        assert!(active.upgrade_fade.is_none());
+    }
+
+    #[test]
     fn render_diagnostics_counts_realtime_preview_wait_frames_until_upgrade() {
         let preview = upgrade_test_track("preview.wav", 2, 0.25, 1.0, true);
         let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview]).unwrap();
