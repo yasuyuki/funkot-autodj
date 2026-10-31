@@ -89,3 +89,6 @@ fn trigger_all_u32() {
 
 #[path = "manual_navigation.rs"]
 mod manual_navigation_proofs;
+
+#[path = "first_live.rs"]
+mod first_live_proofs;

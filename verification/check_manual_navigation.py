@@ -1,4 +1,4 @@
-"""Check the bounded navigation model and retain its counterexamples."""
+"""Check a bounded Engine protocol model and retain its counterexamples."""
 import argparse
 import hashlib
 import json
@@ -46,16 +46,17 @@ def source_revision(root):
     return revision
 
 
-def run_tlc(tree, out, java, jar, label, cfg, started, violation=None):
+def run_tlc(tree, out, java, jar, label, cfg, started, violation=None, module="manual_navigation/ManualNavigation"):
     remaining = 15 * 60 - (time.monotonic() - started)
     if remaining <= 0:
         raise RuntimeError(label + ": total verification deadline exceeded")
-    directory = tree / "verification/manual_navigation"
+    model = Path(module)
+    directory = tree / "verification" / model.parent
     config = directory / (label + ".cfg")
     config.write_text(cfg)
     command = [java, "-XX:MaxRAM=8g", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC",
                "-workers", "auto" if violation is None else "1", "-seed", "0", "-fp", "0", "-config", config.name,
-               "-metadir", str(tree / ("states-" + label)), "ManualNavigation.tla"]
+               "-metadir", str(tree / ("states-" + label)), model.name + ".tla"]
     log_path = out / (label + ".log")
     with log_path.open("w") as log:
         process = subprocess.Popen(command, cwd=directory, stdout=log, stderr=subprocess.STDOUT,
@@ -89,6 +90,7 @@ def run_tlc(tree, out, java, jar, label, cfg, started, violation=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", choices=("navigation", "first-live"), default="navigation")
     parser.add_argument("--setup", action="store_true", help="download the fixed TLC jar and check its hash")
     parser.add_argument("--jar", type=Path, default=Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "funkot-verification/tla2tools-1.7.4.jar")
     parser.add_argument("--java", default="java", help="Java 21 executable")
@@ -113,7 +115,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         parser.error("evidence directory is not empty; prior evidence is unchanged and no proof ran")
-    summary = {"status": "FAIL"}
+    summary = {"status": "FAIL", "protocol": args.model}
     summary_path = out / "summary.json"
     summary_path.write_text(json.dumps(summary) + "\n")
     started = time.monotonic()
@@ -135,25 +137,76 @@ def main():
                 source.extractall(tree, filter="data")
             if archive.wait() != 0:
                 raise RuntimeError("cannot archive the resolved source commit")
-            summary["sources"] = {name: sha256(tree / name) for name in SOURCES}
-            cfg = (tree / "verification/manual_navigation/ManualNavigation.cfg").read_text()
-            summary["model"] = run_tlc(tree, out, args.java, jar, "baseline", cfg, started)
-            stable_cfg = (tree / "verification/manual_navigation/StableNavigation.cfg").read_text()
-            summary["stable_adoption"] = run_tlc(tree, out, args.java, jar, "stable", stable_cfg, started)
-            summary["sensitivity"] = {}
-            for label, constant, violation in (
-                ("generation", "CheckGeneration", "Invariant GenerationSafe is violated"),
-                ("start_frame", "CheckTiming", "Invariant ExactFrameSafe is violated"),
-                ("deadline", "CheckDeadline", "Temporal properties were violated"),
-                ("history_rollover", "CancelHistory", "Invariant AcceptedTargetSafe is violated"),
-            ):
-                anchor = constant + " = TRUE"
-                if cfg.count(anchor) != 1:
-                    raise RuntimeError(label + ": sensitivity edit no longer matches")
-                mutation_cfg = stable_cfg if label == "deadline" else cfg
-                mutated = mutation_cfg.replace(anchor, constant + " = FALSE")
-                summary["sensitivity"][label] = run_tlc(tree, out, args.java, jar, label, mutated,
-                                                       started, violation)
+            sources = SOURCES
+            if args.model == "first-live":
+                sources = ("funkot-core/src/engine.rs", "funkot-core/src/lib.rs",
+                           "funkot-core/src/first_live.rs", "verification/first_live.rs",
+                           "verification/first_live_mutations.py",
+                           "verification/first_live/FirstLive.tla",
+                           "verification/first_live/FirstLive.cfg",
+                           "verification/first_live/FirstLiveStable.cfg",
+                           "verification/first_live/FirstLiveRobust.cfg",
+                           "verification/first_live/FirstLiveTransport.cfg",
+                           "verification/check_manual_navigation.py")
+            summary["sources"] = {name: sha256(tree / name) for name in sources}
+            if args.model == "navigation":
+                cfg = (tree / "verification/manual_navigation/ManualNavigation.cfg").read_text()
+                summary["model"] = run_tlc(tree, out, args.java, jar, "baseline", cfg, started)
+                stable_cfg = (tree / "verification/manual_navigation/StableNavigation.cfg").read_text()
+                summary["stable_adoption"] = run_tlc(tree, out, args.java, jar, "stable", stable_cfg, started)
+                summary["sensitivity"] = {}
+                for label, constant, violation in (
+                    ("generation", "CheckGeneration", "Invariant GenerationSafe is violated"),
+                    ("start_frame", "CheckTiming", "Invariant ExactFrameSafe is violated"),
+                    ("deadline", "CheckDeadline", "Temporal properties were violated"),
+                    ("history_rollover", "CancelHistory", "Invariant AcceptedTargetSafe is violated"),
+                ):
+                    anchor = constant + " = TRUE"
+                    if cfg.count(anchor) != 1:
+                        raise RuntimeError(label + ": sensitivity edit no longer matches")
+                    mutation_cfg = stable_cfg if label == "deadline" else cfg
+                    mutated = mutation_cfg.replace(anchor, constant + " = FALSE")
+                    summary["sensitivity"][label] = run_tlc(tree, out, args.java, jar, label, mutated,
+                                                           started, violation)
+            else:
+                configs = {name: (tree / ("verification/first_live/" + filename)).read_text()
+                           for name, filename in (("model", "FirstLive.cfg"),
+                                                  ("stable_resolution", "FirstLiveStable.cfg"),
+                                                  ("robustness", "FirstLiveRobust.cfg"))}
+                for name, cfg in configs.items():
+                    summary[name] = run_tlc(tree, out, args.java, jar, name, cfg, started,
+                                            module="first_live/FirstLive")
+                summary["sensitivity"] = {}
+                for label, base, constant, violation in (
+                    ("receiver", "model", "CheckReceiver", "Invariant NoRetiredReceiverEffect is violated"),
+                    ("failed_permit", "model", "HoldFailedPermit", "Invariant NoPrematurePermitRelease is violated"),
+                    ("terminal_identity", "model", "KeepTerminal", "Invariant TerminalIdentitySafe is violated"),
+                    ("failure_resolution", "stable_resolution", "EndFailedPreview", "Temporal properties were violated"),
+                    ("upgrade_stage", "robustness", "CheckUpgradeStage", "Invariant UpgradeSafe is violated"),
+                    ("occurrence", "robustness", "CheckOccurrence", "Invariant UpgradeSafe is violated"),
+                ):
+                    cfg = configs[base]
+                    anchor = constant + " = TRUE"
+                    if cfg.count(anchor) != 1:
+                        raise RuntimeError(label + ": sensitivity edit no longer matches")
+                    summary["sensitivity"][label] = run_tlc(
+                        tree, out, args.java, jar, label, cfg.replace(anchor, constant + " = FALSE"),
+                        started, violation, module="first_live/FirstLive")
+                transport_cfg = (tree / "verification/first_live/FirstLiveTransport.cfg").read_text()
+                summary["transport_assumptions"] = {}
+                for label, kind, violation in (
+                    ("duplicate_ready", "ReadyDuplicate", "Invariant BufferedPcmUnique is violated"),
+                    ("duplicate_failure", "FailureDuplicate", "Invariant PermitCreditBound is violated"),
+                    ("early_exhausted", "EarlyExhausted", "Invariant NoPrematureFinish is violated"),
+                ):
+                    anchor = 'FaultKind = "ReadyDuplicate"'
+                    if transport_cfg.count(anchor) != 1:
+                        raise RuntimeError(label + ": transport diagnostic no longer matches")
+                    cfg = transport_cfg.replace(anchor, 'FaultKind = "' + kind + '"')
+                    result = run_tlc(tree, out, args.java, jar, label, cfg, started, violation,
+                                     module="first_live/FirstLive")
+                    result["classification"] = "unsupported transport input"
+                    summary["transport_assumptions"][label] = result
             summary["status"] = "PASS"
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError, tarfile.TarError) as error:
         summary["error"] = str(error)

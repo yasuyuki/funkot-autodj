@@ -1,4 +1,4 @@
-# Transition geometry
+# Engine verification
 
 The driver imports `funkot-core/src/transition_geometry.rs` directly. The engine
 and analysis modules call that same source. Kani dependencies stay outside the
@@ -181,10 +181,148 @@ accepted-Prev-to-A, history-rollover-to-B sequence replayed by
 `history_rollover_cancels_an_accepted_previous_navigation`. The three-line
 product correction and its regression are separate commits in PR #44.
 
-Record navigation results in #41. TLC does not verify PCM samples, DSP quality,
+Record navigation results in #41. The navigation model does not verify PCM samples, DSP quality,
 click freedom, OS scheduling, device output, unbounded request streams or the
 preview/full first-live lifecycle, head-only relabeling or arbitrary FIFO
 capacity. TLC uses probabilistic fingerprints; its reported collision estimate
 is retained with the run logs. Loader identities and future fencing are
-represented only at their navigation boundaries. The separate work in player
-#112 and core #42 must establish their own persistence and upgrade promises.
+represented only at their navigation boundaries. Persistence is covered separately
+in player #112; first-live lifecycle is covered below.
+
+
+## First-live lifecycle
+
+The existing Kani entry also imports `funkot-core/src/first_live.rs` directly.
+Its three harnesses quantify independent boolean facts and both `FailedPermit`
+variants, with 6, 8 and 2 reachable covers. Upgrade admission requires the same
+occurrence, an unfailed non-head preview, and a full incoming buffer. Repeated
+full messages cannot replace already adopted PCM or restart its fade. Wait
+classification ends a terminal preview at EOF, keeps head-only outside upgrade
+wait, and never selects sleeping polling for realtime or scheduled replay.
+Stopped/finished engines select no wait. The permit predicate returns a slot
+only when no Ready previously transferred it to a preview.
+
+Path/index comparisons, Weak PCM identity, receiver ownership and failure-stage
+construction are Engine/loader adapters. Kani does not prove those facts were
+constructed correctly. The real Engine regressions check active and queued
+adoption, exact PCM/fade identity, FIFO final failure followed by later Ready,
+revocation before failure, and preservation of the audible preview tail. Existing
+recorded first-live recipe tests rebuild the actual producer buffers and check
+PCM/evidence equality. This is distinct from the live Upgrade guard, which does
+not authenticate a PCM hash supplied by an adversarial producer.
+
+Run the same pinned TLC entry with the first-live profile:
+
+```sh
+python3 -B verification/check_manual_navigation.py --setup
+python3 -B verification/check_manual_navigation.py --model first-live
+```
+
+The clean commit archive, source attribution, complete-result validation,
+15-minute total deadline and Java sizing described above apply to this profile.
+Its CI artifact is `first-live-proof`; the existing `transition-proof` artifact
+also includes the new Kani harnesses and isolated production mutations.
+
+### Message ownership and terminal preview
+
+`Ready` transfers its preparation permit to the buffer. `Upgrade` uses that
+same slot. A final Failed after preview Ready carries a private
+`AfterPreview(Weak<PCM>)` payload and never releases another permit. The producer
+captures that identity on the loader thread before sending Ready. Failures
+before Ready, ordinary full prepares and head-only prepares use `BeforeReady`
+and release their untransferred permit. A short first-live file has no preview
+Ready and follows that same rule. Revoking the queued preview already returns
+its slot, so the later final failure must still release nothing.
+
+The Engine retains the failed preview's Weak identity for its lifetime. It
+keeps no PCM payload alive and prevents allocation-address reuse. Moving that
+buffer through history, Prev and source replacement preserves its terminal
+status. The remaining head stays playable; at EOF the Engine retires it and
+continues to a ready future, without waiting for global Exhausted. A late
+Upgrade cannot revive that buffer. No new public PreparedTrack/C ABI field,
+filesystem operation, lock or sleep is added to the realtime callback.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Preparing
+    Preparing --> QueuedPreview: Ready transfers permit
+    Preparing --> FailedBeforeReady: Failed returns permit
+    QueuedPreview --> ActivePreview: start
+    QueuedPreview --> Revoked: revoke returns permit
+    QueuedPreview --> Full: Upgrade
+    ActivePreview --> Full: Upgrade preserves playhead
+    QueuedPreview --> TerminalPreview: final Failed, no permit return
+    ActivePreview --> TerminalPreview: final Failed, no permit return
+    Revoked --> Retired: final Failed, no permit return
+    TerminalPreview --> History: audible head reaches EOF
+    History --> TerminalPreview: Prev restores same PCM
+    Full --> History: finish or navigation
+```
+
+### Bounds, fairness and correspondence
+
+The model distinguishes two occurrence keys and independent preview/full PCM
+identities. Three preparation attempts per receiver exercise normal
+current/next/history capacity and the surplus/backpressure case. A fourth
+source poll represents exhaustion. Initial-source attempts may reuse their
+path/index as a looping PlaylistSource does; the replacement uses a fresh key.
+Attempt numbers are allocation/permit evidence only, never production guards.
+One optional source replacement explores old/new receiver isolation without
+integer generation wraparound. Replacement workers prepare full/head buffers
+and cannot create another non-head first-live preview.
+
+Head-only retains the real 12-head prefetch allowance and its resulting permit
+capacity. Three input attempts do not enumerate a completely filled head queue.
+The frame abstraction has preview/head length one and full length two; native
+replay tests cover actual frame and PCM adapters. This does not prove arbitrary
+buffer lengths, audio content, allocation behavior or throughput.
+
+`FirstLive.cfg` checks safety across legal capacity-one FIFO producer order.
+`FirstLiveRobust.cfg` separately injects one extra Upgrade, choosing a duplicate
+full, wrong-index full, wrong-path full, preview or head-only payload, including
+arrival before Ready or after failure/adoption. Those are
+robustness inputs, not messages emitted by the current producer. It does not
+assume that arbitrary lost or reordered messages retain progress.
+`FirstLiveStable.cfg` checks resolution and finite non-head source completion
+under weakly fair producer, current-receiver drain and render actions, with no
+superseding navigation, revoke, stop, fence or source replacement. Offline poll
+owns `&mut Engine`; a hypothetical concurrent `stop()` is not its escape path.
+Stop is checked as a terminal safety boundary before later render/control.
+
+| Model action | Product boundary and native evidence |
+|---|---|
+| `Acquire`, `SendPrepared`, `SendFinal` | `loader_main_mode`, `wait_permit`, `prepare_first_live` and `send_msg`: one acquired slot, Ready success, then Upgrade or stage-tagged Failed. |
+| `Consume` Ready / `Revoke` | `drain_loader`, `take_next`, `revoke_next`: queued buffer ownership and one return on revocation. |
+| `Consume` Failed | Failure-stage permit decision and Weak terminal identity; final failure must not return a transferred slot. |
+| `ApplyUpgrade` | `upgrade_allowed`, `apply_upgrade`, `apply_queued_first_live_upgrade`: occurrence, stage and terminal guards before any PCM/fade mutation. |
+| `Render` | `preview_wait`, `await_preview_upgrade`, `tick_head_only`, `render_one_frame`: realtime yield, offline poll, terminal EOF and natural advance. |
+| `JumpForward`, `JumpPrevious` | Accepted navigation ownership projection through next/history. Planner timing and transition DSP stay in their existing checks. |
+| `BeginFuture`, `AbortFuture`, `CommitFuture` | Existing future fence and receiver/pool replacement. Retained terminal history belongs to its buffer, not the new receiver. |
+| `Stop`, `Resume` | Terminal stop versus resumable natural finish. |
+
+The transferred-permit invariant compares actual credit values before and after
+final failure, including a revoked preview; it is not global permit conservation.
+Head-only mode is fixed per run. The isolated model variants break receiver
+selection, transferred-permit ownership, terminal identity retention, failed-preview EOF resolution, Upgrade
+stage and occurrence checks. Each must produce its named safety or temporal
+counterexample. Production mutations in `first_live_mutations.py` must fail
+completed Kani assertions and the named Engine tests where an observable native
+adapter is provided. Stop/realtime decision mutations are checked directly by
+Kani; the render entry has additional independent stop guards. The receiver
+variant is native-only because receiver exchange is not a pure function. The
+producer-stage variant must fail the synthetic preparation adapter, which checks
+actual Ready/Failed order and the Weak payload.
+Transport-assumption diagnostics separately inject duplicate Ready, duplicate
+BeforeReady Failed and premature Exhausted. Their counterexamples describe
+unsupported channel inputs, not product traces: the real worker has one sender
+and a reliable FIFO. They must remain distinct from the passing legal model and
+Upgrade robustness check.
+Compilation errors, zero selected tests, solver/tool failures and timeouts are
+not accepted counterexamples.
+
+Record results in #42. The model projects accepted hard jumps rather than the
+full planner, concurrent transition decks or shared Restart aliases. Scheduled
+recorded replay is covered by native tests, not this loader model. It does not
+prove sound quality, click freedom, OS/device timing, progress with permanent
+worker loss, unlimited inputs/replacements, arbitrary head-queue occupancy or
+PCM authenticity. TLC fingerprint collision estimates remain in its logs.

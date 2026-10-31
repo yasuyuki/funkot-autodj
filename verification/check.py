@@ -13,7 +13,10 @@ import time
 
 EXPECTED = {"plan_all_u32": 4, "trigger_all_u32": 5, "frame_admission_all_u64": 4,
             "manual_navigation_proofs::reply_is_current_all_u64_bool": 3,
-            "manual_navigation_proofs::tick_decision_all_facts": 10}
+            "manual_navigation_proofs::tick_decision_all_facts": 10,
+            "first_live_proofs::upgrade_admission_all_facts": 6,
+            "first_live_proofs::preview_wait_all_facts": 8,
+            "first_live_proofs::failure_permit_transfer_all_variants": 2}
 started = time.monotonic()
 result = Path("/results")
 revision = os.environ.get("SOURCE_REVISION", "")
@@ -26,6 +29,7 @@ if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision) is None:
     sys.exit(1)
 (result / "kani.json").unlink(missing_ok=True)
 from manual_navigation_mutations import NAVIGATION_MUTATIONS
+from first_live_mutations import FIRST_LIVE_MUTATIONS
 command = ["kani", "verification/transition_geometry.rs", "--target-dir", "/tmp/kani-proof",
            "-j", "1", "--output-format", "terse", "-Z", "unstable-options",
            "--export-json", str(result / "kani.json")]
@@ -48,7 +52,9 @@ summary = {"status": "FAIL", "exit_code": status, "wall_seconds": round(elapsed,
            "sources": {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in
                        ("funkot-core/src/transition_geometry.rs", "verification/transition_geometry.rs",
                         "funkot-core/src/manual_navigation.rs", "verification/manual_navigation.rs",
-                        "funkot-core/src/engine.rs", "verification/manual_navigation_mutations.py")}}
+                        "funkot-core/src/engine.rs", "verification/manual_navigation_mutations.py",
+                        "funkot-core/src/first_live.rs", "verification/first_live.rs",
+                        "verification/first_live_mutations.py")}}
 try:
     assert status == 0, f"Kani exited {status} (timeout/resource/verification failure is not PASS)"
     data = json.loads((result / "kani.json").read_text())
@@ -71,6 +77,7 @@ try:
     summary["sensitivity"] = {}
     geometry = "funkot-core/src/transition_geometry.rs"
     navigation = "funkot-core/src/manual_navigation.rs"
+    first_live = "funkot-core/src/first_live.rs"
     mutations = (
         ("plan_all_u32", "plan_all_u32", geometry,
          (("let skip = i.saturating_sub(m)", "let skip = i"),)),
@@ -78,7 +85,8 @@ try:
          (("saturating_add(OUTRO_LEAD_BARS)", "saturating_add(0)"),)),
         ("frame_admission_all_u64", "frame_admission_all_u64", geometry,
          (("fade_out_end > prev_frames - prev_start", "false"),)),
-    ) + tuple((label, harness, navigation, edits) for label, harness, edits, _ in NAVIGATION_MUTATIONS)
+    ) + tuple((label, harness, navigation, edits) for label, harness, edits, _ in NAVIGATION_MUTATIONS) + tuple(
+        (label, harness, first_live, edits) for label, harness, edits, _ in FIRST_LIVE_MUTATIONS)
     for label, harness, source_name, edits in mutations:
         text = Path(source_name).read_text()
         for original, broken in edits:
@@ -87,7 +95,7 @@ try:
         with tempfile.TemporaryDirectory(prefix="transition-sensitivity-") as temporary:
             tree = Path(temporary)
             for name in ("verification/transition_geometry.rs", "verification/manual_navigation.rs",
-                         geometry, navigation):
+                         "verification/first_live.rs", geometry, navigation, first_live):
                 target = tree / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(Path(name).read_bytes())

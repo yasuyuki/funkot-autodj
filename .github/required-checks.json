@@ -18,5 +18,9 @@
   {
     "app": "github-actions",
     "name": "Manual navigation model"
+  },
+  {
+    "app": "github-actions",
+    "name": "First-live lifecycle model"
   }
 ]

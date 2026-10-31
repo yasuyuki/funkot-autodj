@@ -92,26 +92,30 @@ jobs:
         with:
           name: transition-engine-sensitivity
           path: /tmp/transition-engine-sensitivity.log
-      - name: Engine detects navigation guard mutations
+      - name: Engine detects navigation and first-live guard mutations
         env: { CARGO_PROFILE_RELEASE_LTO: "false", PYTHONDONTWRITEBYTECODE: "1" }
         run: |
           python3 -B - <<'PYTHON'
           import io, os, subprocess, tarfile, tempfile
           from pathlib import Path
           from verification.manual_navigation_mutations import NAVIGATION_MUTATIONS, ENGINE_MUTATION_EDITS
+          from verification.first_live_mutations import FIRST_LIVE_MUTATIONS, FIRST_LIVE_ENGINE_MUTATIONS, ENGINE_MUTATION_EDITS as FIRST_LIVE_ENGINE_EDITS
           archive = subprocess.check_output(["git", "archive", "HEAD"])
-          for label, _, edits, test in NAVIGATION_MUTATIONS:
+          variants = NAVIGATION_MUTATIONS + tuple(item for item in FIRST_LIVE_MUTATIONS if item[3] is not None) + FIRST_LIVE_ENGINE_MUTATIONS
+          adapter_edits = ENGINE_MUTATION_EDITS | FIRST_LIVE_ENGINE_EDITS
+          for label, _, edits, test in variants:
               with tempfile.TemporaryDirectory() as temporary:
                   tree = Path(temporary)
                   with tarfile.open(fileobj=io.BytesIO(archive)) as source:
                       source.extractall(tree, filter="data")
-                  path = tree / "funkot-core/src/manual_navigation.rs"
+                  module = "first_live.rs" if label.startswith("first_live_") else "manual_navigation.rs"
+                  path = tree / "funkot-core/src" / module
                   text = path.read_text()
                   for original, broken in edits:
                       assert text.count(original) == 1
                       text = text.replace(original, broken)
                   path.write_text(text)
-                  for filename, original, broken in ENGINE_MUTATION_EDITS.get(label, ()):
+                  for filename, original, broken in adapter_edits.get(label, ()):
                       adapter = tree / filename
                       text = adapter.read_text()
                       assert text.count(original) == 1
@@ -183,6 +187,33 @@ jobs:
           path: /tmp/manual-navigation-proof/
           if-no-files-found: error
 
+  first-live-proof:
+    name: First-live lifecycle model
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/funkot-verification
+          key: tlc-1.7.4-936a2620
+      - name: Prepare TLC
+        run: python3 -B verification/check_manual_navigation.py --setup
+      - name: Check first-live ordering and counterexamples
+        run: python3 -B verification/check_manual_navigation.py --model first-live --output /tmp/first-live-proof
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: first-live-proof
+          path: /tmp/first-live-proof/
+          if-no-files-found: error
+
   windows-cache:
     name: cache and WAV ownership tests (windows)
     needs: [gate]
@@ -230,7 +261,7 @@ jobs:
 
   package:
     name: package (${{ matrix.artifact }})
-    needs: [gate, test, windows-cache, transition-proof, manual-navigation-proof, dependency-policy]
+    needs: [gate, test, windows-cache, transition-proof, manual-navigation-proof, first-live-proof, dependency-policy]
     if: >-
       needs.gate.outputs.run == 'true' &&
       (github.event_name == 'schedule' ||

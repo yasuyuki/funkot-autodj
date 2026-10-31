@@ -1,6 +1,6 @@
 ---
 name: verify-funkot-transition-geometry
-description: Verify Funkot AutoDJ transition geometry, deck admission and asynchronous manual navigation after changes to planning, markers, navigation, source fencing or their Kani and TLC checks.
+description: Verify Funkot AutoDJ transition geometry, deck admission, asynchronous navigation and first-live lifecycle after changes to planning, markers, loader messages, preview upgrades, source fencing or their Kani and TLC checks.
 ---
 # Verify transition geometry
 
@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`ff68fe49e5f96ab4d4bb528d25ef44cc38752bb8`. This is an audit anchor, not a pin.
+`58e64d096dce4915379ec666a01aac579585af87`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
@@ -139,21 +139,83 @@ repairing either. The stable TLC configuration proves adoption only under its
 stated noninterference and progress assumptions. The ordinary configuration checks safety over the complete bounded event
 graph; conditional resolution and adoption are checked by the stable configuration.
 Neither model covers sound quality, devices, arbitrary-length operation streams,
-or the complete first-live preview/full lifecycle.
+or first-live lifecycle; that promise has a separate model below.
+
+## First-live lifecycle
+
+Inspect `prepare_first_live`, `loader_main_mode`, `send_msg`, `drain_loader`,
+`apply_upgrade`, `apply_queued_first_live_upgrade`, `await_preview_upgrade`,
+`revoke_next`, `start_first`, `push_history`, `retire_active`, accepted Prev,
+and future receiver exchange. The private `first_live.rs` predicates are
+imported directly by the existing Kani entry. Its three harnesses cover Upgrade
+admission, wait classification and failed-attempt permit transfer, with 6, 8
+and 2 reachable covers. Caller path/index, Weak PCM identity and failure-stage
+facts remain native adapters.
+
+Ready transfers one preparation slot to its buffer. Upgrade owns no extra slot.
+The private Failed payload distinguishes BeforeReady from AfterPreview(Weak).
+The latter releases nothing, even if `revoke_next` already returned the slot.
+Its Weak tracks terminal PCM through queued/active/history and source changes
+without retaining the large payload. Do not infer this ownership from whether
+a matching deck happens to remain when failure is drained. Do not clear a
+retained terminal history merely because the receiver generation changed.
+Ordinary later failures release their own untransferred slots even when a
+looping source reuses the earlier path/index.
+
+Only an unfailed non-head preview can accept a same-occurrence full Upgrade.
+Duplicates cannot replace adopted full PCM or restart its fade. A final failure
+preserves the audible preview tail, then ends that deck at EOF without waiting
+for global Exhausted. Realtime and staged replay never select sleeping polling.
+Stop remains terminal; offline polling holds an exclusive Engine borrow and
+cannot assume a concurrently callable stop method.
+
+Use the existing TLC entry with a separate profile:
+
+```sh
+python3 -B verification/check_manual_navigation.py --setup
+python3 -B verification/check_manual_navigation.py --model first-live
+```
+
+Read all three complete results: legal FIFO safety, conditional stable progress,
+and separately injected Upgrade robustness. `verification/README.md` owns the
+finite bounds, fairness assumptions, transition mapping and excluded behavior.
+The current producer emits at most one non-head first-live preview per Engine;
+replacement workers do not emit another. Reassess single-Weak ownership if that
+contract changes. Generation isolation is receiver/channel ownership, not a
+fictional generation field in the message.
+
+Preserve real Engine regressions for final failure followed by later Ready,
+revocation before failure, terminal history restoration, exact PCM/fade identity,
+head-only, stopped/missing-upgrade behavior, and recorded recipe recreation.
+`first_live_mutations.py` owns production mutations and named native adapters.
+Occurrence, preview stage, terminal admission and permit variants must fail both
+Kani and their Engine assertions. Stop/realtime wait variants must fail Kani;
+the native entry has additional independent guards. Breaking receiver exchange
+must fail its real Engine test. Misclassifying the producer after Ready must
+fail the synthetic producer adapter. Model variants separately break receiver,
+permit, terminal retention, failed EOF resolution, stage and occurrence.
+Unsupported Ready/Failed duplication and premature Exhausted are separate
+transport-assumption diagnostics, not reachable product bugs or promises of
+unreliable-channel progress. Keep their counterexamples distinct from the
+passing legal model and Upgrade robustness checks.
+Tool failures, compiler errors, timeouts and zero selected tests never qualify.
+Read counterexamples with `/statechart` and replay applicable traces in Rust.
 
 ## Limits and result record
 
 The numeric proof does not verify floating-point conversion or that its caller
 passes the correct musical marker. Those adapters are covered by engine
 regressions. First-live readiness, upgrade adoption, preparation identities and
-preview wait require real-engine regressions, outside these integer proofs.
+preview wait use the separate bounded model and real-engine regressions above,
+outside the integer geometry proofs.
 Phase scores, musical bar identity, click freedom, real music,
 devices, realtime schedules, OS behavior and the #22 candidate-selection
 question remain outside the proof. Run normal workspace checks and real-track
 rendering as required by `AGENTS.md`; report unavailable input explicitly.
 
 Record geometry results in `funkot-autodj` Issue #26 and navigation results in
-Issue #41, including counterexamples, mutations, exact source/CI commits and
+Issue #41 and first-live results in Issue #42, including counterexamples,
+mutations, exact source/CI commits and
 unproved scope. Keep private paths, raw diagnostics
 and per-file hashes in private evidence; link public CI artifacts for shared
 logs. After changes that skipped this check, use

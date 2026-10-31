@@ -21,14 +21,14 @@ class ManualNavigationResultTests(unittest.TestCase):
         self.java = self.tree / "java-probe"
         self.marker = self.tree / "executed"
 
-    def run_result(self, output, status=0, violation=None, started=None):
+    def run_result(self, output, status=0, violation=None, started=None, module="manual_navigation/ManualNavigation"):
         self.java.write_text("#!" + sys.executable + "\nimport pathlib,sys\n"
                              + "pathlib.Path(" + repr(str(self.marker)) + ").touch()\n"
                              + "print(" + repr(output) + ")\nsys.exit(" + str(status) + ")\n")
         self.java.chmod(0o755)
         return CHECK.run_tlc(self.tree, self.out, str(self.java), self.tree / "jar",
                              "probe", "fixture config", time.monotonic() if started is None else started,
-                             violation)
+                             violation, module=module)
 
     def test_zero_exit_without_complete_exploration_is_not_pass(self):
         for output in ("", "Model checking completed. No error has been found.",
@@ -53,3 +53,14 @@ class ManualNavigationResultTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.run_result("", started=time.monotonic() - 15 * 60 - 1)
         self.assertFalse(self.marker.exists())
+
+    def test_selected_model_uses_the_same_complete_result_validator(self):
+        (self.tree / "verification/first_live").mkdir()
+        output = "2 states generated, 1 distinct states found, 0 states left on queue.\nModel checking completed. No error has been found."
+        result = self.run_result(output, module="first_live/FirstLive")
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue((self.tree / "verification/first_live/probe.cfg").exists())
+        self.assertFalse((self.tree / "verification/manual_navigation/probe.cfg").exists())
+        with self.assertRaises(RuntimeError):
+            self.run_result("2 states generated, 1 distinct states found, 1 states left on queue.",
+                            module="first_live/FirstLive")
