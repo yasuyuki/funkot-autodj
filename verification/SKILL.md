@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`b60e4e0e68704c6567468f8475daffc40f731fe6`. This is an audit anchor, not a pin.
+`8be7aeac3d7de23d18c7be756ba7c48a71fb05e4`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
@@ -31,14 +31,15 @@ plan clips its fade to common remaining material.
 
 The adapter coverage is `engine.rs::bar_to_frames`, `build_manual_plan`,
 `commit_manual_plan`, `begin_transition_to`, `begin_transition`, `start_first`,
-`finish_prepare`, `Engine::new_with_source`, and `Engine::from_prepared`. Inspect every new path that moves
+`finish_prepare`, `Engine::new_with_source`, `Engine::from_prepared`, and
+`Engine::from_prepared_first_live`. Inspect every new path that moves
 their decks, entries, nudges or endpoints. The full target horizon comes from
 the absolute main marker and corrected entry, including a real frame at main.
 Manual rejection precedes queue/history consumption and start events.
 Automatic fallback discards a rejected correction, then uses a bounded simple
 fade or hard cut. Cached derived triggers are normalized by `cache.rs::read_entry`
 without changing manual input fields or stored bytes.
-Both engine constructors reject non-finite bar durations and durations below
+These constructors reject non-finite bar durations and durations below
 one output frame before starting workers or adopting tracks.
 
 ## Run and judge
@@ -91,7 +92,9 @@ boundaries when updating the checker after a code change.
 
 The numeric proof does not verify floating-point conversion or that its caller
 passes the correct musical marker. Those adapters are covered by engine
-regressions. Phase scores, musical bar identity, click freedom, real music,
+regressions. First-live readiness, upgrade adoption, preparation identities and
+preview wait require real-engine regressions, outside these integer proofs.
+Phase scores, musical bar identity, click freedom, real music,
 devices, realtime schedules, OS behavior and the #22 candidate-selection
 question remain outside the proof. Run normal workspace checks and real-track
 rendering as required by `AGENTS.md`; report unavailable input explicitly.
