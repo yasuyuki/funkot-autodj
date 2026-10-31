@@ -6651,6 +6651,41 @@ mod tests {
     }
 
     #[test]
+    fn rejected_manual_reply_invalidates_a_delayed_duplicate() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let (work_tx, _work_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(2);
+        engine.manual_tx = work_tx;
+        engine.manual_rx = reply_rx;
+        let trace_rx = engine.enable_navigation_trace(8);
+        engine.begin_nav(NavAction::TransitionToNext);
+        let now = engine.active.as_ref().expect("active").playhead;
+        engine.manual_deadline = Some(now + 1);
+        let generation = engine.nav_gen;
+        let mut invalid = controlled_manual_plan(&engine, NavAction::TransitionToNext, now, 7);
+        invalid.simple = false;
+        invalid.fade_out_end = u64::MAX;
+        let before_index = engine.current_index();
+        let before_next = engine.next_track_path().map(Path::to_path_buf);
+
+        reply_tx.send(invalid.clone()).expect("first invalid reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), before_index);
+        assert_eq!(engine.next_track_path().map(Path::to_path_buf), before_next);
+
+        engine.render(&mut [0.0; 2]);
+        reply_tx.send(invalid).expect("delayed duplicate");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), before_index, "a rejected operation must not acquire a late fallback");
+        assert_eq!(engine.next_track_path().map(Path::to_path_buf), before_next);
+        assert!(!trace_rx.try_iter().any(|event| matches!(event,
+            NavigationTrace::PlanApplied { generation: applied, .. } if applied == generation
+        )));
+    }
+
+    #[test]
     fn target_replacement_revocation_and_stop_invalidate_accepted_plan() {
         let mut engine = phase_test_engine(true, 8, 44_100);
         let now = engine.active.as_ref().unwrap().playhead;
