@@ -42,7 +42,8 @@ sys.exit(23)
 """)
         docker.chmod(0o755)
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
-                        PROBE=str(self.base / "archive"), SOURCE_REVISION="forged")
+                        PROBE=str(self.base / "archive"), SOURCE_REVISION="forged",
+                        PYTHONDONTWRITEBYTECODE="1")
 
     def git(self, *args, cwd=None):
         return subprocess.check_output([GIT, "-C", str(cwd or self.repo), *args], text=True,

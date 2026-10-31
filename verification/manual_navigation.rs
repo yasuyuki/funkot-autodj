@@ -52,6 +52,16 @@ fn tick_decision_all_facts() {
             if playhead == plan.start
                 && reply_is_current(plan.generation, current_generation, plan.identity_matches)
     );
+    if exact_ready {
+        assert_eq!(decision, TickDecision::Apply);
+    }
+    if let (Some(playhead), Some(plan), Some(deadline)) = (active_playhead, plan, deadline) {
+        if reply_is_current(plan.generation, current_generation, plan.identity_matches)
+            && playhead > plan.start && playhead < deadline.frame
+        {
+            assert_eq!(decision, TickDecision::Replan);
+        }
+    }
     if let (Some(playhead), Some(deadline)) = (active_playhead, deadline) {
         if deadline.fallback_available && playhead >= deadline.frame && !exact_ready {
             assert_eq!(decision, TickDecision::DeadlineFallback);
