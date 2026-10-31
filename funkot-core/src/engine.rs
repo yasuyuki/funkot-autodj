@@ -5239,7 +5239,6 @@ mod tests {
 
     #[test]
     fn recorded_first_live_recreates_the_actual_production_buffers() {
-        assert_ne!(build_revision(), [0; 20], "recorded producer proof requires a clean committed core");
         for (name, bars, has_preview) in [("staged", 8, true), ("single", 4, false)] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join(format!("{name}.wav"));
@@ -5255,8 +5254,10 @@ mod tests {
                     LoaderMsg::Upgrade(full, Some(provenance)) => (initial, Some(full), provenance),
                     _ => panic!("production preview did not produce its full upgrade"),
                 },
-                _ => panic!("production first-live did not produce its initial track"),
+                LoaderMsg::Failed { message, .. } => panic!("production first-live failed for {name}: {message}"),
+                _ => panic!("production first-live did not produce its initial track for {name}"),
             };
+            assert!(provenance.evidence.is_comparable(), "recorded producer proof requires a clean committed core");
             assert_eq!(provenance.recipe.has_preview(), has_preview);
             let recipe = FirstLiveReplayRecipe::from_recorded_json(&serde_json::to_vec(&*provenance.recipe).unwrap()).unwrap();
             let regenerated = prepare_first_live_replay_from_recorded(&options, &path, 0, &recipe, provenance.evidence).unwrap();
