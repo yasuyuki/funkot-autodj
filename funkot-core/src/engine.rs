@@ -1942,9 +1942,12 @@ impl Engine {
                     self.mark_finished();
                 }
                 if let Some((frame, _)) = self.resume_fade.as_mut() { *frame = 0; }
+                let waiting = first_live::waiting_output_frames(want_frames - frames_done, self.finished);
                 for s in out[frames_done * 2..].iter_mut() {
                     *s = 0.0;
                 }
+                self.render_frame = self.render_frame.saturating_add(waiting as u64);
+                frames_done += waiting;
                 break;
             }
 
@@ -5390,8 +5393,9 @@ mod tests {
         assert_eq!(engine.render(&mut audible), 2);
         assert_eq!(audible, [0.25; 4]);
         let mut after_eof = [1.0; 2];
-        assert_eq!(engine.render(&mut after_eof), 0);
+        assert_eq!(engine.render(&mut after_eof), 1);
         assert_eq!(after_eof, [0.0; 2]);
+        assert!(!engine.is_finished());
         assert!(engine.active.is_none());
         assert!(Arc::ptr_eq(
             &engine.last_track.as_ref().expect("terminal history").samples,
@@ -5473,7 +5477,8 @@ mod tests {
         let queued = engine.take_next().expect("queued preview");
         engine.start_first(queued);
         assert_eq!(engine.render(&mut [0.0; 4]), 2);
-        assert_eq!(engine.render(&mut [0.0; 2]), 0);
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        assert!(!engine.is_finished());
         assert!(engine.active.is_none());
 
         let token = engine.begin_future_update().expect("terminal preview no longer blocks source commit");
