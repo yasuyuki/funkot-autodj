@@ -1,7 +1,7 @@
 #[path = "../funkot-core/src/manual_navigation.rs"]
 mod manual_navigation;
 
-use manual_navigation::{
+use self::manual_navigation::{
     reply_is_current, tick_decision, DeadlineFact, PlanFact, TickDecision,
 };
 

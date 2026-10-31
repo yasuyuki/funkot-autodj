@@ -47,6 +47,9 @@ def source_revision(root):
 
 
 def run_tlc(tree, out, java, jar, label, cfg, started, violation=None):
+    remaining = 15 * 60 - (time.monotonic() - started)
+    if remaining <= 0:
+        raise RuntimeError(label + ": total verification deadline exceeded")
     directory = tree / "verification/manual_navigation"
     config = directory / (label + ".cfg")
     config.write_text(cfg)
@@ -58,11 +61,13 @@ def run_tlc(tree, out, java, jar, label, cfg, started, violation=None):
         process = subprocess.Popen(command, cwd=directory, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
         try:
-            status = process.wait(timeout=max(0, 15 * 60 - (time.monotonic() - started)))
+            status = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
             raise RuntimeError(label + ": total verification deadline exceeded")
+    if time.monotonic() - started > 15 * 60:
+        raise RuntimeError(label + ": total verification deadline exceeded")
     log = log_path.read_text()
     counts = re.findall(r"([\d,]+) states generated, ([\d,]+) distinct states found, ([\d,]+) states left on queue", log)
     if not counts:
@@ -73,8 +78,10 @@ def run_tlc(tree, out, java, jar, label, cfg, started, violation=None):
     if violation is None:
         if status != 0 or pending != 0 or "Model checking completed. No error has been found." not in log:
             raise RuntimeError(label + ": TLC did not finish the complete safety and liveness check")
-    elif status == 0 or violation not in log or "State 1:" not in log:
-        raise RuntimeError(label + ": missing the required checked counterexample")
+    else:
+        expected_exit = 13 if violation == "Temporal properties were violated" else 12
+        if status != expected_exit or violation not in log or "State 1:" not in log:
+            raise RuntimeError(label + ": missing the required checked counterexample")
     print(label + (" PASS" if violation is None else " EXPECTED_FAIL"), flush=True)
     return {"status": "PASS" if violation is None else "EXPECTED_FAIL", "exit_code": status,
             "generated": generated, "distinct": distinct, "pending": pending}
