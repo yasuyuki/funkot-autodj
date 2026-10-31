@@ -79,6 +79,8 @@ jobs:
         with:
           path: /tmp/transition-kani-image.tar
           key: transition-kani-0.68.0-${{ hashFiles('verification/Dockerfile') }}
+      - name: Check proof source attribution
+        run: python3 -m unittest discover -s verification -p "test_*.py"
       - name: Prepare verifier
         run: |
           if [ -f /tmp/transition-kani-image.tar ]; then

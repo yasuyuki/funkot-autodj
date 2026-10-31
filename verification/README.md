@@ -15,6 +15,13 @@ The fixed verifier is Kani 0.68.0, bundled Rust nightly-2026-08-21 and CBMC
 6.11.0. The runner reuses the player verification entry's 15-minute deadline
 and 8-GiB cgroup limit without extra swap. `summary.json` retains elapsed time,
 peak memory, revision and source hashes. `kani.json` retains individual checks.
+The runner requires a readable Git checkout with a valid HEAD commit and no
+tracked or nonignored untracked changes. This applies to clones and linked
+worktrees. Keep evidence outside the checkout or in an ignored directory.
+It streams `git archive` of that commit into the verifier. Git metadata is not
+needed inside Docker, and later checkout edits cannot change the proof source.
+An unavailable revision, invalid revision or dirty checkout writes a FAIL summary
+and exits before Docker. The validator also rejects missing or malformed revisions.
 Timeout, solver failure, missing harnesses and unreached covers fail the command.
 Default overflow, assertion, pointer and unwinding checks stay enabled. Neither
 function has a loop or recursion, so there is no finite input enumeration or
@@ -43,7 +50,10 @@ click freedom, real-time scheduling, devices, or OS behavior. The 8-bar candidat
 question in [#22](https://github.com/yasuyuki/funkot-autodj/issues/22) is separate
 and is not an input assumption.
 
-For a sensitivity check, copy the production module and driver into an isolated
+The runner repeats the three sensitivity checks below in isolated temporary
+trees within the same total deadline. Each must produce a completed Kani run
+with a failing safety assertion. Compilation errors and timeouts do not qualify.
+For a manual sensitivity check, copy the production module and driver into an isolated
 tree. Replacing `let skip = i.saturating_sub(m)` with `let skip = i` must fail
 `plan_all_u32`. Replacing the trigger's `saturating_add(OUTRO_LEAD_BARS)` with
 `saturating_add(0)` must fail `trigger_all_u32`. Run the unchanged source again
