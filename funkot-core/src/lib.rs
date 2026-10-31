@@ -25,6 +25,7 @@ pub mod filter;
 pub mod labels;
 pub mod stretch;
 pub mod structure;
+mod manual_navigation;
 mod transition_geometry;
 
 #[cfg(any(test, feature = "testutil"))]

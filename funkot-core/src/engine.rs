@@ -787,6 +787,9 @@ struct ActiveTransition {
     simple: bool,
 }
 
+use crate::manual_navigation::{
+    reply_is_current, tick_decision, DeadlineFact, PlanFact, TickDecision,
+};
 use crate::transition_geometry::admit_frames;
 
 #[derive(Clone)]
@@ -2314,22 +2317,74 @@ impl Engine {
     }
 
     fn poll_nav_tempo(&mut self) {
-        loop { match self.manual_rx.try_recv() {
-            Ok(plan) => { self.manual_in_flight = false; if plan.generation == self.nav_gen && self.manual_plan_matches(&plan) { self.pending_nav = Some(PendingNav::Planned(plan)); } },
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => { self.manual_in_flight = false; self.manual_pending = None; break },
-        }}
+        loop {
+            match self.manual_rx.try_recv() {
+                Ok(plan) => {
+                    self.manual_in_flight = false;
+                    if reply_is_current(
+                        plan.generation,
+                        self.nav_gen,
+                        self.manual_plan_matches(&plan),
+                    ) {
+                        self.pending_nav = Some(PendingNav::Planned(plan));
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.manual_in_flight = false;
+                    self.manual_pending = None;
+                    break;
+                }
+            }
+        }
         self.kick_manual_plan_if_idle();
     }
 
     fn tick_pending_nav(&mut self) {
-        let exact_ready = match (self.pending_nav.as_ref(), self.active.as_ref()) {
-            (Some(PendingNav::Planned(plan)), Some(active)) => plan.start == active.playhead
-                && plan.generation == self.nav_gen && self.manual_plan_matches(plan),
-            _ => false,
-        };
-        if let (Some(deadline), Some(action), Some(active)) = (self.manual_deadline, self.manual_action, self.active.as_ref()) {
-            if active.playhead >= deadline && !exact_ready {
+        let plan_fact = self.pending_nav.as_ref().map(|pending| match pending {
+            PendingNav::Planned(plan) => PlanFact {
+                generation: plan.generation,
+                start: plan.start,
+                identity_matches: self.manual_plan_matches(plan),
+            },
+        });
+        let plan_action = self.pending_nav.as_ref().map(|pending| match pending {
+            PendingNav::Planned(plan) => plan.key.action,
+        });
+        let active_playhead = self.active.as_ref().map(|active| active.playhead);
+        let deadline = self.manual_deadline.map(|frame| DeadlineFact {
+            frame,
+            fallback_available: self.manual_action.is_some(),
+        });
+
+        match tick_decision(self.nav_gen, active_playhead, plan_fact, deadline) {
+            TickDecision::Wait => {}
+            TickDecision::Drop => {
+                self.pending_nav = None;
+            }
+            TickDecision::Apply => {
+                let Some(PendingNav::Planned(plan)) = self.pending_nav.take() else {
+                    return;
+                };
+                self.manual_deadline = None;
+                self.manual_action = None;
+                self.commit_manual_plan(plan);
+            }
+            TickDecision::Replan => {
+                let Some(action) = plan_action else {
+                    return;
+                };
+                self.pending_nav = None;
+                self.manual_pending = Some(ManualDemand {
+                    generation: self.nav_gen,
+                    action,
+                });
+                self.kick_manual_plan_if_idle();
+            }
+            TickDecision::DeadlineFallback => {
+                let Some(action) = self.manual_action else {
+                    return;
+                };
                 self.manual_deadline = None;
                 self.manual_action = None;
                 self.manual_pending = None;
@@ -2340,44 +2395,18 @@ impl Engine {
                     plan.generation = accepted_generation;
                     self.commit_manual_plan(plan);
                 }
-                return;
             }
-        }
-        let Some(PendingNav::Planned(plan)) = self.pending_nav.as_ref() else {
-            return;
-        };
-        if plan.generation != self.nav_gen || !self.manual_plan_matches(plan) {
-            self.pending_nav = None;
-            return;
-        }
-        let start = plan.start;
-        let action = plan.key.action;
-        let playhead = match self.active.as_ref() {
-            Some(d) => d.playhead,
-            None => {
+            TickDecision::LateFallback => {
+                let Some(action) = plan_action else {
+                    return;
+                };
                 self.pending_nav = None;
-                return;
-            }
-        };
-        if playhead > start {
-            // Missing an exact frame never applies a late plan.  Rebuild from
-            // the live position; this also bounds a slow worker to useful work.
-            self.pending_nav = None;
-            if self.manual_deadline.is_some_and(|deadline| playhead < deadline) {
-                self.manual_pending = Some(ManualDemand { generation: self.nav_gen, action });
-                self.kick_manual_plan_if_idle();
-            } else {
                 self.manual_deadline = None;
                 self.manual_action = None;
                 if let Some(plan) = self.manual_simple_plan(action, "late preparation fallback") {
                     self.commit_manual_plan(plan);
                 }
             }
-        } else if playhead == start {
-            let Some(PendingNav::Planned(plan)) = self.pending_nav.take() else { return };
-            self.manual_deadline = None;
-            self.manual_action = None;
-            self.commit_manual_plan(plan);
         }
     }
 
@@ -2409,37 +2438,63 @@ impl Engine {
     }
 
     fn kick_manual_plan_if_idle(&mut self) {
-        if self.manual_in_flight { return; }
-        let Some(demand) = self.manual_pending.take() else { return };
-        let Some(active) = self.active.as_ref() else { return };
+        if self.manual_in_flight {
+            return;
+        }
+        let Some(demand) = self.manual_pending.take() else {
+            return;
+        };
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
         let target = match demand.action {
             NavAction::RestartCurrent => &active.track,
-            NavAction::TransitionToPrev => match self.last_track.as_ref() { Some(t) => t, None => return },
-            NavAction::TransitionToNext => match self.next_track.as_ref() { Some(t) => t, None => return },
+            NavAction::TransitionToPrev => match self.last_track.as_ref() {
+                Some(t) => t,
+                None => return,
+            },
+            NavAction::TransitionToNext => match self.next_track.as_ref() {
+                Some(t) => t,
+                None => return,
+            },
             _ => return,
         };
-        let request = ManualRequest { generation: demand.generation,
+        if !reply_is_current(demand.generation, self.nav_gen, true) {
+            return;
+        }
+        let request = ManualRequest {
+            generation: demand.generation,
             key: manual_key(demand.action, &active.track, target),
             // Reserve a scheduling quantum; a result whose start is already
             // behind the current render frame is never committed.
             playhead: active.playhead.saturating_add(bar_to_frames(1, self.bar_frames)).min(active.track.frames),
             deadline: self.manual_deadline.unwrap_or(u64::MAX),
-            active: Arc::clone(&active.track.samples), target: Arc::clone(&target.samples),
-            bar_frames: self.bar_frames, sample_rate: self.options.output_sample_rate,
-            target_bpm: self.options.target_bpm(), fade_bars: self.options.fade_bars };
+            active: Arc::clone(&active.track.samples),
+            target: Arc::clone(&target.samples),
+            bar_frames: self.bar_frames,
+            sample_rate: self.options.output_sample_rate,
+            target_bpm: self.options.target_bpm(),
+            fade_bars: self.options.fade_bars,
+        };
         // Offline rendering uses the identical pure builder synchronously for
         // deterministic output; realtime always hands it to the sole worker.
         if self.block_on_preview_upgrade {
             let plan = build_manual_plan(request);
-            if plan.generation == self.nav_gen && self.manual_plan_matches(&plan) {
+            if reply_is_current(
+                plan.generation,
+                self.nav_gen,
+                self.manual_plan_matches(&plan),
+            ) {
                 self.pending_nav = Some(PendingNav::Planned(plan));
             }
             return;
         }
         match self.manual_tx.try_send(request) {
             Ok(()) => self.manual_in_flight = true,
-            Err(TrySendError::Full(_)) => { self.manual_pending = Some(demand); },
-            Err(TrySendError::Disconnected(_)) => {},
+            Err(TrySendError::Full(_)) => {
+                self.manual_pending = Some(demand);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -6686,6 +6741,134 @@ mod tests {
         engine.tick_pending_nav();
         assert!(engine.transition.is_some());
         assert_eq!(engine.last_manual_plan_diagnostic().unwrap().reason, "deadline fallback");
+    }
+
+    #[test]
+    fn consecutive_restarts_drop_a_delayed_reply_before_the_current_reply() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let (work_tx, work_rx) = mpsc::sync_channel(2);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(2);
+        engine.manual_tx = work_tx;
+        engine.manual_rx = reply_rx;
+        let trace_rx = engine.enable_navigation_trace(8);
+
+        engine.begin_nav(NavAction::RestartCurrent);
+        let _first_request = work_rx.try_recv().expect("first restart request");
+        let now = engine.active.as_ref().expect("active").playhead;
+        let delayed = controlled_manual_plan(&engine, NavAction::RestartCurrent, now, 7);
+        let first_generation = engine.nav_gen;
+
+        engine.begin_nav(NavAction::RestartCurrent);
+        let current_generation = engine.nav_gen;
+        assert_ne!(current_generation, first_generation);
+        reply_tx.send(delayed).expect("delayed first reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), Some(0));
+
+        let _second_request = work_rx.try_recv().expect("second restart request");
+        let current = controlled_manual_plan(
+            &engine,
+            NavAction::RestartCurrent,
+            engine.active.as_ref().expect("active").playhead,
+            11,
+        );
+        reply_tx.send(current).expect("current restart reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+
+        let trace: Vec<_> = trace_rx.try_iter().collect();
+        assert!(!trace.iter().any(|event| matches!(
+            event,
+            NavigationTrace::PlanApplied { generation, .. } if *generation == first_generation
+        )));
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            NavigationTrace::PlanApplied { generation, .. } if *generation == current_generation
+        )));
+    }
+
+    #[test]
+    fn manual_reply_identity_guard_rejects_replaced_pcm_without_cancellation() {
+        for replace_active in [false, true] {
+            let mut engine = phase_test_engine(true, 8, 44_100);
+            let (work_tx, work_rx) = mpsc::sync_channel(1);
+            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+            engine.manual_tx = work_tx;
+            engine.manual_rx = reply_rx;
+            let trace_rx = engine.enable_navigation_trace(8);
+
+            engine.begin_nav(NavAction::TransitionToNext);
+            let _request = work_rx.try_recv().expect("navigation request");
+            let now = engine.active.as_ref().expect("active").playhead;
+            let reply = controlled_manual_plan(&engine, NavAction::TransitionToNext, now, 7);
+            let generation = engine.nav_gen;
+            if replace_active {
+                let active = engine.active.as_mut().expect("active");
+                active.track.samples = Arc::new(vec![0.0; active.track.samples.len()]);
+            } else {
+                let target = engine.next_track.as_mut().expect("next");
+                target.samples = Arc::new(vec![0.0; target.samples.len()]);
+            }
+
+            reply_tx.send(reply).expect("identity-mismatched reply");
+            engine.poll_nav_tempo();
+
+            assert_eq!(engine.nav_gen, generation, "replacement did not cancel navigation");
+            assert_eq!(engine.current_index(), Some(0));
+            assert!(engine.next_track_path().is_some());
+            let trace: Vec<_> = trace_rx.try_iter().collect();
+            assert!(!trace.iter().any(|event| matches!(
+                event,
+                NavigationTrace::PlanApplied { generation: applied, .. } if *applied == generation
+            )));
+        }
+    }
+
+    #[test]
+    fn deadline_fallback_drops_a_stale_reply_without_a_second_transition() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let (work_tx, work_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        engine.manual_tx = work_tx;
+        engine.manual_rx = reply_rx;
+        let trace_rx = engine.enable_navigation_trace(8);
+
+        engine.begin_nav(NavAction::TransitionToNext);
+        let _request = work_rx.try_recv().expect("navigation request");
+        let now = engine.active.as_ref().expect("active").playhead;
+        let stale = controlled_manual_plan(&engine, NavAction::TransitionToNext, now + 8, 7);
+        let accepted_generation = engine.nav_gen;
+        engine.manual_deadline = Some(now);
+        engine.tick_pending_nav();
+        let index_after_fallback = engine.current_index();
+        let queued_after_fallback = engine.next_track_path().map(Path::to_path_buf);
+
+        reply_tx.send(stale).expect("stale reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        engine.render(&mut [0.0; 2]);
+
+        assert_eq!(engine.current_index(), index_after_fallback);
+        assert_eq!(
+            engine.next_track_path().map(Path::to_path_buf),
+            queued_after_fallback,
+        );
+        let trace: Vec<_> = trace_rx.try_iter().collect();
+        assert_eq!(
+            trace.iter().filter(|event| matches!(
+                event,
+                NavigationTrace::PlanApplied { generation, .. } if *generation == accepted_generation
+            )).count(),
+            1,
+        );
+        assert_eq!(
+            trace.iter().filter(|event| matches!(
+                event,
+                NavigationTrace::TransitionStarted { generation, .. } if *generation == accepted_generation
+            )).count(),
+            1,
+        );
     }
 
     #[test]
