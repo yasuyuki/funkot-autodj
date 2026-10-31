@@ -10,7 +10,10 @@ import subprocess
 import sys
 import time
 
-EXPECTED = {"plan_all_u32": 4, "trigger_all_u32": 5, "frame_admission_all_u64": 4}
+
+EXPECTED = {"plan_all_u32": 4, "trigger_all_u32": 5, "frame_admission_all_u64": 4,
+            "manual_navigation_proofs::reply_is_current_all_u64_bool": 3,
+            "manual_navigation_proofs::tick_decision_all_facts": 10}
 started = time.monotonic()
 result = Path("/results")
 revision = os.environ.get("SOURCE_REVISION", "")
@@ -22,6 +25,7 @@ if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision) is None:
     print(json.dumps(summary))
     sys.exit(1)
 (result / "kani.json").unlink(missing_ok=True)
+from manual_navigation_mutations import NAVIGATION_MUTATIONS
 command = ["kani", "verification/transition_geometry.rs", "--target-dir", "/tmp/kani-proof",
            "-j", "1", "--output-format", "terse", "-Z", "unstable-options",
            "--export-json", str(result / "kani.json")]
@@ -42,7 +46,9 @@ summary = {"status": "FAIL", "exit_code": status, "wall_seconds": round(elapsed,
            "peak_bytes": peak, "limit_bytes": limit,
            "revision": revision,
            "sources": {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in
-                       ("funkot-core/src/transition_geometry.rs", "verification/transition_geometry.rs")}}
+                       ("funkot-core/src/transition_geometry.rs", "verification/transition_geometry.rs",
+                        "funkot-core/src/manual_navigation.rs", "verification/manual_navigation.rs",
+                        "funkot-core/src/engine.rs", "verification/manual_navigation_mutations.py")}}
 try:
     assert status == 0, f"Kani exited {status} (timeout/resource/verification failure is not PASS)"
     data = json.loads((result / "kani.json").read_text())
@@ -63,29 +69,36 @@ try:
         assert all(c["status"] == "Satisfied" for c in covers), "unreachable cover"
         assert all(c["status"] in {"Success", "Unreachable", "Satisfied"} for c in checks)
     summary["sensitivity"] = {}
-    source = Path("funkot-core/src/transition_geometry.rs")
-    original_source = source.read_text()
+    geometry = "funkot-core/src/transition_geometry.rs"
+    navigation = "funkot-core/src/manual_navigation.rs"
     mutations = (
-        ("plan_all_u32", "let skip = i.saturating_sub(m)", "let skip = i"),
-        ("trigger_all_u32", "saturating_add(OUTRO_LEAD_BARS)", "saturating_add(0)"),
-        ("frame_admission_all_u64", "fade_out_end > prev_frames - prev_start", "false"),
-    )
-    for harness, original, broken in mutations:
-        assert original_source.count(original) == 1, f"{harness}: mutation no longer matches"
+        ("plan_all_u32", "plan_all_u32", geometry,
+         (("let skip = i.saturating_sub(m)", "let skip = i"),)),
+        ("trigger_all_u32", "trigger_all_u32", geometry,
+         (("saturating_add(OUTRO_LEAD_BARS)", "saturating_add(0)"),)),
+        ("frame_admission_all_u64", "frame_admission_all_u64", geometry,
+         (("fade_out_end > prev_frames - prev_start", "false"),)),
+    ) + tuple((label, harness, navigation, edits) for label, harness, edits, _ in NAVIGATION_MUTATIONS)
+    for label, harness, source_name, edits in mutations:
+        text = Path(source_name).read_text()
+        for original, broken in edits:
+            assert text.count(original) == 1, f"{label}: mutation no longer matches"
+            text = text.replace(original, broken)
         with tempfile.TemporaryDirectory(prefix="transition-sensitivity-") as temporary:
             tree = Path(temporary)
-            (tree / "verification").mkdir()
-            (tree / "funkot-core/src").mkdir(parents=True)
-            (tree / "verification/transition_geometry.rs").write_bytes(
-                Path("verification/transition_geometry.rs").read_bytes())
-            (tree / source).write_text(original_source.replace(original, broken))
-            mutation_json = result / f"{harness}-sensitivity.json"
+            for name in ("verification/transition_geometry.rs", "verification/manual_navigation.rs",
+                         geometry, navigation):
+                target = tree / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(Path(name).read_bytes())
+            (tree / source_name).write_text(text)
+            mutation_json = result / f"{label}-sensitivity.json"
             mutation_json.unlink(missing_ok=True)
             mutation_command = ["kani", "verification/transition_geometry.rs", "--harness", harness,
                                 "--target-dir", str(tree / "target"), "-j", "1",
                                 "--output-format", "terse", "-Z", "unstable-options",
                                 "--export-json", str(mutation_json)]
-            with (result / f"{harness}-sensitivity.log").open("w") as log:
+            with (result / f"{label}-sensitivity.log").open("w") as log:
                 process = subprocess.Popen(mutation_command, cwd=tree, stdout=log,
                                            stderr=subprocess.STDOUT, start_new_session=True)
                 try:
@@ -103,8 +116,9 @@ try:
             assert checks[0]["status"] == "Failure"
             assert any(c["status"] == "Failure" and c["category"] == "assertion"
                        for c in checks[0]["checks"]), f"{harness}: no safety counterexample"
-            summary["sensitivity"][harness] = "EXPECTED_FAIL"
-    assert hashlib.sha256(source.read_bytes()).hexdigest() == summary["sources"][str(source)]
+            summary["sensitivity"][label] = "EXPECTED_FAIL"
+    assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest
+               for name, digest in summary["sources"].items())
     summary.update(status="PASS", tools=data["tools"], harnesses=EXPECTED)
 except (AssertionError, KeyError, ValueError, TypeError, IndexError, OSError) as error:
     summary["error"] = str(error)

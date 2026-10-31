@@ -143,6 +143,7 @@ sys.exit(23)
                 program = """import pathlib,runpy,sys
 from unittest.mock import patch
 real_path=pathlib.Path
+sys.path.insert(0, str(real_path(sys.argv[1]).parent))
 with patch('pathlib.Path', side_effect=lambda p: real_path(sys.argv[2]) if p == '/results' else real_path(p)):
     runpy.run_path(sys.argv[1], run_name='__main__')
 """
@@ -180,6 +181,7 @@ with patch('pathlib.Path', side_effect=lambda p: real_path(sys.argv[2]) if p == 
                 program = """import json,pathlib,runpy,sys
 from unittest.mock import patch
 real_path=pathlib.Path
+sys.path.insert(0, str(real_path(sys.argv[1]).parent))
 out=real_path(sys.argv[2])
 def resolve(p):
     if p == '/results': return out

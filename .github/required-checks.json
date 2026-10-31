@@ -1,6 +1,22 @@
 [
-  {"app": "github-actions", "name": "test (linux)"},
-  {"app": "github-actions", "name": "cache and WAV ownership tests (windows)"},
-  {"app": "github-actions", "name": "dependency policy"},
-  {"app": "github-actions", "name": "Transition geometry proof"}
+  {
+    "app": "github-actions",
+    "name": "test (linux)"
+  },
+  {
+    "app": "github-actions",
+    "name": "cache and WAV ownership tests (windows)"
+  },
+  {
+    "app": "github-actions",
+    "name": "dependency policy"
+  },
+  {
+    "app": "github-actions",
+    "name": "Transition geometry proof"
+  },
+  {
+    "app": "github-actions",
+    "name": "Manual navigation model"
+  }
 ]
