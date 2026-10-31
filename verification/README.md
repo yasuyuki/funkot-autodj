@@ -193,14 +193,25 @@ in player #112; first-live lifecycle is covered below.
 ## First-live lifecycle
 
 The existing Kani entry also imports `funkot-core/src/first_live.rs` directly.
-Its three harnesses quantify independent boolean facts and both `FailedPermit`
-variants, with 6, 8 and 2 reachable covers. Upgrade admission requires the same
+Its four harnesses quantify independent boolean facts, both `FailedPermit`
+variants and every `usize` remaining-output count, with 6, 8, 2 and 4 reachable
+covers. Upgrade admission requires the same
 occurrence, an unfailed non-head preview, and a full incoming buffer. Repeated
 full messages cannot replace already adopted PCM or restart its fade. Wait
 classification ends a terminal preview at EOF, keeps head-only outside upgrade
 wait, and never selects sleeping polling for realtime or scheduled replay.
 Stopped/finished engines select no wait. The permit predicate returns a slot
 only when no Ready previously transferred it to a preview.
+
+`waiting_output_frames` proves that unfinished rendering writes every remaining
+frame, and writes zero only if finished or no frames remain. A valid nonempty
+request inside the Engine loop has positive remaining frames. Ending a deck is
+not the same as ending playback: while a live loader prepares its successor,
+the output remains a positive silence chunk. Native tests preserve an audible
+prefix across a mid-chunk EOF, advance render_frame for the whole chunk, reach
+a delayed Ready, and return zero only after real Exhausted completion. A final
+partial chunk can be positive even when it finishes playback; no converse
+finished-implies-zero claim is made.
 
 Path/index comparisons, Weak PCM identity, receiver ownership and failure-stage
 construction are Engine/loader adapters. Kani does not prove those facts were
@@ -298,7 +309,7 @@ explicit stutter actions. TLC deadlock checking stays enabled elsewhere.
 | `Consume` Ready / `Revoke` | `drain_loader`, `take_next`, `revoke_next`: queued buffer ownership and one return on revocation. |
 | `Consume` Failed | Failure-stage permit decision and Weak terminal identity; final failure must not return a transferred slot. |
 | `ApplyUpgrade` | `upgrade_allowed`, `apply_upgrade`, `apply_queued_first_live_upgrade`: occurrence, stage and terminal guards before any PCM/fade mutation. |
-| `Render` | `preview_wait`, `await_preview_upgrade`, `tick_head_only`, `render_one_frame`: realtime yield, offline poll, terminal EOF and natural advance. |
+| `Render` | `preview_wait`, `await_preview_upgrade`, `tick_head_only`, `render_one_frame`: realtime yield, offline poll, terminal EOF and natural advance. `waiting_output_frames` plus native render regressions refine empty unfinished output to positive silence; this is an abstract stutter, preserving the caller’s continuation assumption. |
 | `JumpForward`, `JumpPrevious` | Accepted navigation ownership projection through next/history. Planner timing and transition DSP stay in their existing checks. |
 | `BeginFuture`, `AbortFuture`, `CommitFuture` | Existing future fence and receiver/pool replacement. Retained terminal history belongs to its buffer, not the new receiver. |
 | `Stop`, `Resume` | Terminal stop versus resumable natural finish. |
@@ -320,6 +331,10 @@ BeforeReady Failed and premature Exhausted. Their counterexamples describe
 unsupported channel inputs, not product traces: the real worker has one sender
 and a reliable FIFO. They must remain distinct from the passing legal model and
 Upgrade robustness check.
+The waiting-output mutation returns a premature zero and must fail the new
+all-usize Kani assertion and its actual Engine caller-boundary test. The TLA
+NoPrematureFinish observer checks internal finished, so it did not detect this
+public return-value mismatch; the Kani/native refinement closes that gap.
 Compilation errors, zero selected tests, solver/tool failures and timeouts are
 not accepted counterexamples.
 

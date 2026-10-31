@@ -1,4 +1,7 @@
 FIRST_LIVE_MUTATIONS = (
+    ("first_live_wait_output", "first_live_proofs::waiting_output_all_usize",
+     (("if finished { 0 } else { remaining }", "0"),),
+     "terminal_preview_eof_keeps_live_loader_render_contract_until_later_ready"),
     ("first_live_occurrence", "first_live_proofs::upgrade_admission_all_facts",
      (("same_occurrence && target_preview", "true && target_preview"),),
      "upgrade_ignores_wrong_occurrence_identity"),

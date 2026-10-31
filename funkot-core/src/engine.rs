@@ -5406,49 +5406,63 @@ mod tests {
     #[test]
     fn terminal_preview_eof_keeps_live_loader_render_contract_until_later_ready() {
         for realtime in [false, true] {
-            let mut preview = upgrade_test_track("terminal-gap-preview.wav", 2, 0.25, 1.0, true);
-            preview.playlist_index = 7;
-            let mut later = upgrade_test_track("terminal-gap-later.wav", 8, 0.5, 1.0, false);
-            later.playlist_index = 8;
-            let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
-            engine.set_realtime(realtime);
-            let (messages, receiver) = mpsc::sync_channel(2);
-            engine.loader_rx = receiver;
-            engine.loader_exhausted = false;
+            for initial_frames in [2usize, 4] {
+                let mut preview = upgrade_test_track("terminal-gap-preview.wav", 2, 0.25, 1.0, true);
+                preview.playlist_index = 7;
+                let mut later = upgrade_test_track("terminal-gap-later.wav", 8, 0.5, 1.0, false);
+                later.playlist_index = 8;
+                let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
+                engine.set_realtime(realtime);
+                let (messages, receiver) = mpsc::sync_channel(2);
+                engine.loader_rx = receiver;
+                engine.loader_exhausted = false;
 
-            messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
-            messages.send(LoaderMsg::Failed {
-                index: preview.playlist_index,
-                path: preview.path.clone(),
-                message: "final stretch failed".into(),
-                attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
-            }).unwrap();
-            assert!(engine.poll_events().iter().any(|event| matches!(
-                event,
-                EngineEvent::TrackFailed { index, path, .. }
-                    if *index == preview.playlist_index && path == &preview.path
-            )));
+                messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
+                messages.send(LoaderMsg::Failed {
+                    index: preview.playlist_index,
+                    path: preview.path.clone(),
+                    message: "final stretch failed".into(),
+                    attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+                })
+                    .unwrap();
+                assert!(engine.poll_events().iter().any(|event| matches!(
+                    event,
+                    EngineEvent::TrackFailed { index, path, .. }
+                        if *index == preview.playlist_index && path == &preview.path
+                )));
 
-            let mut audible = [0.0; 4];
-            assert_eq!(engine.render(&mut audible), 2);
-            assert_eq!(audible, [0.25; 4]);
+                let before_initial_frame = engine.render_frame();
+                let mut initial = vec![1.0; initial_frames * 2];
+                assert_eq!(engine.render(&mut initial), initial_frames);
+                assert_eq!(&initial[..4], &[0.25; 4]);
+                assert!(initial[4..].iter().all(|sample| *sample == 0.0));
+                assert!(!engine.is_finished());
+                assert_eq!(engine.render_frame(), before_initial_frame + initial_frames as u64);
 
-            let before_gap_frame = engine.render_frame();
-            let mut gap = [1.0; 4];
-            assert_eq!(
-                engine.render(&mut gap),
-                2,
-                "a live source must honor the full render request after terminal preview EOF (realtime={realtime})",
-            );
-            assert_eq!(gap, [0.0; 4]);
-            assert!(!engine.is_finished());
-            assert_eq!(engine.render_frame(), before_gap_frame + 2);
+                let before_gap_frame = engine.render_frame();
+                let mut gap = [1.0; 4];
+                assert_eq!(
+                    engine.render(&mut gap),
+                    2,
+                    "a live source must honor the full render request after terminal preview EOF (realtime={realtime}, initial_frames={initial_frames})",
+                );
+                assert_eq!(gap, [0.0; 4]);
+                assert!(!engine.is_finished());
+                assert_eq!(engine.render_frame(), before_gap_frame + 2);
 
-            messages.send(LoaderMsg::Ready(later.clone(), None)).unwrap();
-            let mut resumed = [0.0; 4];
-            assert_eq!(engine.render(&mut resumed), 2);
-            assert_eq!(engine.current_index(), Some(later.playlist_index));
-            assert!(resumed.iter().any(|sample| *sample != 0.0));
+                messages.send(LoaderMsg::Ready(later.clone(), None)).unwrap();
+                let mut resumed = [0.0; 4];
+                assert_eq!(engine.render(&mut resumed), 2);
+                assert_eq!(engine.current_index(), Some(later.playlist_index));
+                assert!(resumed.iter().any(|sample| *sample != 0.0));
+
+                messages.send(LoaderMsg::Exhausted).unwrap();
+                let mut tail = [1.0; 32];
+                let tail_frames = engine.render(&mut tail);
+                assert!(tail_frames > 0 && tail_frames < 16);
+                assert!(engine.is_finished());
+                assert_eq!(engine.render(&mut [1.0; 2]), 0);
+            }
         }
     }
 

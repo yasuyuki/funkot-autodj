@@ -16,7 +16,8 @@ EXPECTED = {"plan_all_u32": 4, "trigger_all_u32": 5, "frame_admission_all_u64": 
             "manual_navigation_proofs::tick_decision_all_facts": 10,
             "first_live_proofs::upgrade_admission_all_facts": 6,
             "first_live_proofs::preview_wait_all_facts": 8,
-            "first_live_proofs::failure_permit_transfer_all_variants": 2}
+            "first_live_proofs::failure_permit_transfer_all_variants": 2,
+            "first_live_proofs::waiting_output_all_usize": 4}
 started = time.monotonic()
 result = Path("/results")
 revision = os.environ.get("SOURCE_REVISION", "")

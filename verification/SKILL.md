@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`58e64d096dce4915379ec666a01aac579585af87`. This is an audit anchor, not a pin.
+`47bc56bb2860ac8cd98ba3884c1df601723156ce`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
@@ -147,9 +147,9 @@ Inspect `prepare_first_live`, `loader_main_mode`, `send_msg`, `drain_loader`,
 `apply_upgrade`, `apply_queued_first_live_upgrade`, `await_preview_upgrade`,
 `revoke_next`, `start_first`, `push_history`, `retire_active`, accepted Prev,
 and future receiver exchange. The private `first_live.rs` predicates are
-imported directly by the existing Kani entry. Its three harnesses cover Upgrade
-admission, wait classification and failed-attempt permit transfer, with 6, 8
-and 2 reachable covers. Caller path/index, Weak PCM identity and failure-stage
+imported directly by the existing Kani entry. Its four harnesses cover Upgrade
+admission, wait classification, failed-attempt permit transfer and unfinished
+output counts, with 6, 8, 2 and 4 reachable covers. Caller path/index, Weak PCM identity and failure-stage
 facts remain native adapters.
 
 Ready transfers one preparation slot to its buffer. Upgrade owns no extra slot.
@@ -168,6 +168,18 @@ preserves the audible preview tail, then ends that deck at EOF without waiting
 for global Exhausted. Realtime and staged replay never select sleeping polling.
 Stop remains terminal; offline polling holds an exclusive Engine borrow and
 cannot assume a concurrently callable stop method.
+
+Ending a deck does not end playback while a live source prepares its successor.
+`waiting_output_frames` checks every `usize` remaining count: an unfinished
+render writes all remaining frames, and zero is allowed only when finished or
+nothing remains. Native regressions check a positive silent result and matching
+render_frame advance at EOF, preserved PCM prefix for mid-chunk EOF, delayed
+Ready recovery, and true final partial/zero output. Preserve the valid nonempty
+buffer precondition. A final partial chunk can be positive even when finished;
+do not claim the reverse implication for the whole render method.
+The finite model observes internal finished, not the public return count. This
+Kani/native adapter keeps a zero-terminating caller from abandoning its fair
+render/drain continuation. A premature-zero mutation must fail both checks.
 
 Use the existing TLC entry with a separate profile:
 

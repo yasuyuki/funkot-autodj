@@ -1,7 +1,7 @@
 #[path = "../funkot-core/src/first_live.rs"]
 mod first_live;
 
-use self::first_live::{upgrade_allowed, preview_wait, PreviewWait, FailedPermit, release_failed_permit};
+use self::first_live::{upgrade_allowed, preview_wait, PreviewWait, FailedPermit, release_failed_permit, waiting_output_frames};
 
 #[kani::proof]
 fn upgrade_admission_all_facts() {
@@ -76,4 +76,20 @@ fn failure_permit_transfer_all_variants() {
     assert_eq!(release, !transferred);
     kani::cover!(release);
     kani::cover!(!release);
+}
+
+#[kani::proof]
+fn waiting_output_all_usize() {
+    let remaining: usize = kani::any();
+    let finished: bool = kani::any();
+    let written = waiting_output_frames(remaining, finished);
+    assert!(written <= remaining);
+    assert_eq!(written == 0, finished || remaining == 0);
+    if !finished {
+        assert_eq!(written, remaining);
+    }
+    kani::cover!(finished && remaining > 0 && written == 0);
+    kani::cover!(!finished && remaining == 0 && written == 0);
+    kani::cover!(!finished && remaining > 0 && written > 0);
+    kani::cover!(!finished && remaining == usize::MAX && written == usize::MAX);
 }
