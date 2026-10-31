@@ -5060,6 +5060,95 @@ mod tests {
     }
 
     #[test]
+    fn realtime_final_failure_of_first_preview_does_not_release_its_active_permit() {
+        let mut preview = upgrade_test_track("first-preview-permit.wav", 3, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(
+            EngineOptions::default(),
+            vec![preview.clone()],
+        ).unwrap();
+        engine.set_realtime(true);
+
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+        let (permits, permit_receiver) = mpsc::sync_channel(1);
+        engine.permit_tx = permits;
+
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+        }).unwrap();
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+
+        assert!(permit_receiver.try_recv().is_err(),
+            "the failed full stretch shares the active preview permit");
+        assert!(engine.poll_events().iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackFailed { index, path, .. }
+                if *index == preview.playlist_index && path == &preview.path
+        )));
+    }
+
+    #[test]
+    fn realtime_final_failure_of_first_preview_advances_to_later_ready_head() {
+        let mut preview = upgrade_test_track("first-preview-eof.wav", 3, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut future = upgrade_test_track("later-ready.wav", 8, 0.5, 1.0, false);
+        future.playlist_index = 8;
+        let mut engine = Engine::from_prepared(
+            EngineOptions::default(),
+            vec![preview.clone()],
+        ).unwrap();
+        engine.set_realtime(true);
+
+        // The channel stays connected and delivers the producer order:
+        // final failure for this preview, followed by a different Ready.
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+
+        let mut first = [0.0; 2];
+        assert_eq!(engine.render(&mut first), 1);
+        assert_eq!(first, [0.25; 2]);
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+        }).unwrap();
+
+        let mut middle = [0.0; 2];
+        assert_eq!(engine.render(&mut middle), 1);
+        assert_eq!(middle, [0.25; 2]);
+        messages.send(LoaderMsg::Ready(future.clone(), None)).unwrap();
+
+        let mut tail = [0.0; 2];
+        assert_eq!(engine.render(&mut tail), 1);
+        assert_eq!(tail, [0.25; 2],
+            "the admitted preview remains audible through EOF");
+
+        let mut after_preview = [0.0; 2];
+        assert_eq!(engine.render(&mut after_preview), 1);
+        assert_eq!(after_preview, [0.5; 2],
+            "preview EOF advances to the later Ready without waiting for a disconnected loader");
+        assert_eq!(engine.current_index(), Some(future.playlist_index));
+        assert!(!engine.loader_exhausted, "the later Ready leaves the loader connection live");
+        let events = engine.poll_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackFailed { index, path, .. }
+                if *index == preview.playlist_index && path == &preview.path
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackStarted { index, path, .. }
+                if *index == future.playlist_index && path == &future.path
+        )));
+    }
+
+    #[test]
     fn render_diagnostics_counts_realtime_preview_wait_frames_until_upgrade() {
         let preview = upgrade_test_track("preview.wav", 2, 0.25, 1.0, true);
         let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview]).unwrap();
