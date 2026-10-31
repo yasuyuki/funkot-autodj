@@ -2465,7 +2465,10 @@ impl Engine {
                 plan.simple,
             )
         };
-        let Some(admission) = admission else { return };
+        let Some(admission) = admission else {
+            self.cancel_pending_nav();
+            return;
+        };
         let action = plan.key.action;
         let target = match action {
             NavAction::RestartCurrent => match self.active.as_ref() { Some(d) => d.track.clone(), None => return },
