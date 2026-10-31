@@ -106,7 +106,7 @@ try:
             summary["sensitivity"][harness] = "EXPECTED_FAIL"
     assert hashlib.sha256(source.read_bytes()).hexdigest() == summary["sources"][str(source)]
     summary.update(status="PASS", tools=data["tools"], harnesses=EXPECTED)
-except (AssertionError, KeyError, ValueError, OSError) as error:
+except (AssertionError, KeyError, ValueError, TypeError, IndexError, OSError) as error:
     summary["error"] = str(error)
     print((result / "kani.log").read_text())
 summary.update(wall_seconds=round(time.monotonic() - started, 3),
