@@ -9,6 +9,10 @@ if (( $# > 1 )); then echo "usage: $0 [--setup | evidence-directory]" >&2; exit 
 out=${1:-$(mktemp -d "${TMPDIR:-/tmp}/transition-geometry.XXXXXXXX")}
 mkdir -p -- "$out"
 out=$(cd -- "$out" && pwd)
+if [[ -n $(find "$out" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+    echo "Evidence directory is not empty; existing evidence is unchanged and no proof ran." >&2
+    exit 2
+fi
 echo "Evidence: $out"
 reason="verification did not complete"
 write_failure() {
@@ -37,8 +41,6 @@ dirty=$(git -C "$root" status --porcelain --untracked-files=normal)
 reason="source checkout is dirty; commit or remove owned changes before verification"
 [[ -z $dirty ]]
 reason="source archive or verifier failed; inspect kani.log when present"
-# The archive binds every executed source file to the resolved commit, even if
-# another process changes the checkout after the clean-state check.
 git -C "$root" archive --format=tar "$revision" |
     docker run --rm -i --memory=8g --memory-swap=8g \
         -e SOURCE_REVISION="$revision" -v "$out:/results" "$image" \

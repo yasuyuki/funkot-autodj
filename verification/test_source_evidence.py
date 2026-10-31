@@ -1,4 +1,3 @@
-"""Exercise the public runner with real Git clones and linked worktrees."""
 import io
 import json
 import os
@@ -59,7 +58,9 @@ sys.exit(23)
     def run_entry(self, checkout):
         evidence = self.base / "evidence"
         evidence.mkdir(exist_ok=True)
-        (evidence / "summary.json").write_text('{"status":"PASS","revision":"stale"}')
+        previous = evidence / "summary.json"
+        if previous.exists():
+            previous.unlink()
         result = subprocess.run(["bash", str(checkout / "scripts/check-transition-geometry.sh"),
                                  str(evidence)], env=self.env, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
@@ -152,3 +153,50 @@ with patch('pathlib.Path', side_effect=lambda p: real_path(sys.argv[2]) if p == 
                 self.assertEqual(summary["status"], "FAIL")
                 self.assertIn("revision", summary["error"])
                 self.assertFalse((target / "kani.log").exists())
+
+    def test_reused_evidence_is_refused_without_destroying_previous_results(self):
+        evidence = self.base / "evidence"
+        evidence.mkdir()
+        for name in ("summary.json", "kani.json", "plan_all_u32-sensitivity.json", "kani.log"):
+            (evidence / name).write_text("previous proof evidence")
+        result = subprocess.run(["bash", str(self.repo / "scripts/check-transition-geometry.sh"),
+                                 str(evidence)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no proof ran", result.stderr)
+        self.assertFalse((self.base / "archive").exists())
+        for path in evidence.iterdir():
+            self.assertEqual(path.read_text(), "previous proof evidence")
+
+    def test_wrong_shaped_kani_json_records_a_validation_failure(self):
+        tools = {"kani": "0.68.0", "rustc": "rustc 1.100.0-nightly (8925ea358 2026-08-20)",
+                 "cbmc": "6.11.0 (cbmc-6.11.0)"}
+        for payload in ({"tools": []}, {"tools": tools, "verification_results": []}):
+            with self.subTest(payload=payload):
+                target = self.base / "shape-result"
+                target.mkdir(exist_ok=True)
+                (target / "memory.max").write_text(str(8 * 1024**3))
+                (target / "memory.peak").write_text("1")
+                env = dict(self.env, SOURCE_REVISION="a" * 40)
+                program = """import json,pathlib,runpy,sys
+from unittest.mock import patch
+real_path=pathlib.Path
+out=real_path(sys.argv[2])
+def resolve(p):
+    if p == '/results': return out
+    if str(p).startswith('/sys/fs/cgroup/'): return out / str(p).split('/')[-1]
+    return real_path(p)
+class Process:
+    def __init__(self,*args,**kwargs):
+        (out / 'kani.json').write_text(sys.argv[3])
+    def wait(self,**kwargs): return 0
+with patch('pathlib.Path', side_effect=resolve), patch('subprocess.Popen', Process):
+    runpy.run_path(sys.argv[1], run_name='__main__')
+"""
+                result = subprocess.run(["python3", "-c", program, str(ROOT / "verification/check.py"),
+                                         str(target), json.dumps(payload)], cwd=ROOT, env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                summary = json.loads((target / "summary.json").read_text())
+                self.assertEqual(summary["status"], "FAIL")
+                self.assertTrue(summary["error"])

@@ -17,7 +17,8 @@ and 8-GiB cgroup limit without extra swap. `summary.json` retains elapsed time,
 peak memory, revision and source hashes. `kani.json` retains individual checks.
 The runner requires a readable Git checkout with a valid HEAD commit and no
 tracked or nonignored untracked changes. This applies to clones and linked
-worktrees. Keep evidence outside the checkout or in an ignored directory.
+worktrees. Use a new or empty evidence directory outside the checkout or in an
+ignored directory. A nonempty directory is refused without changing prior results.
 It streams `git archive` of that commit into the verifier. Git metadata is not
 needed inside Docker, and later checkout edits cannot change the proof source.
 An unavailable revision, invalid revision or dirty checkout writes a FAIL summary
