@@ -7202,13 +7202,17 @@ mod tests {
     #[test]
     fn target_replacement_revocation_and_stop_invalidate_accepted_plan() {
         let mut engine = phase_test_engine(true, 8, 44_100);
+        engine.next_track.as_mut().unwrap().preview = true;
         let now = engine.active.as_ref().unwrap().playhead;
         engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
             &engine, NavAction::TransitionToNext, now + 4, 7)));
         let before = engine.nav_gen;
         let mut replacement = engine.next_track.as_ref().unwrap().clone();
         replacement.samples = Arc::new(vec![0.1; replacement.samples.len()]);
+        replacement.preview = false;
+        let replacement_pcm = replacement.samples.clone();
         engine.apply_upgrade(replacement, None);
+        assert!(Arc::ptr_eq(&engine.next_track.as_ref().unwrap().samples, &replacement_pcm));
         assert!(engine.pending_nav.is_none());
         assert_ne!(engine.nav_gen, before);
 
