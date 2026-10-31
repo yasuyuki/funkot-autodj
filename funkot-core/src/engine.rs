@@ -6653,6 +6653,8 @@ mod tests {
     #[test]
     fn rejected_manual_reply_invalidates_a_delayed_duplicate() {
         let mut engine = phase_test_engine(true, 8, 44_100);
+        let active = engine.active.as_mut().expect("active");
+        active.track.outro_start_out = active.track.frames - 1;
         let (work_tx, _work_rx) = mpsc::sync_channel(1);
         let (reply_tx, reply_rx) = mpsc::sync_channel(2);
         engine.manual_tx = work_tx;
@@ -6675,6 +6677,8 @@ mod tests {
         assert_eq!(engine.next_track_path().map(Path::to_path_buf), before_next);
 
         engine.render(&mut [0.0; 2]);
+        assert!(engine.transition.is_none(), "fixture must remain before automatic transition");
+        assert_eq!(engine.current_index(), before_index);
         reply_tx.send(invalid).expect("delayed duplicate");
         engine.poll_nav_tempo();
         engine.tick_pending_nav();
