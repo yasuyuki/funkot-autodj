@@ -5239,13 +5239,23 @@ mod tests {
 
     #[test]
     fn recorded_first_live_recreates_the_actual_production_buffers() {
-        for (name, bars, has_preview) in [("staged", 8, true), ("single", 4, false)] {
+        for (name, bars, has_preview) in [("staged", 8, true), ("cached-single", 4, false)] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join(format!("{name}.wav"));
             let buffer = crate::testutil::synth_track(180.0, bars, bars, bars, 8_000);
             crate::testutil::write_wav(&path, &buffer).unwrap();
             let options = EngineOptions { output_sample_rate: 8_000, rate: 1.07,
                 cache_dir: directory.path().join("cache"), loop_playlist: false, ..EngineOptions::default() };
+            if !has_preview {
+                let decoded = decode::decode_file(&path).unwrap();
+                let mut labels = cache::provisional(&decoded, "cached-single.wav");
+                labels.needs_reanalysis = false;
+                labels.intro_bars_manual = true;
+                labels.outro_bars_manual = true;
+                labels.intro_bpm = 179.993_761_483_271_03;
+                labels.gain_db = -0.003_762_913_499_987_125;
+                cache::store(&options.cache_dir, &cache::content_hash(&path).unwrap(), &labels).unwrap();
+            }
             let (sender, receiver) = mpsc::sync_channel(2);
             assert!(prepare_first_live(&options, &path, 0, &sender, &AtomicBool::new(false)));
             let (initial, full, provenance) = match receiver.try_recv().unwrap() {
