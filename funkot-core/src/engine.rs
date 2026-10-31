@@ -23,6 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
+use sha2::{Digest, Sha256};
 
 use crate::analysis::{local_grid_continuous, local_sync_span, refine_groove_phase};
 use crate::filter::StereoHighPass;
@@ -64,6 +65,8 @@ pub struct PreviewUpgrade {
     pub playlist_index: usize,
     pub playhead: u64,
     pub preview_frames: u64,
+    pub render_frame: u64,
+    pub evidence: Option<FirstLiveReplayEvidence>,
 }
 
 /// Cumulative per-engine diagnostics for first-track preview rendering.
@@ -104,6 +107,130 @@ pub struct PreparedTrack {
     /// Labeling mode: only `first_downbeat..+head_secs` was decoded/stretched.
     /// Implies `preview == true`; never receives an Upgrade.
     pub head_only: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FirstLiveReplayEvidence {
+    pub playlist_index: usize,
+    pub build_revision: [u8; 20],
+    pub decoded_input_sha256: [u8; 32],
+    pub preview_prepared_sha256: [u8; 32],
+    pub full_prepared_sha256: [u8; 32],
+    pub preparation_sha256: [u8; 32],
+    pub preview_used_provisional: bool,
+}
+
+impl FirstLiveReplayEvidence {
+    pub fn is_comparable(&self) -> bool { self.build_revision != [0; 20] }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FirstLiveReplaySchedule {
+    pub ready_at_render_frame: u64,
+    pub upgrade_at_render_frame: Option<u64>,
+    pub upgrade_adoption: Option<FirstLiveReplayUpgradeAdoption>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FirstLiveReplayUpgradeAdoption {
+    Queued,
+    Active,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FirstLivePreparation {
+    intro_bpm_bits: [u8; 8],
+    first_downbeat: u64,
+    outro_start: u64,
+    intro_bars: u32,
+    outro_bars: u32,
+    gain_db_bits: [u8; 8],
+}
+
+impl FirstLivePreparation {
+    fn from_analysis(analysis: &crate::TrackAnalysis) -> Self {
+        Self { intro_bpm_bits: analysis.intro_bpm.to_bits().to_le_bytes(), first_downbeat: analysis.first_downbeat,
+            outro_start: analysis.outro_start, intro_bars: analysis.intro_bars, outro_bars: analysis.outro_bars,
+            gain_db_bits: analysis.gain_db.to_bits().to_le_bytes() }
+    }
+    fn intro_bpm(&self) -> f64 { f64::from_bits(u64::from_le_bytes(self.intro_bpm_bits)) }
+    fn gain_db(&self) -> f64 { f64::from_bits(u64::from_le_bytes(self.gain_db_bits)) }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FirstLiveReplayRecipe {
+    occurrence_index: usize,
+    decoded_input_sha256: [u8; 32],
+    input_sample_rate: u32,
+    input_frames: u64,
+    preview: FirstLivePreparation,
+    full: FirstLivePreparation,
+    has_preview: bool,
+    preview_used_provisional: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct FirstLiveReplayRecipeWire {
+    occurrence_index: usize,
+    decoded_input_sha256: [u8; 32],
+    input_sample_rate: u32,
+    input_frames: u64,
+    preview: FirstLivePreparation,
+    full: FirstLivePreparation,
+    has_preview: bool,
+    preview_used_provisional: bool,
+}
+
+impl FirstLiveReplayRecipe {
+    /// Whether production emitted a separate head preview before the full track.
+    pub fn has_preview(&self) -> bool { self.has_preview }
+
+    pub fn from_recorded_json(json: &[u8]) -> Result<Self> {
+        let wire: FirstLiveReplayRecipeWire = serde_json::from_slice(json)
+            .map_err(|e| Error::Engine(format!("invalid first-live recipe: {e}")))?;
+        let recipe = Self { occurrence_index: wire.occurrence_index, decoded_input_sha256: wire.decoded_input_sha256,
+            input_sample_rate: wire.input_sample_rate, input_frames: wire.input_frames,
+            preview: wire.preview, full: wire.full, has_preview: wire.has_preview,
+            preview_used_provisional: wire.preview_used_provisional };
+        recipe.validate()?;
+        Ok(recipe)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.input_sample_rate == 0 || self.input_frames == 0 {
+            return Err(Error::Engine("invalid first-live recipe input geometry".into()));
+        }
+        for snapshot in [&self.preview, &self.full] {
+            if !snapshot.intro_bpm().is_finite() || snapshot.intro_bpm() <= 0.0
+                || !snapshot.gain_db().is_finite() {
+                return Err(Error::Engine("invalid first-live recipe analysis".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct PreparedFirstLive {
+    initial: PreparedTrack,
+    full: Option<PreparedTrack>,
+    evidence: FirstLiveReplayEvidence,
+    recipe: Arc<FirstLiveReplayRecipe>,
+}
+
+/// Atomic producer-completed observation for capture writers.
+#[derive(Clone)]
+pub struct FirstLiveReplayObservation {
+    pub ready_at_render_frame: u64,
+    pub evidence: FirstLiveReplayEvidence,
+    pub recipe: Arc<FirstLiveReplayRecipe>,
+    /// Actual adoption before first playback, if the full buffer replaced a
+    /// queued preview. Active adoption is reported by `PreviewUpgrade`.
+    pub queued_upgrade_at_render_frame: Option<u64>,
+}
+
+struct FirstLiveProvenance {
+    evidence: FirstLiveReplayEvidence,
+    recipe: Arc<FirstLiveReplayRecipe>,
 }
 
 pub use crate::transition_geometry::{plan_transition, TransitionPlan};
@@ -621,9 +748,9 @@ fn energy_xcorr_at_win(a: &[f64], b: &[f64], lag: i64, win: usize) -> f64 {
 }
 
 enum LoaderMsg {
-    Ready(PreparedTrack),
+    Ready(PreparedTrack, Option<FirstLiveProvenance>),
     /// Replace the playing (or queued) first-track preview with the full stretch.
-    Upgrade(PreparedTrack),
+    Upgrade(PreparedTrack, Option<FirstLiveProvenance>),
     Failed {
         index: usize,
         path: PathBuf,
@@ -1250,6 +1377,15 @@ pub struct Engine {
     /// this false via [`Self::set_realtime`] so the audio callback never sleeps.
     block_on_preview_upgrade: bool,
     render_diagnostics: RenderDiagnostics,
+    first_live_ready_frame: Option<u64>,
+    first_live_evidence: Option<FirstLiveReplayEvidence>,
+    first_live_recipe: Option<Arc<FirstLiveReplayRecipe>>,
+    pending_first_live_provenance: Option<FirstLiveProvenance>,
+    scheduled_first_live_upgrade: Option<(u64, FirstLiveReplayUpgradeAdoption, PreparedTrack, FirstLiveProvenance)>,
+    replay_initial_track: Option<PreparedTrack>,
+    replay_ready_at: Option<u64>,
+    replay_upgrade_pending: bool,
+    queued_first_live_upgrade_frame: Option<u64>,
     /// Background phase-align result: `(prev_start, next_entry, prev_nudge)`.
     phase_align_ready: Option<(u64, u64, u64)>,
     phase_align_rx: Option<Receiver<(u64, u64, u64)>>,
@@ -1357,6 +1493,15 @@ impl Engine {
             loader_exhausted: false,
             block_on_preview_upgrade: true,
             render_diagnostics: RenderDiagnostics::default(),
+            first_live_ready_frame: None,
+            first_live_evidence: None,
+            first_live_recipe: None,
+            pending_first_live_provenance: None,
+            scheduled_first_live_upgrade: None,
+            replay_initial_track: None,
+            replay_ready_at: None,
+            replay_upgrade_pending: false,
+            queued_first_live_upgrade_frame: None,
             phase_align_ready: None,
             phase_align_rx: None,
             nav_tx,
@@ -1467,6 +1612,15 @@ impl Engine {
             loader_exhausted: rest_empty,
             block_on_preview_upgrade: true,
             render_diagnostics: RenderDiagnostics::default(),
+            first_live_ready_frame: None,
+            first_live_evidence: None,
+            first_live_recipe: None,
+            pending_first_live_provenance: None,
+            scheduled_first_live_upgrade: None,
+            replay_initial_track: None,
+            replay_ready_at: None,
+            replay_upgrade_pending: false,
+            queued_first_live_upgrade_frame: None,
             phase_align_ready: None,
             phase_align_rx: None,
             nav_tx,
@@ -1486,6 +1640,53 @@ impl Engine {
             engine.loader_exhausted = true;
         }
         engine.kick_phase_align_if_needed();
+        Ok(engine)
+    }
+
+    /// Offline replay that preserves the production first-live staging boundary.
+    /// A staged track without an upgrade waits nonblockingly for a full buffer;
+    /// its caller bounds rendering and stops the engine when no upgrade arrives.
+    pub fn from_prepared_first_live(
+        options: EngineOptions,
+        first: PreparedFirstLive,
+        later: Vec<PreparedTrack>,
+        schedule: FirstLiveReplaySchedule,
+    ) -> Result<Self> {
+        match (&first.full, schedule.upgrade_at_render_frame, schedule.upgrade_adoption) {
+            (None, Some(_), _) | (None, None, Some(_)) => return Err(Error::Engine("single first-live preparation cannot schedule an upgrade".into())),
+            (Some(_), Some(frame), Some(FirstLiveReplayUpgradeAdoption::Active)) if frame < schedule.ready_at_render_frame => {
+                return Err(Error::Engine("active first-live upgrade precedes source readiness".into()));
+            }
+            (Some(_), Some(frame), Some(FirstLiveReplayUpgradeAdoption::Queued)) if frame != schedule.ready_at_render_frame => {
+                return Err(Error::Engine("queued first-live upgrade must coincide with source readiness".into()));
+            }
+            (Some(_), Some(_), None) | (Some(_), None, Some(_)) => {
+                return Err(Error::Engine("first-live upgrade frame and adoption mode must both be present".into()));
+            }
+            _ => {}
+        }
+        let mut tracks = Vec::with_capacity(later.len() + 1);
+        tracks.push(first.initial);
+        tracks.extend(later);
+        let mut engine = Self::from_prepared(options, tracks)?;
+        let initial = engine.active.take().expect("first prepared track").track;
+        engine.pending_events.clear();
+        engine.clear_phase_align();
+        engine.replay_initial_track = Some(initial);
+        engine.first_live_ready_frame = None;
+        engine.replay_ready_at = Some(schedule.ready_at_render_frame);
+        engine.block_on_preview_upgrade = false;
+        if let Some(full) = first.full {
+            engine.replay_upgrade_pending = true;
+            if let (Some(frame), Some(adoption)) = (schedule.upgrade_at_render_frame, schedule.upgrade_adoption) {
+                engine.scheduled_first_live_upgrade = Some((frame, adoption, full, FirstLiveProvenance {
+                    evidence: first.evidence, recipe: first.recipe,
+                }));
+            }
+        } else {
+            engine.first_live_evidence = Some(first.evidence);
+            engine.first_live_recipe = Some(first.recipe);
+        }
         Ok(engine)
     }
 
@@ -1598,6 +1799,16 @@ impl Engine {
         self.render_diagnostics
     }
 
+    /// Returns only after the loader has supplied both the recipe and evidence.
+    pub fn first_live_replay_observation(&self) -> Option<FirstLiveReplayObservation> {
+        Some(FirstLiveReplayObservation {
+            ready_at_render_frame: self.first_live_ready_frame?,
+            evidence: self.first_live_evidence?,
+            recipe: self.first_live_recipe.clone()?,
+            queued_upgrade_at_render_frame: self.queued_first_live_upgrade_frame,
+        })
+    }
+
     /// Cumulative output PCM frames returned by [`Self::render`].
     ///
     /// The count advances for silence returned while waiting for preparation or
@@ -1640,6 +1851,24 @@ impl Engine {
 
         if self.stopped || self.finished {
             return 0;
+        }
+
+        if let Some(ready_at) = self.replay_ready_at {
+            if self.render_frame < ready_at {
+                let frames = (ready_at - self.render_frame).min(want_frames as u64) as usize;
+                out[..frames * 2].fill(0.0);
+                self.render_frame = self.render_frame.saturating_add(frames as u64);
+                if frames == want_frames { return frames; }
+                return frames + self.render(&mut out[frames * 2..]);
+            }
+            self.replay_ready_at = None;
+        }
+
+        if self.replay_initial_track.is_some() {
+            self.drain_loader();
+            if let Some(track) = self.replay_initial_track.take() {
+                self.start_first(track);
+            }
         }
 
         self.drain_loader();
@@ -1697,7 +1926,8 @@ impl Engine {
                 break;
             }
 
-            if !self.block_on_preview_upgrade && self.preview_exhausted_awaiting_upgrade() {
+            if (!self.block_on_preview_upgrade || self.replay_upgrade_pending)
+                && self.preview_exhausted_awaiting_upgrade() {
                 self.render_diagnostics.preview_wait_frames = self
                     .render_diagnostics
                     .preview_wait_frames
@@ -2525,9 +2755,22 @@ impl Engine {
 
     fn drain_loader(&mut self) {
         if self.future_fence.is_some() { return; }
+        if self.scheduled_first_live_upgrade.as_ref().is_some_and(|(at, adoption, _, _)| {
+            *at == self.render_frame && (*adoption == FirstLiveReplayUpgradeAdoption::Queued || self.replay_initial_track.is_none())
+        }) {
+            let (_, adoption, track, provenance) = self.scheduled_first_live_upgrade.take().expect("scheduled upgrade");
+            if adoption == FirstLiveReplayUpgradeAdoption::Queued {
+                self.apply_queued_first_live_upgrade(track, provenance);
+            } else {
+                self.apply_upgrade(track, Some(provenance));
+            }
+        }
         loop {
             match self.loader_rx.try_recv() {
-                Ok(LoaderMsg::Ready(track)) => {
+                Ok(LoaderMsg::Ready(track, provenance)) => {
+                    if provenance.is_some() && self.first_live_ready_frame.is_none() {
+                        self.pending_first_live_provenance = provenance;
+                    }
                     if self.next_track.is_none() {
                         self.next_track = Some(track);
                         self.kick_phase_align_if_needed();
@@ -2547,8 +2790,8 @@ impl Engine {
                         retire_prepared(track);
                     }
                 }
-                Ok(LoaderMsg::Upgrade(track)) => {
-                    self.apply_upgrade(track);
+                Ok(LoaderMsg::Upgrade(track, provenance)) => {
+                    self.apply_upgrade(track, provenance);
                 }
                 Ok(LoaderMsg::Failed { index, path, message }) => {
                     self.pending_events
@@ -2569,7 +2812,7 @@ impl Engine {
     }
 
     /// Swap preview samples/markers for the full first track without restarting.
-    fn apply_upgrade(&mut self, track: PreparedTrack) {
+    fn apply_upgrade(&mut self, track: PreparedTrack, provenance: Option<FirstLiveProvenance>) {
         if let Some(deck) = self.active.as_mut() {
             if deck.track.path == track.path && deck.track.playlist_index == track.playlist_index {
                 // A second Upgrade is not normally emitted, but do not leave
@@ -2590,7 +2833,14 @@ impl Engine {
                         playlist_index,
                         playhead: old_playhead,
                         preview_frames,
+                        render_frame: self.render_frame,
+                        evidence: provenance.as_ref().map(|p| p.evidence),
                     });
+                    if let Some(provenance) = provenance {
+                        self.first_live_evidence = Some(provenance.evidence);
+                        self.first_live_recipe = Some(provenance.recipe);
+                    }
+                    self.replay_upgrade_pending = false;
                 }
                 deck.playhead = playhead;
                 deck.upgrade_fade = Some(UpgradeFade { track: old, playhead: old_playhead,
@@ -2604,7 +2854,15 @@ impl Engine {
         }
         if let Some(next) = self.next_track.as_mut() {
             if next.path == track.path && next.playlist_index == track.playlist_index {
+                let queued_preview_upgrade = next.preview && !track.preview;
                 let old = std::mem::replace(next, track);
+                if queued_preview_upgrade {
+                    if let Some(provenance) = provenance {
+                        self.pending_first_live_provenance = Some(provenance);
+                        self.queued_first_live_upgrade_frame = Some(self.render_frame);
+                    }
+                    self.replay_upgrade_pending = false;
+                }
                 retire_prepared(old);
                 self.clear_phase_align();
                 self.cancel_pending_nav();
@@ -2614,6 +2872,23 @@ impl Engine {
         }
         // Else: already left this track; drop upgrade (no permit — same slot).
         retire_prepared(track);
+    }
+
+    fn apply_queued_first_live_upgrade(&mut self, track: PreparedTrack, provenance: FirstLiveProvenance) {
+        let Some(initial) = self.replay_initial_track.as_mut() else {
+            self.apply_upgrade(track, Some(provenance));
+            return;
+        };
+        if initial.path != track.path || initial.playlist_index != track.playlist_index
+            || !initial.preview || track.preview {
+            retire_prepared(track);
+            return;
+        }
+        let old = std::mem::replace(initial, track);
+        retire_prepared(old);
+        self.pending_first_live_provenance = Some(provenance);
+        self.queued_first_live_upgrade_frame = Some(self.render_frame);
+        self.replay_upgrade_pending = false;
     }
 
     /// True when the active deck has consumed its head preview and still needs Upgrade.
@@ -2675,10 +2950,10 @@ impl Engine {
         if !self.preview_exhausted_awaiting_upgrade() {
             return;
         }
-        if !self.block_on_preview_upgrade {
+        if !self.block_on_preview_upgrade || self.replay_upgrade_pending {
             // Realtime: never sleep. If the loader already gave up, end the deck
             // the same way the blocking path does; otherwise silence until Upgrade.
-            if self.loader_exhausted {
+            if self.loader_exhausted && !self.replay_upgrade_pending {
                 self.retire_active();
                 self.drop_prev();
                 if self.ready_ahead() == 0 {
@@ -2716,6 +2991,15 @@ impl Engine {
         self.cancel_pending_nav();
         let path = track.path.clone();
         let index = track.playlist_index;
+        if self.first_live_ready_frame.is_none() {
+            self.first_live_ready_frame = Some(self.render_frame);
+            if let Some(provenance) = self.pending_first_live_provenance.take() {
+                if provenance.evidence.playlist_index == index {
+                    self.first_live_evidence = Some(provenance.evidence);
+                    self.first_live_recipe = Some(provenance.recipe);
+                }
+            }
+        }
         let playhead = track.first_downbeat_out.min(track.frames.saturating_sub(1));
         let filter = StereoHighPass::new(self.options.output_sample_rate, self.options.highpass_hz);
         self.active = Some(Deck {
@@ -3157,7 +3441,7 @@ fn prepared_loader_main(
         if !wait_permit(&permit_rx, &shutdown) {
             return;
         }
-        if !send_msg(&tx, LoaderMsg::Ready(track), &shutdown) {
+        if !send_msg(&tx, LoaderMsg::Ready(track, None), &shutdown) {
             return;
         }
     }
@@ -3280,7 +3564,7 @@ fn loader_main_mode(
         } else {
             match prepare_one(&options, &path, idx, head_secs) {
                 Ok(track) => {
-                    if !send_msg(&tx, LoaderMsg::Ready(track), &shutdown) {
+                    if !send_msg(&tx, LoaderMsg::Ready(track, None), &shutdown) {
                         return;
                     }
                 }
@@ -3370,7 +3654,7 @@ pub fn prepare_track_head_only(
         samples: buffer.samples[start as usize * 2..end as usize * 2].to_vec(),
     };
 
-    let mut head_analysis = analysis.clone();
+    let mut head_analysis = FirstLivePreparation::from_analysis(&analysis);
     head_analysis.first_downbeat = 0;
 
     let track = finish_prepare(options, path, index, head, &head_analysis, true, true)?;
@@ -3407,6 +3691,9 @@ fn prepare_first_live(
             );
         }
     };
+    let decoded_input_sha256 = hash_audio(&buffer);
+    let input_sample_rate = buffer.sample_rate;
+    let input_frames = buffer.frames;
 
     let (analysis, used_provisional) =
         match cache::get_cached_or_provisional(path, &options.cache_dir, &buffer) {
@@ -3423,21 +3710,25 @@ fn prepare_first_live(
                 );
             }
         };
+    let initial_analysis = FirstLivePreparation::from_analysis(&analysis);
 
     // Head preview so audio starts before full Preserve stretch finishes.
     // Preview holds outro at EOF so a provisional mix point cannot fire early.
     let head_frames = ((FIRST_LIVE_HEAD_SECS * f64::from(buffer.sample_rate)).round() as u64)
         .min(buffer.frames)
         .max(1);
-    if head_frames < buffer.frames {
+    let has_preview = head_frames < buffer.frames;
+    let mut preview_prepared_sha256 = None;
+    if has_preview {
         let head = decode::AudioBuffer {
             sample_rate: buffer.sample_rate,
             frames: head_frames,
             samples: buffer.samples[..head_frames as usize * 2].to_vec(),
         };
-        match finish_prepare(options, path, index, head, &analysis, true, false) {
+        match finish_prepare(options, path, index, head, &initial_analysis, true, false) {
             Ok(preview) => {
-                if !send_msg(tx, LoaderMsg::Ready(preview), shutdown) {
+                preview_prepared_sha256 = Some(hash_track(&preview));
+                if !send_msg(tx, LoaderMsg::Ready(preview, None), shutdown) {
                     return false;
                 }
             }
@@ -3481,7 +3772,8 @@ fn prepare_first_live(
     // Read before `finish_prepare` moves `buffer`; used below to pick the
     // final message variant.
     let total_frames = buffer.frames;
-    let full = match finish_prepare(options, path, index, buffer, &analysis, false, false) {
+    let full_analysis = FirstLivePreparation::from_analysis(&analysis);
+    let full = match finish_prepare(options, path, index, buffer, &full_analysis, false, false) {
         Ok(t) => t,
         Err(e) => {
             return send_msg(
@@ -3496,13 +3788,138 @@ fn prepare_first_live(
         }
     };
 
+    let full_prepared_sha256 = hash_track(&full);
+    let recipe = Arc::new(FirstLiveReplayRecipe { occurrence_index: index, decoded_input_sha256, input_sample_rate,
+        input_frames, preview: initial_analysis, full: full_analysis, has_preview, preview_used_provisional: used_provisional });
+    let evidence = FirstLiveReplayEvidence { playlist_index: index, build_revision: build_revision(), decoded_input_sha256,
+        preview_prepared_sha256: preview_prepared_sha256.unwrap_or(full_prepared_sha256), full_prepared_sha256,
+        preparation_sha256: hash_recipe(&recipe), preview_used_provisional: used_provisional };
+    let provenance = FirstLiveProvenance { evidence, recipe };
+
     // Short file: only one Ready (no separate preview). Long file: Upgrade.
     let msg = if head_frames < total_frames {
-        LoaderMsg::Upgrade(full)
+        LoaderMsg::Upgrade(full, Some(provenance))
     } else {
-        LoaderMsg::Ready(full)
+        LoaderMsg::Ready(full, Some(provenance))
     };
     send_msg(tx, msg, shutdown)
+}
+
+fn hash_audio(buffer: &decode::AudioBuffer) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(buffer.sample_rate.to_le_bytes());
+    hash.update(buffer.frames.to_le_bytes());
+    for sample in &buffer.samples { hash.update(sample.to_bits().to_le_bytes()); }
+    hash.finalize().into()
+}
+
+fn hash_track(track: &PreparedTrack) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(track.frames.to_le_bytes());
+    hash.update(track.first_downbeat_out.to_le_bytes());
+    hash.update(track.outro_start_out.to_le_bytes());
+    hash.update(track.outro_end_anchored_out.to_le_bytes());
+    hash.update(track.intro_bars.to_le_bytes());
+    hash.update(track.outro_bars.to_le_bytes());
+    hash.update(track.gain_linear.to_bits().to_le_bytes());
+    for sample in track.samples.iter() { hash.update(sample.to_bits().to_le_bytes()); }
+    hash.finalize().into()
+}
+
+fn build_revision() -> [u8; 20] {
+    let revision = env!("FUNKOT_REPLAY_BUILD_REVISION");
+    if revision.len() != 40 { return [0; 20]; }
+    let mut bytes = [0; 20];
+    for (i, pair) in revision.as_bytes().chunks(2).enumerate() {
+        let Ok(pair) = std::str::from_utf8(pair) else { return [0; 20]; };
+        let Ok(value) = u8::from_str_radix(pair, 16) else { return [0; 20]; };
+        bytes[i] = value;
+    }
+    bytes
+}
+
+fn hash_recipe(recipe: &FirstLiveReplayRecipe) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(recipe.occurrence_index.to_le_bytes());
+    hash.update(recipe.decoded_input_sha256);
+    hash.update(recipe.input_sample_rate.to_le_bytes());
+    hash.update(recipe.input_frames.to_le_bytes());
+    hash.update([recipe.has_preview as u8, recipe.preview_used_provisional as u8]);
+    for snapshot in [&recipe.preview, &recipe.full] {
+        hash.update(snapshot.intro_bpm_bits);
+        hash.update(snapshot.first_downbeat.to_le_bytes());
+        hash.update(snapshot.outro_start.to_le_bytes());
+        hash.update(snapshot.intro_bars.to_le_bytes());
+        hash.update(snapshot.outro_bars.to_le_bytes());
+        hash.update(snapshot.gain_db_bits);
+    }
+    hash.finalize().into()
+}
+
+fn prepare_first_live_with_analyses(
+    options: &EngineOptions,
+    path: &Path,
+    index: usize,
+    buffer: decode::AudioBuffer,
+    initial: FirstLivePreparation,
+    full_analysis: FirstLivePreparation,
+    used_provisional: bool,
+) -> Result<PreparedFirstLive> {
+    let decoded_input_sha256 = hash_audio(&buffer);
+    let input_sample_rate = buffer.sample_rate;
+    let input_frames = buffer.frames;
+    let head_frames = ((FIRST_LIVE_HEAD_SECS * f64::from(buffer.sample_rate)).round() as u64)
+        .min(buffer.frames).max(1);
+    let preview = if head_frames < buffer.frames {
+        let head = decode::AudioBuffer { sample_rate: buffer.sample_rate, frames: head_frames,
+            samples: buffer.samples[..head_frames as usize * 2].to_vec() };
+        Some(finish_prepare(options, path, index, head, &initial, true, false)?)
+    } else { None };
+    let full = finish_prepare(options, path, index, buffer, &full_analysis, false, false)?;
+    let has_preview = preview.is_some();
+    let initial_track = preview.unwrap_or_else(|| full.clone());
+    let recipe = Arc::new(FirstLiveReplayRecipe { occurrence_index: index, decoded_input_sha256, input_sample_rate,
+        input_frames, preview: initial, full: full_analysis, has_preview, preview_used_provisional: used_provisional });
+    let evidence = FirstLiveReplayEvidence { playlist_index: index, build_revision: build_revision(), decoded_input_sha256,
+        preview_prepared_sha256: hash_track(&initial_track), full_prepared_sha256: hash_track(&full),
+        preparation_sha256: hash_recipe(&recipe), preview_used_provisional: used_provisional };
+    Ok(PreparedFirstLive { initial: initial_track, full: has_preview.then_some(full), evidence, recipe })
+}
+
+/// Prepare exactly the staged first-live buffers from the current cache state.
+pub fn prepare_first_live_replay(options: &EngineOptions, path: &Path, index: usize) -> Result<PreparedFirstLive> {
+    let buffer = decode::decode_file(path)?;
+    let (analysis, used_provisional) = cache::get_cached_or_provisional(path, &options.cache_dir, &buffer)?;
+    let initial = FirstLivePreparation::from_analysis(&analysis);
+    let full = if used_provisional {
+        FirstLivePreparation::from_analysis(&cache::get_or_analyze(path, &options.cache_dir, &buffer)?)
+    } else { initial.clone() };
+    prepare_first_live_with_analyses(options, path, index, buffer, initial, full, used_provisional)
+}
+
+/// Regenerate from an untrusted recorded recipe and require the captured evidence.
+pub fn prepare_first_live_replay_from_recorded(
+    options: &EngineOptions, path: &Path, index: usize, recipe: &FirstLiveReplayRecipe,
+    expected: FirstLiveReplayEvidence,
+) -> Result<PreparedFirstLive> {
+    if !expected.is_comparable() || expected.build_revision != build_revision() {
+        return Err(Error::Engine("first-live replay producer build revision is unavailable or different".into()));
+    }
+    recipe.validate()?;
+    if recipe.occurrence_index != index || expected.playlist_index != index {
+        return Err(Error::Engine("first-live replay occurrence mismatch".into()));
+    }
+    let buffer = decode::decode_file(path)?;
+    if buffer.sample_rate != recipe.input_sample_rate || buffer.frames != recipe.input_frames
+        || hash_audio(&buffer) != recipe.decoded_input_sha256 || recipe.decoded_input_sha256 != expected.decoded_input_sha256 {
+        return Err(Error::Engine("first-live replay input mismatch".into()));
+    }
+    let prepared = prepare_first_live_with_analyses(options, path, index, buffer, recipe.preview.clone(),
+        recipe.full.clone(), recipe.preview_used_provisional)?;
+    if prepared.evidence != expected {
+        return Err(Error::Engine("first-live replay evidence mismatch".into()));
+    }
+    Ok(prepared)
 }
 
 /// Decode, analyze (cached), stretch, and map markers for one playlist entry.
@@ -3515,7 +3932,7 @@ pub fn prepare_track(
 ) -> Result<PreparedTrack> {
     let buffer = decode::decode_file(path)?;
     let analysis = cache::get_or_analyze(path, &options.cache_dir, &buffer)?;
-    finish_prepare(options, path, index, buffer, &analysis, false, false)
+    finish_prepare(options, path, index, buffer, &FirstLivePreparation::from_analysis(&analysis), false, false)
 }
 
 fn finish_prepare(
@@ -3523,13 +3940,13 @@ fn finish_prepare(
     path: &std::path::Path,
     index: usize,
     buffer: decode::AudioBuffer,
-    analysis: &crate::TrackAnalysis,
+    analysis: &FirstLivePreparation,
     preview: bool,
     head_only: bool,
 ) -> Result<PreparedTrack> {
     // Stretch so intro BPM lands on target_bpm. For Funkot, outro_bpm ≈ intro_bpm.
-    let intro_bpm = if analysis.intro_bpm.is_finite() && analysis.intro_bpm > 0.0 {
-        analysis.intro_bpm
+    let intro_bpm = if analysis.intro_bpm().is_finite() && analysis.intro_bpm() > 0.0 {
+        analysis.intro_bpm()
     } else {
         crate::NOMINAL_BPM
     };
@@ -3589,7 +4006,7 @@ fn finish_prepare(
     };
 
     let gain_linear = if options.gain_normalize {
-        let g = (10.0f64).powf(analysis.gain_db / 20.0) as f32;
+        let g = (10.0f64).powf(analysis.gain_db() / 20.0) as f32;
         if g.is_finite() && g > 0.0 {
             g
         } else {
@@ -4254,7 +4671,7 @@ mod tests {
                     assert_eq!(engine.render(&mut silence), 16);
                     assert_eq!(silence, [0.0; 32]);
                 }
-                ready.send(LoaderMsg::Ready(track.clone())).unwrap();
+                ready.send(LoaderMsg::Ready(track.clone(), None)).unwrap();
                 let mut output = Vec::new();
                 while output.len() < reference.len() {
                     // Repeated Play must not restart the ramp.
@@ -4294,7 +4711,7 @@ mod tests {
         engine.loader_rx = rx;
         engine.loader_exhausted = false;
         let short = upgrade_test_track("short.wav", 4, 0.5, 1.0, false);
-        ready.send(LoaderMsg::Ready(short.clone())).unwrap();
+        ready.send(LoaderMsg::Ready(short.clone(), None)).unwrap();
         assert!(engine.resume());
         let mut first = [0.0; 8];
         assert_eq!(engine.render(&mut first), 4);
@@ -4304,7 +4721,7 @@ mod tests {
         let mut silence = [1.0; 4];
         assert_eq!(engine.render(&mut silence), 2);
         assert_eq!(silence, [0.0; 4]);
-        ready.send(LoaderMsg::Ready(short)).unwrap();
+        ready.send(LoaderMsg::Ready(short, None)).unwrap();
         engine.poll_events();
         ready.send(LoaderMsg::Exhausted).unwrap();
         let mut second = [0.0; 8];
@@ -4320,7 +4737,7 @@ mod tests {
 
     #[test]
     fn future_commit_retires_prepared_preparing_and_old_messages_and_permits() {
-        for late in [LoaderMsg::Ready(future_track(3)), LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "old failure".into() }, LoaderMsg::Exhausted] {
+        for late in [LoaderMsg::Ready(future_track(3), None), LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "old failure".into() }, LoaderMsg::Exhausted] {
             let mut engine = future_engine(&[1, 2]);
             let (old_tx, old_rx) = mpsc::sync_channel(1);
             engine.loader_rx = old_rx;
@@ -4337,7 +4754,7 @@ mod tests {
             assert!(engine.head_queue.is_empty());
             assert!(!engine.poll_events().iter().any(|e| matches!(e, EngineEvent::TrackFailed { .. })));
             drop(retired);
-            assert!(old_tx.try_send(LoaderMsg::Ready(future_track(3))).is_err());
+            assert!(old_tx.try_send(LoaderMsg::Ready(future_track(3), None)).is_err());
         }
     }
 
@@ -4380,7 +4797,7 @@ mod tests {
     #[test]
     fn future_same_path_upgrade_matches_occurrence_and_failure_reports_index() {
         let mut engine = future_engine(&[1, 2]);
-        engine.apply_upgrade(future_track(2));
+        engine.apply_upgrade(future_track(2), None);
         assert_eq!(engine.current_index(), Some(1));
         let (tx, rx) = mpsc::sync_channel(1);
         engine.loader_rx = rx;
@@ -4597,7 +5014,7 @@ mod tests {
         assert_eq!(waiting, [0.0; 6]);
         assert_eq!(engine.render_diagnostics().preview_wait_frames, 3);
 
-        tx.send(LoaderMsg::Upgrade(upgrade_test_track("preview.wav", 600, 0.5, 1.0, false))).unwrap();
+        tx.send(LoaderMsg::Upgrade(upgrade_test_track("preview.wav", 600, 0.5, 1.0, false), None)).unwrap();
         let mut resumed = [0.0; 1024];
         assert_eq!(engine.render(&mut resumed), 512);
         assert_eq!(engine.render_diagnostics().preview_wait_frames, 3);
@@ -4613,7 +5030,7 @@ mod tests {
 
         let mut full = upgrade_test_track("same.wav", 20, 0.5, 1.0, false);
         full.playlist_index = 7;
-        engine.apply_upgrade(full.clone());
+        engine.apply_upgrade(full.clone(), None);
         assert_eq!(engine.render_diagnostics(), RenderDiagnostics {
             preview_wait_frames: 0,
             preview_upgrades: 1,
@@ -4621,13 +5038,15 @@ mod tests {
                 playlist_index: 7,
                 playhead: 3,
                 preview_frames: 8,
+                render_frame: 0,
+                evidence: None,
             }),
         });
 
-        engine.apply_upgrade(full.clone());
+        engine.apply_upgrade(full.clone(), None);
         let mut wrong_occurrence = full.clone();
         wrong_occurrence.playlist_index = 8;
-        engine.apply_upgrade(wrong_occurrence);
+        engine.apply_upgrade(wrong_occurrence, None);
         assert_eq!(engine.render_diagnostics().preview_upgrades, 1);
 
         let mut next_preview = upgrade_test_track("next.wav", 8, 0.25, 1.0, true);
@@ -4635,8 +5054,240 @@ mod tests {
         engine.next_track = Some(next_preview);
         let mut next_full = upgrade_test_track("next.wav", 20, 0.5, 1.0, false);
         next_full.playlist_index = 9;
-        engine.apply_upgrade(next_full);
+        engine.apply_upgrade(next_full, None);
         assert_eq!(engine.render_diagnostics().preview_upgrades, 1);
+    }
+
+    fn replay_stage(preview: PreparedTrack, full: Option<PreparedTrack>) -> PreparedFirstLive {
+        let snapshot = FirstLivePreparation {
+            intro_bpm_bits: 180.0f64.to_bits().to_le_bytes(), first_downbeat: 0,
+            outro_start: 1, intro_bars: 1, outro_bars: 1,
+            gain_db_bits: 0.0f64.to_bits().to_le_bytes(),
+        };
+        let recipe = Arc::new(FirstLiveReplayRecipe { occurrence_index: preview.playlist_index,
+            decoded_input_sha256: [3; 32], input_sample_rate: 48_000, input_frames: 64,
+            preview: snapshot.clone(), full: snapshot, has_preview: full.is_some(), preview_used_provisional: true });
+        let evidence = FirstLiveReplayEvidence { playlist_index: preview.playlist_index,
+            build_revision: [0; 20], decoded_input_sha256: [3; 32], preview_prepared_sha256: hash_track(&preview),
+            full_prepared_sha256: full.as_ref().map_or_else(|| hash_track(&preview), hash_track),
+            preparation_sha256: hash_recipe(&recipe), preview_used_provisional: true };
+        PreparedFirstLive { initial: preview, full, evidence, recipe }
+    }
+
+    #[test]
+    fn first_live_replay_defers_ready_event_and_adopts_at_exact_engine_frame() {
+        let preview = upgrade_test_track("replay.wav", 2, 0.25, 1.0, true);
+        let full = upgrade_test_track("replay.wav", 64, 0.5, 1.0, false);
+        let mut engine = Engine::from_prepared_first_live(EngineOptions::default(), replay_stage(preview, Some(full)), vec![],
+            FirstLiveReplaySchedule { ready_at_render_frame: 3, upgrade_at_render_frame: Some(7),
+                upgrade_adoption: Some(FirstLiveReplayUpgradeAdoption::Active) }).unwrap();
+        let mut before_ready = [1.0; 12];
+        assert_eq!(engine.render(&mut before_ready[..4]), 2);
+        assert_eq!(before_ready[..4], [0.0; 4]);
+        assert!(engine.poll_events().is_empty());
+        assert_eq!(engine.render(&mut before_ready[4..6]), 1);
+        assert!(engine.first_live_replay_observation().is_none());
+        let mut after_ready = [0.0; 10];
+        assert_eq!(engine.render(&mut after_ready), 5);
+        assert_eq!(engine.render_frame(), 8);
+        let upgrade = engine.render_diagnostics().last_preview_upgrade.expect("upgrade");
+        assert_eq!(upgrade.render_frame, 7);
+        assert_eq!(upgrade.playhead, 2);
+        assert!(upgrade.evidence.is_some());
+        assert_eq!(engine.first_live_replay_observation().map(|o| o.ready_at_render_frame), Some(3));
+        assert!(engine.poll_events().iter().any(|event| matches!(event, EngineEvent::TrackStarted { .. })));
+    }
+
+    #[test]
+    fn first_live_replay_rejects_a_fake_upgrade_for_a_single_track() {
+        let single = upgrade_test_track("single.wav", 32, 0.5, 1.0, false);
+        let error = match Engine::from_prepared_first_live(EngineOptions::default(), replay_stage(single, None), vec![],
+            FirstLiveReplaySchedule { ready_at_render_frame: 0, upgrade_at_render_frame: Some(0),
+                upgrade_adoption: Some(FirstLiveReplayUpgradeAdoption::Active) }) {
+            Ok(_) => panic!("single first-live preparation accepted an upgrade"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot schedule"));
+    }
+
+    #[test]
+    fn queued_preview_upgrade_retains_producer_observation_without_active_fade() {
+        let preview = upgrade_test_track("queued.wav", 8, 0.25, 1.0, true);
+        let full = upgrade_test_track("queued.wav", 32, 0.5, 1.0, false);
+        let staged = replay_stage(preview, Some(full));
+        let PreparedFirstLive { initial, full, evidence, recipe } = staged;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![initial]).unwrap();
+        let queued = engine.active.take().unwrap().track;
+        engine.next_track = Some(queued);
+        engine.first_live_ready_frame = None;
+        engine.apply_upgrade(full.unwrap(), Some(FirstLiveProvenance { evidence, recipe }));
+        assert_eq!(engine.render_diagnostics().preview_upgrades, 0);
+        assert!(engine.render_diagnostics().last_preview_upgrade.is_none());
+        let queued = engine.take_next().unwrap();
+        engine.start_first(queued);
+        let observation = engine.first_live_replay_observation().expect("queued observation");
+        assert_eq!(observation.queued_upgrade_at_render_frame, Some(0));
+        assert_eq!(observation.ready_at_render_frame, 0);
+    }
+
+    #[test]
+    fn same_frame_queued_replay_uses_full_pcm_without_an_active_upgrade_fade() {
+        let preview = upgrade_test_track("same-frame.wav", 8, 0.25, 1.0, true);
+        let full = upgrade_test_track("same-frame.wav", 32, 0.5, 1.0, false);
+        let mut engine = Engine::from_prepared_first_live(EngineOptions::default(), replay_stage(preview, Some(full)), vec![],
+            FirstLiveReplaySchedule { ready_at_render_frame: 3, upgrade_at_render_frame: Some(3),
+                upgrade_adoption: Some(FirstLiveReplayUpgradeAdoption::Queued) }).unwrap();
+        assert_eq!(engine.render(&mut [0.0; 6]), 3);
+        assert_eq!(engine.render_diagnostics().preview_upgrades, 0);
+        assert!(engine.first_live_replay_observation().is_none());
+        let mut output = [0.0; 2];
+        assert_eq!(engine.render(&mut output), 1);
+        assert_eq!(output, [0.5; 2]);
+        assert_eq!(engine.first_live_replay_observation().unwrap().queued_upgrade_at_render_frame, Some(3));
+    }
+
+    #[test]
+    fn scheduled_first_live_output_does_not_depend_on_chunks_crossing_readiness() {
+        fn replay(chunks: &[usize], adoption: FirstLiveReplayUpgradeAdoption, at: u64) -> (Vec<f32>, RenderDiagnostics) {
+            let preview = upgrade_test_track("chunks.wav", 2, 0.25, 1.0, true);
+            let full = upgrade_test_track("chunks.wav", 128, 0.5, 1.0, false);
+            let mut engine = Engine::from_prepared_first_live(EngineOptions::default(), replay_stage(preview, Some(full)), vec![],
+                FirstLiveReplaySchedule { ready_at_render_frame: 3, upgrade_at_render_frame: Some(at),
+                    upgrade_adoption: Some(adoption) }).unwrap();
+            let mut output = Vec::new();
+            for chunk in chunks.iter().cycle() {
+                let frames = (*chunk).min(32 - output.len() / 2);
+                let mut buffer = vec![9.0; frames * 2];
+                assert_eq!(engine.render(&mut buffer), frames, "unfinished replay must fill the callback");
+                output.extend(buffer);
+                if output.len() == 64 { break; }
+            }
+            assert_eq!(engine.render_frame(), 32);
+            assert_eq!(engine.first_live_replay_observation().unwrap().ready_at_render_frame, 3);
+            (output, engine.render_diagnostics())
+        }
+        for (adoption, at) in [(FirstLiveReplayUpgradeAdoption::Active, 7),
+            (FirstLiveReplayUpgradeAdoption::Active, 3), (FirstLiveReplayUpgradeAdoption::Queued, 3)] {
+            let expected = replay(&[1], adoption, at);
+            assert_eq!(replay(&[1024], adoption, at), expected);
+            assert_eq!(replay(&[5, 7, 2, 11], adoption, at), expected);
+            assert_eq!(&expected.0[..6], &[0.0; 6]);
+            if adoption == FirstLiveReplayUpgradeAdoption::Active {
+                assert_eq!(expected.1.last_preview_upgrade.unwrap().render_frame, at);
+                assert_eq!(expected.1.preview_wait_frames, if at == 7 { 2 } else { 0 });
+            }
+        }
+        assert_eq!(replay(&[1024], FirstLiveReplayUpgradeAdoption::Queued, 3).0[6], 0.5);
+        assert_eq!(replay(&[1024], FirstLiveReplayUpgradeAdoption::Active, 3).0[6], 0.25);
+    }
+
+    #[test]
+    fn missing_first_live_upgrade_waits_without_blocking_and_stop_ends_it() {
+        let preview = upgrade_test_track("missing.wav", 2, 0.25, 1.0, true);
+        let full = upgrade_test_track("missing.wav", 32, 0.5, 1.0, false);
+        let mut engine = Engine::from_prepared_first_live(EngineOptions::default(), replay_stage(preview, Some(full)), vec![],
+            FirstLiveReplaySchedule { ready_at_render_frame: 0, upgrade_at_render_frame: None, upgrade_adoption: None }).unwrap();
+        let mut output = [9.0; 20];
+        assert_eq!(engine.render(&mut output), 10);
+        assert_eq!(engine.render_diagnostics().preview_wait_frames, 8);
+        assert!(!engine.is_finished());
+        assert!(engine.first_live_replay_observation().is_none());
+        engine.stop();
+        assert_eq!(engine.render(&mut output), 0);
+    }
+
+    #[test]
+    fn queued_first_live_upgrade_requires_the_actual_ready_boundary() {
+        for at in [2, 4] {
+            let preview = upgrade_test_track("queue-order.wav", 2, 0.25, 1.0, true);
+            let full = upgrade_test_track("queue-order.wav", 32, 0.5, 1.0, false);
+            assert!(Engine::from_prepared_first_live(EngineOptions::default(), replay_stage(preview, Some(full)), vec![],
+                FirstLiveReplaySchedule { ready_at_render_frame: 3, upgrade_at_render_frame: Some(at),
+                    upgrade_adoption: Some(FirstLiveReplayUpgradeAdoption::Queued) }).is_err());
+        }
+    }
+
+    #[test]
+    fn first_live_recipe_json_preserves_float_bits_and_rejects_nonfinite_input() {
+        let preview = upgrade_test_track("recipe.wav", 8, 0.25, 1.0, true);
+        let full = upgrade_test_track("recipe.wav", 32, 0.5, 1.0, false);
+        let mut staged = replay_stage(preview, Some(full));
+        let recipe = Arc::make_mut(&mut staged.recipe);
+        recipe.preview.intro_bpm_bits = 179.993_761_483_271_03f64.to_bits().to_le_bytes();
+        recipe.full.gain_db_bits = (-0.003_762_913_499_987_125f64).to_bits().to_le_bytes();
+        let json = serde_json::to_vec(&*staged.recipe).unwrap();
+        let imported = FirstLiveReplayRecipe::from_recorded_json(&json).unwrap();
+        assert_eq!(imported.preview.intro_bpm_bits, staged.recipe.preview.intro_bpm_bits);
+        assert_eq!(imported.full.gain_db_bits, staged.recipe.full.gain_db_bits);
+
+        let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        value["preview"]["intro_bpm_bits"] = serde_json::json!([0, 0, 0, 0, 0, 0, 248, 127]);
+        assert!(FirstLiveReplayRecipe::from_recorded_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn recorded_first_live_rejects_missing_clean_producer_before_reading_input() {
+        let preview = upgrade_test_track("unknown.wav", 2, 0.25, 1.0, true);
+        let full = upgrade_test_track("unknown.wav", 32, 0.5, 1.0, false);
+        let staged = replay_stage(preview, Some(full));
+        let error = match prepare_first_live_replay_from_recorded(&EngineOptions::default(), Path::new("not-read.wav"), 0,
+            &staged.recipe, staged.evidence) {
+            Ok(_) => panic!("unknown producer became comparable"), Err(error) => error,
+        };
+        assert!(error.to_string().contains("producer build revision"));
+    }
+
+    #[test]
+    fn recorded_first_live_recreates_the_actual_production_buffers() {
+        assert_ne!(build_revision(), [0; 20], "recorded producer proof requires a clean committed core");
+        for (name, bars, has_preview) in [("staged", 8, true), ("single", 4, false)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{name}.wav"));
+            let buffer = crate::testutil::synth_track(180.0, bars, bars, bars, 8_000);
+            crate::testutil::write_wav(&path, &buffer).unwrap();
+            let options = EngineOptions { output_sample_rate: 8_000, rate: 1.07,
+                cache_dir: directory.path().join("cache"), loop_playlist: false, ..EngineOptions::default() };
+            let (sender, receiver) = mpsc::sync_channel(2);
+            assert!(prepare_first_live(&options, &path, 0, &sender, &AtomicBool::new(false)));
+            let (initial, full, provenance) = match receiver.try_recv().unwrap() {
+                LoaderMsg::Ready(initial, Some(provenance)) => (initial, None, provenance),
+                LoaderMsg::Ready(initial, None) => match receiver.try_recv().unwrap() {
+                    LoaderMsg::Upgrade(full, Some(provenance)) => (initial, Some(full), provenance),
+                    _ => panic!("production preview did not produce its full upgrade"),
+                },
+                _ => panic!("production first-live did not produce its initial track"),
+            };
+            assert_eq!(provenance.recipe.has_preview(), has_preview);
+            let recipe = FirstLiveReplayRecipe::from_recorded_json(&serde_json::to_vec(&*provenance.recipe).unwrap()).unwrap();
+            let regenerated = prepare_first_live_replay_from_recorded(&options, &path, 0, &recipe, provenance.evidence).unwrap();
+            assert_eq!(hash_track(&regenerated.initial), hash_track(&initial));
+            assert_eq!(*regenerated.initial.samples, *initial.samples);
+            assert_eq!(regenerated.evidence, provenance.evidence);
+            match (regenerated.full, full) {
+                (Some(regenerated), Some(actual)) => {
+                    assert_eq!(hash_track(&regenerated), hash_track(&actual));
+                    assert_eq!(*regenerated.samples, *actual.samples);
+                }
+                (None, None) => {}
+                _ => panic!("regeneration changed the production staging boundary"),
+            }
+            for field in 0..4 {
+                let mut changed = provenance.evidence;
+                match field {
+                    0 => changed.decoded_input_sha256[0] ^= 1,
+                    1 => changed.preview_prepared_sha256[0] ^= 1,
+                    2 => changed.full_prepared_sha256[0] ^= 1,
+                    _ => changed.preparation_sha256[0] ^= 1,
+                }
+                assert!(prepare_first_live_replay_from_recorded(&options, &path, 0, &recipe, changed).is_err());
+            }
+            assert!(prepare_first_live_replay_from_recorded(&options, &path, 1, &recipe, provenance.evidence).is_err());
+            let other = directory.path().join("other.wav");
+            let mut changed = buffer;
+            changed.samples[0] = 0.25;
+            crate::testutil::write_wav(&other, &changed).unwrap();
+            assert!(prepare_first_live_replay_from_recorded(&options, &other, 0, &recipe, provenance.evidence).is_err());
+        }
     }
 
     #[test]
@@ -4659,7 +5310,7 @@ mod tests {
             assert_eq!(engine.render(&mut prefix), arrival as usize);
             assert_eq!(engine.active.as_ref().unwrap().playhead, arrival);
             let generation = engine.nav_gen;
-            engine.apply_upgrade(full.clone());
+            engine.apply_upgrade(full.clone(), None);
             let active = engine.active.as_ref().unwrap();
             assert_eq!(active.playhead, arrival, "{sr}Hz preserve arrival playhead");
             assert!(!active.track.preview);
@@ -5647,19 +6298,19 @@ mod tests {
         let mut upgrade_outro = None;
         for _ in 0..8 {
             match rx.recv_timeout(Duration::from_secs(180)) {
-                Ok(LoaderMsg::Ready(t)) if t.preview => {
+                Ok(LoaderMsg::Ready(t, _)) if t.preview => {
                     preview = true;
                     assert_eq!(
                         t.outro_start_out, t.frames,
                         "preview must hold transitions at EOF"
                     );
                 }
-                Ok(LoaderMsg::Upgrade(t)) => {
+                Ok(LoaderMsg::Upgrade(t, _)) => {
                     assert!(!t.preview);
                     upgrade_outro = Some(t.outro_bars);
                     break;
                 }
-                Ok(LoaderMsg::Ready(t)) => {
+                Ok(LoaderMsg::Ready(t, _)) => {
                     // Short-file path (no preview): still must be analyzed.
                     upgrade_outro = Some(t.outro_bars);
                     break;
@@ -5879,7 +6530,7 @@ mod tests {
         let before = engine.nav_gen;
         let mut replacement = engine.next_track.as_ref().unwrap().clone();
         replacement.samples = Arc::new(vec![0.1; replacement.samples.len()]);
-        engine.apply_upgrade(replacement);
+        engine.apply_upgrade(replacement, None);
         assert!(engine.pending_nav.is_none());
         assert_ne!(engine.nav_gen, before);
 
