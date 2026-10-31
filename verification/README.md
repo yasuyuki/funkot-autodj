@@ -262,9 +262,10 @@ stateDiagram-v2
 ### Bounds, fairness and correspondence
 
 The model distinguishes two occurrence keys and independent preview/full PCM
-identities. Three preparation attempts per receiver exercise normal
-current/next/history capacity and the surplus/backpressure case. A fourth
-source poll represents exhaustion. Initial-source attempts may reuse their
+identities. Three initial-source preparation attempts exercise normal current/next/history
+capacity and the surplus/backpressure case. The replacement has one fresh
+occurrence, matching its engine-lifetime index uniqueness contract. Each source
+then polls exhaustion; this does not cover longer replacement queues. Initial-source attempts may reuse their
 path/index as a looping PlaylistSource does; the replacement uses a fresh key.
 Attempt numbers are allocation/permit evidence only, never production guards.
 One optional source replacement explores old/new receiver isolation without
@@ -272,7 +273,7 @@ integer generation wraparound. Replacement workers prepare full/head buffers
 and cannot create another non-head first-live preview.
 
 Head-only retains the real 12-head prefetch allowance and its resulting permit
-capacity. Three input attempts do not enumerate a completely filled head queue.
+capacity. The bounded inputs do not enumerate a completely filled head queue.
 The frame abstraction has preview/head length one and full length two; native
 replay tests cover actual frame and PCM adapters. This does not prove arbitrary
 buffer lengths, audio content, allocation behavior or throughput.
@@ -288,6 +289,8 @@ under weakly fair producer, current-receiver drain and render actions, with no
 superseding navigation, revoke, stop, fence or source replacement. Offline poll
 owns `&mut Engine`; a hypothetical concurrent `stop()` is not its escape path.
 Stop is checked as a terminal safety boundary before later render/control.
+Normal stop/finite completion and the actual preview silence/poll boundary have
+explicit stutter actions. TLC deadlock checking stays enabled elsewhere.
 
 | Model action | Product boundary and native evidence |
 |---|---|

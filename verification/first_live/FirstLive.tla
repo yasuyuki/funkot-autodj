@@ -4,10 +4,12 @@ EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
 (* Bounded Engine projection; see verification/README.md for correspondence.
    Initial receiver uses occurrence key 1; its loop may reuse that key. The
    replacement uses key 2, satisfying replacement-source index uniqueness.
-   Each receiver has three preparation attempts, independently named PCM, and
-   one capacity-one FIFO. Three attempts exercise normal current/next/history
-   capacity and surplus backpressure. Head-only retains the real 12-slot
-   prefetch capacity; three inputs do NOT prove full head-queue occupancy.
+   The initial receiver has three preparation attempts with independently
+   named PCM; the replacement has one fresh-key attempt. Each FIFO has capacity
+   one. Three initial attempts exercise normal current/next/history capacity
+   and surplus backpressure. A repeated replacement key would violate its
+   lifetime-unique-index contract. Head-only retains the real 12-slot prefetch
+   capacity; these inputs do NOT prove full head-queue occupancy.
    Exactly one optional receiver replacement is explored, without generation
    wraparound or reuse. Initial non-head preview exists at most once/Engine.
    Attempt numbers are ghost allocation names, NEVER Failed/Upgrade guards.
@@ -28,7 +30,7 @@ Preview == Track(1,"Preview")
 Full == Track(1,"Full")
 Kinds == {"Preview","Full","Head"}
 OtherPath == [Full EXCEPT !.path="Other"]
-Tracks == {Track(a,k): a \in 1..7, k \in Kinds} \cup {OtherPath}
+Tracks == {Track(a,k): a \in {1,2,3,5}, k \in Kinds} \cup {OtherPath}
 SameOccurrence(t,u) == t.index=u.index /\ t.path=u.path
 Pcm(t) == <<t.allocation,t.stage>>
 NonHeadPreview(t) == IF t = None THEN FALSE ELSE t.stage = "Preview"
@@ -84,7 +86,8 @@ SendPrepared ==
         a == Ticket(s.gen,n)
         preview == s.gen=0 /\ n=1 /\ s.firstPreview
         kind == IF preview THEN "Preview" ELSE IF s.head THEN "Head" ELSE "Full"
-    IN IF n=4
+        exhaustedAt == IF s.gen=0 THEN 4 ELSE 2
+    IN IF n=exhaustedAt
        THEN s'=[s EXCEPT !.mail[s.gen]= <<Msg("Exhausted",None,a,FALSE)>>,
                         !.phase[s.gen]="Done"]
        ELSE \/ s'=[s EXCEPT !.mail[s.gen]= <<Msg("Ready",Track(a,kind),a,FALSE)>>,
@@ -248,7 +251,20 @@ CommitFuture ==
         !.reserved=(s.active=None), !.exhausted=FALSE,
         !.failedPcm=IF KeepTerminal THEN @ ELSE None]
 
-Next == Producer \/ Drain \/ InjectTransport \/ Render \/ JumpForward \/ JumpPrevious \/ Revoke
+(* Real render/stop terminal boundaries and preview wait polling may leave
+   this frame/ownership abstraction unchanged. Keep only these justified
+   self-loops so TLC's default deadlock check still detects other stuck states. *)
+TerminalStutter ==
+ /\ (s.stopped \/ (s.finished /\ s.phase[s.gen]="Done"))
+ /\ UNCHANGED s
+PreviewWaitStutter ==
+ /\ ~s.stopped /\ ~s.finished /\ ~s.fence
+ /\ NonHeadPreview(s.active) /\ s.position>=Frames(s.active)
+ /\ ~(EndFailedPreview /\ Failed(s.active)) /\ ~s.exhausted
+ /\ s.mail[s.gen]= <<>>
+ /\ UNCHANGED s
+
+Next == TerminalStutter \/ PreviewWaitStutter \/ Producer \/ Drain \/ InjectTransport \/ Render \/ JumpForward \/ JumpPrevious \/ Revoke
         \/ Stop \/ Resume \/ BeginFuture \/ AbortFuture \/ CommitFuture
         \/ (\E incoming \in {Full,Preview,Track(1,"Head"),Track(5,"Full"),OtherPath}: Inject(incoming))
 SafetySpec == Init /\ [][Next]_vars
@@ -258,7 +274,7 @@ TypeOK ==
  /\ s.gen \in Gens /\ s.head \in BOOLEAN /\ s.realtime \in BOOLEAN
  /\ s.firstPreview \in BOOLEAN
  /\ s.phase \in [Gens -> {"Acquire","Preparing","Final","Done"}]
- /\ s.number \in [Gens -> 1..4] /\ s.credits \in [Gens -> 0..15]
+ /\ s.number \in [Gens -> 1..4] /\ s.number[1] \in 1..2 /\ s.credits \in [Gens -> 0..15]
  /\ \A g \in Gens: Len(s.mail[g])<=1
  /\ s.active \in Tracks \cup {None} /\ s.next \in Tracks \cup {None}
  /\ s.history \in Tracks \cup {None}
