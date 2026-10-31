@@ -1,6 +1,6 @@
 ---
 name: verify-funkot-transition-geometry
-description: Verify Funkot AutoDJ transition bar geometry and real deck admission after changes to planning, markers, manual or automatic transitions, or their Kani harnesses.
+description: Verify Funkot AutoDJ transition geometry, deck admission and asynchronous manual navigation after changes to planning, markers, navigation, source fencing or their Kani and TLC checks.
 ---
 # Verify transition geometry
 
@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`8be7aeac3d7de23d18c7be756ba7c48a71fb05e4`. This is an audit anchor, not a pin.
+`ff68fe49e5f96ab4d4bb528d25ef44cc38752bb8`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
@@ -48,7 +48,7 @@ From the selected core root on Linux x86_64 with Docker and cgroup v2:
 
 ```sh
 ./scripts/check-transition-geometry.sh --setup
-./scripts/check-transition-geometry.sh /tmp/transition-proof
+./scripts/check-transition-geometry.sh
 ./dev.sh cargo test -p funkot-core --release --lib
 ./dev.sh cargo test -p funkot-core --release --test engine --test fade_curve
 ./work.sh --self-check
@@ -88,6 +88,59 @@ keep the last one-frame simple fade audible, and reject unrepresentable bar
 durations at both engine constructors. Preserve those observable
 boundaries when updating the checker after a code change.
 
+## Manual navigation ordering
+
+The navigation coverage is `engine.rs::begin_nav`, `poll_nav_tempo`,
+`manual_plan_matches`, `kick_manual_plan_if_idle`, `tick_pending_nav`,
+`commit_manual_plan`, `cancel_pending_nav`, `drop_prev`, `push_history`,
+`apply_upgrade`, `drain_loader`, and the begin/abort/commit future-update methods.
+Inspect every new writer of their active/target/history identities, navigation
+generation, deadline or future fence. A source change invalidates navigation
+through generation; `ManualKey` has no separate source-epoch field.
+
+`funkot-core/src/manual_navigation.rs` is the production decision source.
+`verification/manual_navigation.rs` directly imports it. The existing Kani
+entry also checks both navigation harnesses and their reachable covers over
+arbitrary `u64` frames/generations and optional facts. Preserve exact-start
+adoption, exact-at-deadline precedence, a fixed replan deadline, and current
+fallback construction. Borrowed identity facts remain an Engine adapter and
+must be checked by real Engine regressions.
+
+Run the finite event-order check on Linux with Python 3.12 or later and Java 21:
+
+```sh
+python3 -B verification/check_manual_navigation.py --setup
+python3 -B verification/check_manual_navigation.py
+```
+
+Use the normal clean-checkout entries. They verify a commit archive and refuse
+unavailable/malformed revisions, dirty source and nonempty evidence directories.
+Read both `summary.json` results and the CI artifacts. Missing results, partial
+exploration, unexpected tool bytes, timeout and an undetected mutation fail.
+The navigation runner fixes TLC 1.7.4 by hash. `verification/README.md` owns the
+bounds, fairness assumptions, transition-to-code table and unproved scope.
+
+Read each TLC result with `/statechart`. Replay a counterexample in real Rust
+before calling it a product bug. The accepted-Prev/history-rollover trace is
+already replayed by `history_rollover_cancels_an_accepted_previous_navigation`.
+Preserve its cancellation and the companion Next/Restart preservation test.
+
+The runner checks generation, exact-start, missing-deadline and old-history
+variants in isolated model copies. The shared Rust generation/identity/deadline/
+start variants must fail completed Kani safety assertions and their named Engine
+regressions. `manual_navigation_mutations.py` owns edits and test names; the
+native identity variant also disables the independent Engine identity recheck.
+A compiler error, a missing test or a timeout is not mutation detection.
+The native suite must pass again on the unchanged committed source afterward.
+
+A model mismatch is verification drift. An actual accepted target silently
+changing during a pending operation is a product bug. Keep the promise while
+repairing either. The stable TLC configuration proves adoption only under its
+stated noninterference and progress assumptions. The ordinary configuration checks safety over the complete bounded event
+graph; conditional resolution and adoption are checked by the stable configuration.
+Neither model covers sound quality, devices, arbitrary-length operation streams,
+or the complete first-live preview/full lifecycle.
+
 ## Limits and result record
 
 The numeric proof does not verify floating-point conversion or that its caller
@@ -99,8 +152,9 @@ devices, realtime schedules, OS behavior and the #22 candidate-selection
 question remain outside the proof. Run normal workspace checks and real-track
 rendering as required by `AGENTS.md`; report unavailable input explicitly.
 
-Record results, counterexamples, mutation failures, exact source/CI commits and
-unproved scope in `funkot-autodj` Issue #26. Keep private paths, raw diagnostics
+Record geometry results in `funkot-autodj` Issue #26 and navigation results in
+Issue #41, including counterexamples, mutations, exact source/CI commits and
+unproved scope. Keep private paths, raw diagnostics
 and per-file hashes in private evidence; link public CI artifacts for shared
 logs. After changes that skipped this check, use
 `maintain-formal-verification-skill` to classify each result as in sync, updated,

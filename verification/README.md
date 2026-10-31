@@ -183,6 +183,8 @@ product correction and its regression are separate commits in PR #44.
 
 Record navigation results in #41. TLC does not verify PCM samples, DSP quality,
 click freedom, OS scheduling, device output, unbounded request streams or the
-preview/full first-live lifecycle. Loader identities and future fencing are
+preview/full first-live lifecycle, head-only relabeling or arbitrary FIFO
+capacity. TLC uses probabilistic fingerprints; its reported collision estimate
+is retained with the run logs. Loader identities and future fencing are
 represented only at their navigation boundaries. The separate work in player
 #112 and core #42 must establish their own persistence and upgrade promises.
