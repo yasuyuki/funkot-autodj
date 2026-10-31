@@ -2120,6 +2120,9 @@ impl Engine {
     }
 
     fn push_history(&mut self, track: PreparedTrack) {
+        if self.manual_action == Some(NavAction::TransitionToPrev) {
+            self.cancel_pending_nav();
+        }
         if let Some(old) = self.last_track.replace(track) {
             // Replaced prior history slot → free that permit.
             self.release_permit();
