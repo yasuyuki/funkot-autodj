@@ -1675,7 +1675,6 @@ impl Engine {
         engine.replay_initial_track = Some(initial);
         engine.first_live_ready_frame = None;
         engine.replay_ready_at = Some(schedule.ready_at_render_frame);
-        engine.block_on_preview_upgrade = false;
         if let Some(full) = first.full {
             engine.replay_upgrade_pending = true;
             if let (Some(frame), Some(adoption)) = (schedule.upgrade_at_render_frame, schedule.upgrade_adoption) {
@@ -5449,6 +5448,26 @@ mod tests {
         reset_phase_align_calls_on_thread();
         engine.begin_transition(0);
         assert!(phase_align_calls_on_thread() > 0, "offline must retain phase alignment");
+    }
+
+    #[test]
+    fn first_live_replay_keeps_offline_phase_alignment_when_worker_is_unavailable() {
+        let mut ordinary = phase_test_engine(false, 8, 44_100);
+        ordinary.begin_transition(0);
+        let mut options = EngineOptions::default();
+        options.output_sample_rate = 44_100;
+        options.loop_playlist = false;
+        let mut replay = Engine::from_prepared_first_live(options,
+            replay_stage(phase_test_track(0, 8, 16), None), vec![phase_test_track(1, 8, 16)],
+            FirstLiveReplaySchedule { ready_at_render_frame: 0, upgrade_at_render_frame: None, upgrade_adoption: None }).unwrap();
+        assert_eq!(replay.render(&mut [0.0; 2]), 1);
+        replay.active.as_mut().unwrap().playhead = 16;
+        replay.clear_phase_align();
+        reset_phase_align_calls_on_thread();
+        replay.begin_transition(0);
+        assert!(phase_align_calls_on_thread() > 0, "staged offline replay must retain phase alignment");
+        assert_eq!(replay.active.as_ref().unwrap().playhead, ordinary.active.as_ref().unwrap().playhead);
+        assert_eq!(replay.render_one_frame(), ordinary.render_one_frame());
     }
 
     #[test]
