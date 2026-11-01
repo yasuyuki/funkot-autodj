@@ -7617,7 +7617,7 @@ mod natural_handoff_tests {
             let mut engine = Engine::from_prepared(handoff_options(), tracks).unwrap();
             engine.set_realtime(true);
             engine.poll_events();
-            let release_at = 23 * BAR + BAR / 2;
+            let release_at = 22 * BAR + BAR / 2;
             if resolution == "append" {
                 render_frames(&mut engine, release_at);
             }
@@ -7637,7 +7637,7 @@ mod natural_handoff_tests {
             };
             engine.poll_events();
             assert_eq!(engine.ready_ahead(), 1, "{resolution}: successor ready");
-            let (frames, events) = render_until_event(&mut engine, BAR);
+            let (frames, events) = render_until_event(&mut engine, 2 * BAR);
             assert_eq!(release_at + frames, 24 * BAR, "{resolution}: solo handoff at EOF");
             assert!(events.iter().any(|event| matches!(event, EngineEvent::TrackStarted { index: 1, .. })),
                 "{resolution}: missing solo start: {events:?}");
