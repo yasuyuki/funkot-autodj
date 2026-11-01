@@ -7456,3 +7456,248 @@ mod tests {
         assert_eq!(engine.render_one_frame(), (0.25, -0.5));
     }
 }
+
+#[cfg(test)]
+mod natural_handoff_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const BAR: u64 = 4_000;
+
+    fn handoff_options() -> EngineOptions {
+        let mut options = EngineOptions::default();
+        options.output_sample_rate = 3_000;
+        options.rate = 1.0;
+        options.loop_playlist = false;
+        assert_eq!(options.bar_frames(), BAR as f64);
+        options
+    }
+
+    fn handoff_track(index: usize, body_bars: u64, outro_bars: u32) -> PreparedTrack {
+        let frames = (body_bars + u64::from(outro_bars)) * BAR;
+        PreparedTrack {
+            path: PathBuf::from(format!("natural-handoff-{index}.wav")),
+            playlist_index: index,
+            samples: Arc::new(
+                (0..frames * 2)
+                    .map(|frame| ((frame / 2 % 97) as f32 / 400.0) + 0.05)
+                    .collect(),
+            ),
+            frames,
+            first_downbeat_out: 0,
+            outro_start_out: body_bars * BAR,
+            outro_end_anchored_out: frames,
+            intro_bars: 16,
+            outro_bars,
+            gain_linear: 1.0,
+            preview: false,
+            head_only: false,
+        }
+    }
+
+    fn gated_replacement(
+        tracks: Vec<PreparedTrack>,
+    ) -> (PreparedSourceReplacement, SyncSender<()>) {
+        let (activate, start) = mpsc::sync_channel::<EngineOptions>(1);
+        let (gate_tx, gate_rx) = mpsc::sync_channel::<()>(1);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (permit_tx, permit_rx) = mpsc::sync_channel(3 + HEAD_ONLY_PREFETCH);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let join = thread::spawn(move || {
+            if start.recv().is_ok() && gate_rx.recv().is_ok() {
+                prepared_loader_main(tracks, tx, permit_rx, flag);
+            }
+        });
+        (
+            PreparedSourceReplacement {
+                activate,
+                shutdown,
+                rx,
+                permit_tx,
+                join,
+            },
+            gate_tx,
+        )
+    }
+
+    fn engine_with_gated_future(
+        first: PreparedTrack,
+        later: Vec<PreparedTrack>,
+    ) -> (Engine, SyncSender<()>) {
+        let mut engine = Engine::from_prepared(handoff_options(), vec![first]).unwrap();
+        engine.poll_events();
+        engine.set_realtime(true);
+        let token = engine.begin_future_update().expect("future update in track body");
+        let (replacement, gate) = gated_replacement(later);
+        drop(engine.commit_future_update(token, replacement));
+        (engine, gate)
+    }
+
+    fn render_frames(engine: &mut Engine, frames: u64) {
+        let mut out = vec![0.0; 2_000];
+        let mut remaining = frames;
+        while remaining > 0 {
+            let frames_now = remaining.min(1_000) as usize;
+            assert_eq!(engine.render(&mut out[..frames_now * 2]), frames_now);
+            remaining -= frames_now as u64;
+        }
+    }
+
+    fn wait_until_ready(engine: &mut Engine) {
+        for _ in 0..2_000 {
+            engine.drain_loader();
+            if engine.ready_ahead() > 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("gated replacement never supplied a track");
+    }
+
+    fn render_until_event(engine: &mut Engine, limit: u64) -> (u64, Vec<EngineEvent>) {
+        let mut out = [0.0; 2];
+        for frame in 1..=limit {
+            assert_eq!(engine.render(&mut out), 1);
+            let events = engine.poll_events();
+            if !events.is_empty() {
+                return (frame, events);
+            }
+        }
+        panic!("no engine event within {limit} frames");
+    }
+
+    #[test]
+    fn natural_handoff_waits_for_b_own_outro_and_reports_remaining_frames() {
+        for (name, release_at, expected_remaining) in [
+            ("gap", 24 * BAR, 24 * BAR - 1),
+            ("last A frame", 24 * BAR - 1, 24 * BAR),
+        ] {
+            let (mut engine, gate) = engine_with_gated_future(
+                handoff_track(0, 8, 16),
+                vec![handoff_track(1, 24, 16), handoff_track(2, 24, 16)],
+            );
+
+            render_frames(&mut engine, release_at);
+            assert_eq!(
+                engine.current_index(),
+                (release_at < 24 * BAR).then_some(0),
+                "{name} release point"
+            );
+
+            gate.send(()).expect("open replacement gate");
+            wait_until_ready(&mut engine);
+            let (_, started) = render_until_event(&mut engine, 10);
+            assert!(started.iter().any(|event| matches!(
+                event,
+                EngineEvent::TrackStarted {
+                    index: 1,
+                    entry_frame_out: 0,
+                    ..
+                }
+            )), "{name}: {started:?}");
+
+            let readout = engine.frames_until_transition();
+            let b_playhead_start = engine.active.as_ref().expect("B active").playhead;
+
+            wait_until_ready(&mut engine);
+            let (frames, events) = render_until_event(&mut engine, 40 * BAR);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, EngineEvent::TransitionStarted { .. })),
+                "{name}: expected B-to-C transition, got {events:?}"
+            );
+            let b_transition_playhead = b_playhead_start + frames - 1;
+            assert_eq!(
+                b_transition_playhead,
+                24 * BAR,
+                "{name}: B-to-C transition began at B frame {b_transition_playhead}, before B's outro at {}; host readout was {readout:?}",
+                24 * BAR
+            );
+            assert_eq!(
+                readout,
+                Some(expected_remaining),
+                "{name}: the host readout is B's own remaining body"
+            );
+        }
+    }
+
+    fn engine_finishing_a_with_b_and_c() -> Engine {
+        let mut engine = Engine::from_prepared(
+            handoff_options(),
+            vec![handoff_track(0, 24, 16), handoff_track(1, 24, 16)],
+        )
+        .unwrap();
+        engine.poll_events();
+        engine.set_realtime(true);
+        engine.head_queue.push_back(handoff_track(1, 24, 16));
+        let active = engine.active.as_mut().expect("A active");
+        active.playhead = active.track.frames.saturating_sub(1);
+        engine.awaiting_next_at_outro = true;
+        engine.outro_anchor = active.track.outro_start_out;
+        engine
+    }
+
+    fn assert_new_pair_phase_result(
+        engine: &mut Engine,
+        old_phase_sender: Option<SyncSender<(u64, u64, u64)>>,
+    ) {
+        assert_eq!(engine.current_index(), Some(1));
+        assert_eq!(engine.next_track.as_ref().map(|track| track.playlist_index), Some(1));
+        if let Some(sender) = old_phase_sender {
+            assert!(sender.try_send((0, 7, 0)).is_err(), "A-to-B receiver survived B start");
+        }
+
+        let b_outro = engine.active.as_ref().expect("B active").track.outro_start_out;
+        let result = (0..2_000)
+            .find_map(|_| {
+                engine.poll_phase_align();
+                let result = engine.phase_align_ready;
+                if result.is_none() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result
+            })
+            .expect("B-to-C phase worker result");
+        assert_eq!(result.0, b_outro, "B-to-C worker must use B's outro");
+        assert_ne!(result.1, 7, "old A-to-B correction must not be reused");
+
+        engine.active.as_mut().expect("B active").playhead = b_outro;
+        engine.begin_transition(0);
+
+        assert_eq!(engine.current_index(), Some(1));
+        assert_eq!(
+            engine.active.as_ref().expect("C active").playhead,
+            result.1,
+            "B-to-C adopted its worker correction"
+        );
+        assert!(engine.poll_events().iter().any(|event| matches!(
+            event,
+            EngineEvent::TransitionStarted {
+                entry_frame_out,
+                ..
+            } if *entry_frame_out == result.1
+        )));
+    }
+
+    #[test]
+    fn natural_handoff_discards_a_ready_phase_result_before_starting_b_to_c() {
+        let mut engine = engine_finishing_a_with_b_and_c();
+        let b_outro = engine.next_track.as_ref().expect("B queued").outro_start_out;
+        engine.phase_align_ready = Some((b_outro, 7, 0));
+
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        assert_new_pair_phase_result(&mut engine, None);
+    }
+
+    #[test]
+    fn natural_handoff_discards_an_in_flight_phase_receiver_before_starting_b_to_c() {
+        let mut engine = engine_finishing_a_with_b_and_c();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        engine.phase_align_rx = Some(receiver);
+
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        assert_new_pair_phase_result(&mut engine, Some(sender));
+    }
+}
