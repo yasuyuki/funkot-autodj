@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`47bc56bb2860ac8cd98ba3884c1df601723156ce`. This is an audit anchor, not a pin.
+`e49cac5f12f089afa38393eb832a2e4e0a9c2afe`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
@@ -212,6 +212,19 @@ unreliable-channel progress. Keep their counterexamples distinct from the
 passing legal model and Upgrade robustness checks.
 Tool failures, compiler errors, timeouts and zero selected tests never qualify.
 Read counterexamples with `/statechart` and replay applicable traces in Rust.
+
+## Automatic solo starts
+
+`engine.rs::start_first` starts a new occurrence. It clears the outgoing
+outro wait, anchor and active/next phase receiver or result before scheduling
+alignment for the new pair. The `natural_handoff_tests` Engine regressions
+cover a successor after silence or on the outgoing track's final frame,
+the successor's own outro countdown and transition frame, and repeated
+path/index/marker values with ready or pending old phase work. They also check
+adoption of the actual new phase-worker result in realtime mode.
+
+Neither TLC model includes automatic outro waiting or phase workers. These
+native regressions check that adapter; the models do not prove this lifecycle.
 
 ## Limits and result record
 
