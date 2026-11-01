@@ -1,23 +1,6 @@
 ----------------------------- MODULE FirstLive -----------------------------
 EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
 
-(* Bounded Engine projection; see verification/README.md for correspondence.
-   Initial receiver uses occurrence key 1; its loop may reuse that key. The
-   replacement uses key 2, satisfying replacement-source index uniqueness.
-   The initial receiver has three preparation attempts with independently
-   named PCM; the replacement has one fresh-key attempt. Each FIFO has capacity
-   one. Three initial attempts exercise normal current/next/history capacity
-   and surplus backpressure. A repeated replacement key would violate its
-   lifetime-unique-index contract. Head-only retains the real 12-slot prefetch
-   capacity; these inputs do NOT prove full head-queue occupancy.
-   Exactly one optional receiver replacement is explored, without generation
-   wraparound or reuse. Initial non-head preview exists at most once/Engine.
-   Attempt numbers are ghost allocation names, NEVER Failed/Upgrade guards.
-   Preview/full PCM names differ even when path and occurrence match.
-   Accepted hard jumps represent navigation ownership boundaries; transition
-   DSP, concurrent prev deck, restart aliases and scheduled replay are outside
-   this model. Engine actions serialize; producer steps may interleave. *)
-
 CONSTANTS None, Stable, Robust, FaultKind, CheckReceiver, CheckOccurrence, CheckUpgradeStage,
           EndFailedPreview, HoldFailedPermit, KeepTerminal
 ASSUME FaultKind \in {"None","ReadyDuplicate","FailureDuplicate","EarlyExhausted"}
@@ -103,10 +86,6 @@ SendFinal ==
                    !.phase[0]="Acquire", !.number[0]=2]
 Producer == Acquire \/ SendPrepared \/ SendFinal
 
-(* Upgrade messages carry path/index and a PreparedTrack, not generation.
-   Receiver selection is the generation isolation. The all-same-path legal
-   input retains the independent occurrence check; robust foreign input uses
-   the other key. No ghost attempt equality participates in the guard. *)
 UpgradeMatches(t,incoming) ==
  IF t=None THEN FALSE
  ELSE /\ (~CheckOccurrence \/ SameOccurrence(t,incoming))
@@ -156,21 +135,11 @@ Consume(g) ==
 DrainCurrent == Consume(s.gen)
 Drain == \E g \in Gens: Consume(g)
 
-(* One additional Upgrade is an explicit robustness input, outside the legal
-   producer language. Its payload may duplicate, precede Ready, arrive after
-   failure/adoption, use another occurrence/path, or itself be preview/head.
-   A single injected copy suffices to exercise duplicate adoption alongside
-   the genuine Upgrade. It does not acquire a permit. *)
 Inject(incoming) ==
  /\ Robust /\ ~s.stopped /\ ~s.injected /\ s.mail[s.gen]= <<>>
  /\ s'=[s EXCEPT !.injected=TRUE,
         !.mail[s.gen]= <<Msg("Upgrade",incoming,1,FALSE)>>]
 
-(* These three diagnostics intentionally violate the real producer contract.
-   They do not promise that Engine tolerates a forged extra permit owner,
-   duplicate untransferred failure or end-of-source ahead of remaining input.
-   The echo is recorded only AFTER a real message was consumed. Normal configs
-   keep it None, so it adds no behavioral state to their exploration. *)
 InjectTransport ==
  /\ FaultKind # "None" /\ ~s.stopped /\ ~s.transportInjected
  /\ s.mail[s.gen]= <<>>
@@ -251,9 +220,6 @@ CommitFuture ==
         !.reserved=(s.active=None), !.exhausted=FALSE,
         !.failedPcm=IF KeepTerminal THEN @ ELSE None]
 
-(* Real render/stop terminal boundaries and preview wait polling may leave
-   this frame/ownership abstraction unchanged. Keep only these justified
-   self-loops so TLC's default deadlock check still detects other stuck states. *)
 TerminalStutter ==
  /\ (s.stopped \/ (s.finished /\ s.phase[s.gen]="Done"))
  /\ UNCHANGED s
@@ -289,12 +255,7 @@ NoRetiredReceiverEffect == s.receiverSafe
 UpgradeSafe == s.upgradeSafe
 UpgradeAtMostOnce == s.upgrades<=1
 PlayheadPreserved == s.playheadSafe
-(* An AfterPreview failure never increases the current pool credit, even
-   after revoke already returned that preview slot. This is an action-local
-   credit property, not a proof of global permit conservation. *)
 NoPrematurePermitRelease == s.permitSafe
-(* The weak PCM allocation identity stays recorded across retirement, source
-   commit and Prev. Native tests own Weak lifetime/address-reuse adapters. *)
 TerminalIdentitySafe == s.terminalWitness => s.failedPcm=Pcm(Preview)
 RealtimeNeverBlocks == s.realtime => ~s.blocked
 StopIsTerminal == s.stopped => s.finished /\ ~s.blocked
@@ -306,10 +267,6 @@ PreviewEventuallyResolves ==
        => <>(s.active # Preview \/ s.position<Frames(Preview) \/ s.stopped))
 EventuallyFiniteSourceEnds == ~s.head => <>s.finished
 
-(* Transport diagnostics observe real buffer slots/credits/finish, not the
-   fault selector. They are checked separately from supported-protocol safety.
-   NoPrematureFinish is scoped to Stable: no Stop or replacement can legitimately
-   leave finished set while a different producer starts. *)
 BufferedPcmUnique ==
  LET slots == <<s.active,s.next,s.history>> \o s.heads
      held == {i \in DOMAIN slots: slots[i] # None}

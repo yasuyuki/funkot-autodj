@@ -53,8 +53,6 @@ fn report(path: &Path, cache_dir: &Path, bars: u32) -> Result<(), Box<dyn std::e
     let flux = funkot_core::analysis::onset_flux_envelope(&mono);
     let hop = funkot_core::analysis::ONSET_FLUX_HOP as f64;
 
-    // Reference = median over the scanned bars of the mean of the 2nd and 3rd
-    // strongest beat, i.e. what music_end_bar calls a typical bar.
     let scan_lo = (end_bar as i64 - 64).max(1);
     let mut typical: Vec<f64> = Vec::new();
     for b in scan_lo..end_bar as i64 {

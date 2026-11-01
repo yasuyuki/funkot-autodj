@@ -13,16 +13,6 @@ use crate::{
 };
 
 /// Cache format version; bump when the analyzer changes incompatibly.
-///
-/// 10: `outro_bars` is now `outro_structure_bars + OUTRO_LEAD_BARS` on every
-/// track (`analysis::outro_trigger_bars`). Version 9 entries carry triggers
-/// from the old conditional rule, which collapsed onto the structural
-/// boundary on tracks whose outro starts 64 bars from the end — the
-/// transition ran inside the outro there.
-/// 15: automatic section candidates start at 16 bars; v14 manual values are
-/// preserved while its automatic fields are reanalyzed.
-/// 14: head/tail classify scores (`ClassifyScores`: z / z_ratio / half_ratio)
-/// are stored on `TrackAnalysis` so threshold retunes need no re-decode.
 pub const CACHE_VERSION: u32 = 15;
 const PREVIOUS_CACHE_VERSION: u32 = 14;
 
@@ -50,7 +40,6 @@ pub fn content_hash(path: &Path) -> Result<String> {
 
     if len > HASH_CHUNK {
         let last_len = HASH_CHUNK.min(len) as usize;
-        // When len <= 128 KiB the last window overlaps the first; still hash as specified.
         let start = len.saturating_sub(HASH_CHUNK);
         file.seek(SeekFrom::Start(start))
             .map_err(|e| Error::Cache(format!("cannot seek in '{}': {e}", path.display())))?;
@@ -182,10 +171,8 @@ const WRITE_LOCK: &str = ".write.lock";
 /// not, and there this mutex is the whole guarantee.
 static WRITE_TURN: Mutex<()> = Mutex::new(());
 
-/// Whether a target has file locks is a property of the build, not of one write.
 static UNLOCKED_NOTICE: Once = Once::new();
 
-/// `File::lock`, with a seam so tests can reproduce a target that has none.
 fn lock_file(file: &fs::File) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(kind) = LOCK_FAILURE.with(std::cell::Cell::get) {
@@ -196,7 +183,7 @@ fn lock_file(file: &fs::File) -> std::io::Result<()> {
 
 /// A separate, persistent inode/handle serializes cooperating threads/processes.
 /// Never remove/replace this file while this cache can be in use. JSON readers
-/// need no lock. All of this I/O belongs on control/loader threads, not render.
+/// need no lock.
 struct CacheWriter {
     // Declared first so the file lock is released before the next writer in
     // this process is admitted.
@@ -209,8 +196,6 @@ impl CacheWriter {
         fs::create_dir_all(cache_dir).map_err(|e| {
             Error::Cache(format!("cannot create cache dir '{}': {e}", cache_dir.display()))
         })?;
-        // Taken before the file lock: it has to cover the same read-modify-write,
-        // and it is the only ordering left where the file lock is unavailable.
         let turn = WRITE_TURN.lock().unwrap_or_else(|e| e.into_inner());
         let path = cache_dir.join(WRITE_LOCK);
         let file = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
@@ -218,9 +203,8 @@ impl CacheWriter {
             .map_err(|e| Error::Cache(format!("cannot open cache lock '{}': {e}", path.display())))?;
         let held = match lock_file(&file) {
             Ok(()) => true,
-            // Android answers `Unsupported`. Refusing the write there left every
-            // track that still needed analysis unplayable, so keep writing with
-            // in-process serialization only; a second process would not be held off.
+            // Android answers `Unsupported`; keep writing with in-process
+            // serialization only, so a second process is not held off.
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
                 let (shown, reason) = (path.display().to_string(), e.to_string());
                 UNLOCKED_NOTICE.call_once(|| {
@@ -261,8 +245,6 @@ impl CacheWriter {
     }
 }
 
-/// Reconcile against the manual state observed *under the write lock*, including
-/// explicit clears and the exclusive outro modes. Auto completion state is fresh.
 fn reconcile_manual(latest: &TrackAnalysis, mut incoming: TrackAnalysis) -> TrackAnalysis {
     let needs_reanalysis = incoming.needs_reanalysis;
     incoming.intro_bars_manual = false;
@@ -375,7 +357,6 @@ pub fn purge_auto(cache_dir: &Path) -> Result<PurgeStats> {
     Ok(stats)
 }
 
-/// Keep only manually protected bar counts; mark for reanalysis.
 fn strip_auto_fields(a: &mut TrackAnalysis) {
     let intro_bars = if a.intro_bars_manual { a.intro_bars } else { 0 };
     let outro_bars = if a.outro_bars_manual { a.outro_bars } else { 0 };
@@ -393,12 +374,8 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
         first_downbeat: 0,
         outro_start: 0,
         intro_bars,
-        // Auto: recomputed from the fresh boundary next load.
         track_bars: 0,
         outro_bars,
-        // Stripped alongside the other auto fields unless hand-set;
-        // needs_reanalysis pulls in a fresh value (or a fresh
-        // FALLBACK_BARS-based one) next load.
         outro_structure_bars,
         bars_estimated_low_confidence: true,
         intro_bars_low_confidence: !intro_m,
@@ -407,7 +384,6 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
         outro_bars_manual: outro_m,
         outro_structure_bars_manual: structure_m,
         needs_reanalysis: true,
-        // Placeholder until reanalysis; overwritten by `analyze`.
         is_funkot: true,
         classify_scores: None,
         rms_dbfs: TARGET_RMS_DBFS,
@@ -415,14 +391,12 @@ fn strip_auto_fields(a: &mut TrackAnalysis) {
     };
 }
 
-/// Length of one bar in frames at the outro tempo.
 fn outro_bar_len(a: &TrackAnalysis) -> u64 {
     (60.0 / a.outro_bpm * f64::from(a.sample_rate) * f64::from(BEATS_PER_BAR))
         .round()
         .max(1.0) as u64
 }
 
-/// Recompute `outro_start` from `outro_bars`, `outro_bpm`, `sample_rate` and `total_frames`.
 fn recompute_outro_start(a: &mut TrackAnalysis) {
     let bar_len = outro_bar_len(a);
     a.outro_start = a
@@ -430,12 +404,6 @@ fn recompute_outro_start(a: &mut TrackAnalysis) {
         .saturating_sub(u64::from(a.outro_bars).saturating_mul(bar_len));
 }
 
-/// `track_bars`, or a stand-in for entries written before it was stored.
-///
-/// The fallback measures to the end of the *file* rather than the end of the
-/// music, so it runs long on tracks with a silent tail. It only feeds the
-/// "is the track long enough to hold the lead-in" bound, where being generous
-/// just means the plain boundary-plus-lead-in rule applies.
 fn track_bars_or_estimate(a: &TrackAnalysis) -> u32 {
     if a.track_bars > 0 {
         return a.track_bars;
@@ -443,10 +411,6 @@ fn track_bars_or_estimate(a: &TrackAnalysis) -> u32 {
     (a.total_frames.saturating_sub(a.first_downbeat) / outro_bar_len(a)) as u32
 }
 
-/// Legacy v14 entries may contain the old automatic 64/80 fallback even when
-/// that pair cannot fit in the track. Preserve every manual or confident
-/// result; only route an impossible automatic both-low result through the
-/// existing reanalysis and persistence path.
 fn automatic_both_low_geometry_is_impossible(a: &TrackAnalysis) -> bool {
     if a.intro_bars_manual || a.outro_bars_manual || a.outro_structure_bars_manual
         || !a.intro_bars_low_confidence || !a.outro_bars_low_confidence {
@@ -463,8 +427,6 @@ fn automatic_both_low_geometry_is_impossible(a: &TrackAnalysis) -> bool {
     track_bars.is_some_and(|bars| a.intro_bars.saturating_add(a.outro_bars) > bars)
 }
 
-/// Re-derive the mix trigger (and `outro_start`) from the structural boundary,
-/// by the same rule `analysis::analyze` applies.
 fn derive_outro_from_structure(a: &mut TrackAnalysis) {
     a.outro_bars = crate::analysis::outro_trigger_bars(
         a.outro_structure_bars,
@@ -473,8 +435,6 @@ fn derive_outro_from_structure(a: &mut TrackAnalysis) {
     );
     recompute_outro_start(a);
 }
-
-/// A manual trigger override also clips the structural count to that trigger.
 
 fn clamp_structure_to_outro(a: &mut TrackAnalysis) {
     a.outro_structure_bars = a.outro_structure_bars.min(a.outro_bars);
@@ -496,8 +456,6 @@ pub fn apply_manual_overrides(manual: &TrackAnalysis, mut fresh: TrackAnalysis) 
         fresh.outro_structure_bars_manual = true;
         fresh.outro_bars_manual = false;
         fresh.outro_bars_low_confidence = false;
-        // Derived from the boundary the *user* set, but against this analysis'
-        // fresh intro and length — the same inputs `analyze` would have used.
         derive_outro_from_structure(&mut fresh);
     } else if manual.outro_bars_manual {
         fresh.outro_bars = manual.outro_bars;
@@ -580,8 +538,6 @@ pub fn set_manual_bars(
         analysis.outro_bars = n;
         analysis.outro_bars_manual = true;
         analysis.outro_bars_low_confidence = false;
-        // Pinning the trigger by hand takes the outro edge out of the
-        // boundary's control, so an earlier boundary edit no longer applies.
         analysis.outro_structure_bars_manual = false;
         recompute_outro_start(&mut analysis);
         clamp_structure_to_outro(&mut analysis);
@@ -644,8 +600,6 @@ pub fn get_or_analyze(
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
     let analysis = crate::analysis::analyze(buffer, file_name)?;
-    // Analysis is expensive and stays outside the write lock. Re-read manual
-    // state at commit time rather than resurrecting our initial snapshot.
     #[cfg(test)]
     BEFORE_ANALYSIS_COMMIT.with(|hook| {
         if let Some(before_commit) = hook.borrow_mut().take() { before_commit(); }
@@ -702,7 +656,6 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         .round()
         .max(1.0) as u64;
     let total_bars = (buffer.frames / bar_len) as u32;
-    // Don't claim a 64-bar outro on a shorter file (would put outro_start at 0).
     let section_bars = FALLBACK_BARS.min(total_bars / 3).max(1);
     let outro_start = buffer
         .frames
@@ -719,8 +672,6 @@ pub fn provisional(buffer: &AudioBuffer, file_name: &str) -> TrackAnalysis {
         intro_bars: section_bars,
         track_bars: total_bars,
         outro_bars: section_bars,
-        // Naive placeholder, no structural detection ran; mirrors outro_bars
-        // like every other field here (all low-confidence by construction).
         outro_structure_bars: section_bars,
         bars_estimated_low_confidence: true,
         intro_bars_low_confidence: true,
@@ -793,7 +744,6 @@ mod tests {
         }
     }
 
-    /// Process-unique scratch dir under the system temp dir, cleaned up on drop.
     struct TempDir(std::path::PathBuf);
 
     impl TempDir {
@@ -1033,14 +983,11 @@ mod tests {
         assert!(result.intro_bars_manual);
     }
 
-    /// The dangerous direction: editing one side must not mark the *other* side
-    /// manual. A wrongly-set flag pins an auto-detected value forever and is
-    /// indistinguishable from real hand-editing afterwards.
     #[test]
     fn set_manual_bars_does_not_mark_the_other_side_manual() {
         let dir = TempDir::new("intro-auto");
         let hash = TEST_HASH;
-        let analysis = sample_analysis(); // both *_manual are false
+        let analysis = sample_analysis();
         store(dir.path(), hash, &analysis).unwrap();
 
         let result = set_manual_bars(dir.path(), hash, None, Some(20)).unwrap();
@@ -1054,10 +1001,6 @@ mod tests {
         assert!(result.intro_bars_manual);
     }
 
-    /// A hand-edited trigger is the one path that can put the structural
-    /// boundary behind `outro_bars`, breaking the invariant `analyze` holds by
-    /// construction — and it breaks it on exactly the hand-corrected tracks
-    /// `eval_sections` cares most about.
     #[test]
     fn set_manual_bars_outro_clamps_the_structural_boundary() {
         let dir = TempDir::new("outro-clamp");
@@ -1092,8 +1035,6 @@ mod tests {
         );
     }
 
-    /// Reanalysis re-applies the stored manual trigger onto a *fresh* boundary,
-    /// so the same clamp has to run there too.
     #[test]
     fn apply_manual_overrides_clamps_the_structural_boundary() {
         let mut manual = sample_analysis();
@@ -1135,9 +1076,6 @@ mod tests {
         assert_eq!(load(dir.path(), hash).unwrap(), result);
     }
 
-    /// The two manual outro edits describe the same edge, so the later one has
-    /// to win outright — leaving both flags set would make the next reanalysis
-    /// pick between them.
     #[test]
     fn manual_outro_edits_replace_each_other() {
         let dir = TempDir::new("structure-excl");
@@ -1158,8 +1096,6 @@ mod tests {
         assert_eq!(result.outro_structure_bars, 24, "clamped to the trigger");
     }
 
-    /// Reanalysis has to re-derive the trigger rather than restore the stored
-    /// one: the fresh analysis may have found a different intro or length.
     #[test]
     fn apply_manual_overrides_rederives_from_a_hand_set_boundary() {
         let mut manual = sample_analysis();
@@ -1178,8 +1114,6 @@ mod tests {
         assert!(!result.needs_reanalysis);
     }
 
-    /// Entries written before `track_bars` existed still have to derive a
-    /// trigger; the file-length estimate stands in for the stored value.
     #[test]
     fn set_manual_structure_bars_without_stored_track_bars() {
         let dir = TempDir::new("structure-old");
@@ -1192,8 +1126,6 @@ mod tests {
         assert_eq!(result.outro_bars, 48);
     }
 
-    /// `purge_auto` protects hand-edited bars. A hand-set boundary is one, and
-    /// deleting the entry would throw the edit away silently.
     #[test]
     fn purge_auto_keeps_a_hand_set_boundary() {
         let dir = TempDir::new("structure-purge");
@@ -1221,8 +1153,6 @@ mod tests {
         }
     }
 
-    /// Scores below the live cut must flip `is_funkot` on load even when the
-    /// JSON still says true (threshold retune without CACHE_VERSION bump).
     #[test]
     fn load_reapplies_verdict_from_classify_scores() {
         let dir = TempDir::new("verdict-reload");
@@ -1377,8 +1307,6 @@ mod tests {
         let inaccessible = cache_path(dir.path(), &hash).unwrap();
         fs::write(&inaccessible, serde_json::to_vec(&sample_analysis()).unwrap()).unwrap();
         fs::set_permissions(&inaccessible, fs::Permissions::from_mode(0)).unwrap();
-        // Empty audio would fail analysis with a different error. The I/O error
-        // must win before the analyzer sees it.
         let empty = crate::decode::AudioBuffer { samples: vec![], sample_rate: 44_100, frames: 0 };
         let error = get_or_analyze(&source, dir.path(), &empty).unwrap_err();
         assert!(error.to_string().contains("cannot read cache"), "{error}");
@@ -1405,7 +1333,6 @@ mod tests {
             assert_eq!(fs::read_to_string(&other).unwrap(), "owned by another writer");
             assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3, "only entry, lock, other temp");
         }
-        // Exercise a real persist error too, without removing an existing target.
         let writer = CacheWriter::acquire(dir.path()).unwrap();
         let destination = dir.path().join("blocked.json");
         fs::create_dir(&destination).unwrap();
@@ -1425,8 +1352,6 @@ mod tests {
 
     #[test]
     fn writes_and_keeps_manual_edits_where_the_target_has_no_file_lock() {
-        // Android: `File::lock` answers `Unsupported`, and refusing the write
-        // there left every not-yet-analyzed track unplayable.
         let dir = TempDir::new("unsupported-lock");
         let stale = sample_analysis();
         with_lock_failure(std::io::ErrorKind::Unsupported, || {
@@ -1575,7 +1500,6 @@ mod tests {
         let dir = TempDir::new("processes");
         store(dir.path(), TEST_HASH, &sample_analysis()).unwrap();
         let lock = CacheWriter::acquire(dir.path()).unwrap();
-        // Separate handles must conflict even within this process.
         let second = fs::OpenOptions::new().read(true).write(true).open(dir.path().join(WRITE_LOCK)).unwrap();
         assert!(matches!(second.try_lock(), Err(fs::TryLockError::WouldBlock)));
         let mut children = Vec::new();

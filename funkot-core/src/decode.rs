@@ -90,7 +90,6 @@ fn open_format<'s>(
         match IsoMp4Reader::try_probe_new(mss, fmt_opts.clone()) {
             Ok(format) => return Ok(format),
             Err(e) => {
-                // Re-open for probe fallback (mss was consumed).
                 let file = File::open(path).map_err(|io| {
                     Error::Decode(format!(
                         "isomp4 open failed for '{}' ({e}); re-open: {io}",
@@ -128,8 +127,6 @@ fn probe_format<'s>(
         })
 }
 
-/// Decode an entire audio file to stereo f32 at native sample rate, using
-/// symphonia directly (no ffmpeg fallback). See [`decode_file`].
 fn decode_native(path: &Path) -> Result<AudioBuffer> {
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -168,10 +165,6 @@ fn decode_native(path: &Path) -> Result<AudioBuffer> {
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(audio_params, &dec_opts)
         .map_err(|e| {
-            // The container was recognized but no decoder exists for its
-            // codec (e.g. Opus inside Ogg) — this is the ffmpeg fallback's
-            // entry point in `decode_file`, so it must be `UnsupportedFormat`
-            // and not `Decode`.
             Error::UnsupportedFormat(format!(
                 "cannot create decoder for '{}': {}",
                 path.display(),
@@ -286,9 +279,6 @@ pub fn decode_file(path: &Path) -> Result<AudioBuffer> {
     }
 }
 
-/// Append the original `decode_native` failure reason to a conversion error,
-/// keeping the error's variant (so an ffmpeg-not-found error, for example,
-/// stays [`Error::UnsupportedFormat`]).
 fn with_native_failure_context(e: Error, native_why: &str) -> Error {
     match e {
         Error::UnsupportedFormat(m) => {
@@ -301,11 +291,6 @@ fn with_native_failure_context(e: Error, native_why: &str) -> Error {
     }
 }
 
-/// Convert interleaved multi-channel samples to interleaved stereo.
-///
-/// - 1ch → duplicate to L/R
-/// - 2ch → as-is
-/// - >2ch → take channels 0 and 1
 fn append_as_stereo(dst: &mut Vec<f32>, interleaved: &[f32], channels: usize) {
     if channels == 0 || interleaved.is_empty() {
         return;
@@ -433,20 +418,17 @@ mod tests {
             sample_rate: 48_000,
             frames: 4,
             samples: vec![
-                1.0, 3.0, // → 2.0
-                2.0, 4.0, // → 3.0
-                0.0, 2.0, // → 1.0
-                -2.0, 0.0, // → -1.0
+                1.0, 3.0,
+                2.0, 4.0,
+                0.0, 2.0,
+                -2.0, 0.0,
             ],
         };
 
         assert_eq!(buf.mono(), vec![2.0, 3.0, 1.0, -1.0]);
         assert_eq!(buf.mono_range(1, 2), vec![3.0, 1.0]);
-        // start past end → empty
         assert!(buf.mono_range(10, 5).is_empty());
-        // len clamps to end
         assert_eq!(buf.mono_range(2, 100), vec![1.0, -1.0]);
-        // start + len overflow clamps
         assert_eq!(buf.mono_range(u64::MAX - 1, 10), Vec::<f32>::new());
     }
 
@@ -456,12 +438,6 @@ mod tests {
         std::fs::write(&path, b"not an audio file at all").expect("write bogus");
         let err = decode_file(&path).expect_err("should fail");
         let _ = std::fs::remove_file(&path);
-        // Without ffmpeg on PATH this is `UnsupportedFormat` straight from
-        // decode_native's probe failure. With ffmpeg present, decode_file
-        // also tries the conversion fallback; ffmpeg can't make sense of
-        // this file either and fails, so the error becomes `Decode` — but
-        // either way the original probe failure has to still be in the
-        // message (see `with_native_failure_context`).
         let msg = match &err {
             Error::UnsupportedFormat(msg) | Error::Decode(msg) => msg,
             other => panic!("expected UnsupportedFormat or Decode, got {other}"),

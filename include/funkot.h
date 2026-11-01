@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-typedef struct FunkotEngine FunkotEngine; /* opaque */
+typedef struct FunkotEngine FunkotEngine;
 
 /*
  * A handle has one owner. Do not call any function concurrently on the same
@@ -82,4 +82,4 @@ void funkot_engine_free(FunkotEngine* engine);
 }
 #endif
 
-#endif /* FUNKOT_H */
+#endif

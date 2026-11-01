@@ -1,6 +1,4 @@
 #!/bin/sh
-# bar_phase_diag over every track in testdata/file_list.txt (absolute paths
-# pass through, bare names are testdata/-relative).
 set -eu
 cd /work
 IFS='

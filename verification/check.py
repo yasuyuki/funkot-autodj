@@ -34,7 +34,6 @@ from first_live_mutations import FIRST_LIVE_MUTATIONS
 command = ["kani", "verification/transition_geometry.rs", "--target-dir", "/tmp/kani-proof",
            "-j", "1", "--output-format", "terse", "-Z", "unstable-options",
            "--export-json", str(result / "kani.json")]
-# The container limit covers the compiler, verifier and all solver processes.
 limit = int(Path("/sys/fs/cgroup/memory.max").read_text())
 assert 0 < limit <= 8 * 1024**3, "verification requires a total 8 GiB cgroup limit"
 with (result / "kani.log").open("w") as log:

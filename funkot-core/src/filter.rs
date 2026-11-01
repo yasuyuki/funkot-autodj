@@ -23,7 +23,6 @@ impl Biquad {
     fn highpass(sample_rate: u32, cutoff_hz: f32) -> Self {
         let sr = f64::from(sample_rate).max(1.0);
         let mut fc = f64::from(cutoff_hz);
-        // Keep the design frequency inside (0, Nyquist).
         let nyquist = sr * 0.5;
         if !(fc.is_finite() && fc > 0.0) {
             fc = 1.0;
@@ -36,7 +35,6 @@ impl Biquad {
         let q = std::f64::consts::FRAC_1_SQRT_2;
         let alpha = sin_w0 / (2.0 * q);
 
-        // RBJ Cookbook high-pass: b0=(1+cos)/2, b1=-(1+cos), b2=(1+cos)/2.
         let b0 = (1.0 + cos_w0) * 0.5;
         let b1 = -(1.0 + cos_w0);
         let b2 = (1.0 + cos_w0) * 0.5;
@@ -114,7 +112,6 @@ mod tests {
             let mut r = x;
             f.process_frame(&mut l, &mut r);
             sum_sq += f64::from(l) * f64::from(l);
-            // Stereo channels should match for identical input.
             assert!((l - r).abs() < 1e-6, "stereo mismatch l={l} r={r}");
         }
         (sum_sq / measure as f64).sqrt() as f32
@@ -129,7 +126,6 @@ mod tests {
         assert_eq!(l, 0.0);
         assert_eq!(r, 0.0);
 
-        // Drive with signal then reset; silence must stay quiet.
         for _ in 0..1000 {
             l = 0.5;
             r = -0.5;
@@ -150,7 +146,6 @@ mod tests {
         let settle = 20_000usize;
         let measure = 8_000usize;
 
-        // DC: steady 1.0 must be strongly attenuated (HPF blocks DC).
         let mut f = StereoHighPass::new(sr, cutoff);
         let mut l = 0.0f32;
         let mut r = 0.0f32;
@@ -162,7 +157,6 @@ mod tests {
         assert!(l.abs() < 1e-3, "DC left not attenuated: {l}");
         assert!(r.abs() < 1e-3, "DC right not attenuated: {r}");
 
-        // ~50 Hz (well below 300 Hz) strongly attenuated vs unity-ish input RMS.
         let mut f50 = StereoHighPass::new(sr, cutoff);
         let rms_50 = rms_after_settle(&mut f50, 50.0, sr, settle, measure);
         assert!(
@@ -170,7 +164,6 @@ mod tests {
             "50 Hz should be strongly attenuated, rms={rms_50}"
         );
 
-        // 2 kHz (well above 300 Hz) should pass near full level (sine RMS ≈ 0.707).
         let mut f2k = StereoHighPass::new(sr, cutoff);
         let rms_2k = rms_after_settle(&mut f2k, 2_000.0, sr, settle, measure);
         assert!(rms_2k > 0.55, "2 kHz should pass, rms={rms_2k}");

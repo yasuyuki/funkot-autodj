@@ -239,8 +239,6 @@ fn side_cols(s: &analysis::SideProbe) -> String {
         Some(b) => format!("{b:.2}"),
         None => "-".to_string(),
     };
-    // `half_ratio` is infinite when the grid carries no signal at all; print
-    // it as "inf" rather than letting it widen the column unpredictably.
     let half = if s.half_ratio.is_finite() {
         format!("{:.3}", s.half_ratio)
     } else {

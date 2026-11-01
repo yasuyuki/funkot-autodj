@@ -17,8 +17,6 @@ fn upgrade_admission_all_facts() {
     if same && preview && !head_only && !failed && !incoming_preview {
         assert!(apply);
     }
-    // A successful adoption changes preview to false. Repeating that Upgrade
-    // cannot replace PCM or restart its fade, even with the same occurrence.
     if apply {
         assert!(!upgrade_allowed(same, false, head_only, failed, incoming_preview));
     }
@@ -52,7 +50,6 @@ fn preview_wait_all_facts() {
     if decision == PreviewWait::Poll {
         assert!(awaiting && !stopped && !finished && !failed && !exhausted && !replay && blocking);
     }
-    // Realtime and staged replay never enter the sleeping poll path.
     if !blocking || replay {
         assert_ne!(decision, PreviewWait::Poll);
     }
@@ -71,8 +68,6 @@ fn failure_permit_transfer_all_variants() {
     let transferred: bool = kani::any();
     let permit = if transferred { FailedPermit::TransferredToPreview } else { FailedPermit::Untransferred };
     let release = release_failed_permit(permit);
-    // Ready already transferred this attempt's permit to its preview. Revoking
-    // that preview returns the same permit; its final failure never returns it.
     assert_eq!(release, !transferred);
     kani::cover!(release);
     kani::cover!(!release);

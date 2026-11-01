@@ -26,69 +26,16 @@ use serde::Serialize;
 use funkot_core::labels::{load_labels, SectionLabel};
 use funkot_core::{analysis, cache, decode};
 
-// ---------------------------------------------------------------------
-// Outro label <-> TrackAnalysis comparison.
-//
-// `TrackAnalysis::outro_bars` (see funkot-core/src/lib.rs) is the DJ mix
-// trigger: the musical main->outro structural boundary, plus a mix lead-in
-// that is only added when there's room for it. Labels record the
-// structural boundary itself (what a human hears as "this is where the
-// outro starts"), since that's the thing that's well-defined and checkable
-// by ear -- the lead-in is a DJ-timing choice layered on top, and is *not*
-// a fixed offset from the structural boundary (it clamps independently
-// against FALLBACK_BARS, and is skipped entirely when the outro is too
-// short to fit it). An earlier version of this harness reconstructed the
-// structural boundary as `outro_bars - 16`, which silently collapsed to 0
-// (or otherwise diverged) whenever the lead-in wasn't actually added.
-// `TrackAnalysis::outro_structure_bars` (cache version 9+) is the analyzer
-// exposing that structural boundary directly, so comparison here needs no
-// conversion or duplicated constant.
-
-// ---------------------------------------------------------------------
-// DJ severity cost weights.
-//
-// `analyze()`'s two sides fail in asymmetric ways for a DJ:
-//  - Intro too short (estimate < truth): the next track is treated as
-//    already in its audible main while it's still intro -- the transition
-//    schedule pulls the previous track's fade-out earlier than the mix
-//    point actually supports, i.e. the *previous* track gets cut off
-//    mid-material. Audible train-wreck. Heavily penalized.
-//  - Intro too long (estimate > truth): the switch to next-track-audible
-//    happens a bit later than it could have; at worst a slightly longer
-//    solo intro. Mildly penalized.
-//  - Outro too long / overestimated (mixing starts before the true
-//    structural boundary): the DJ starts blending a bit into the last
-//    energetic bars of the main -- early, but Funkot mains are dense so a
-//    few bars of overlap is forgiving. Mildly penalized.
-//  - Outro too short / underestimated (mixing starts after the true
-//    boundary, i.e. after the energy has already collapsed): the mix
-//    starts over a dead/quiet tail, which is the definitionally audible
-//    failure mode outro detection exists to avoid. Heavily penalized.
-//
-// The 4x ratio between "heavy" and "light" is a judgment call, not measured
-// from listening tests (none exist yet -- that's the whole reason Stage 0
-// exists). Treat these as a placeholder baseline; revisit once Stage 3 has
-// enough evaluated changes to argue for different weights.
 const INTRO_UNDERESTIMATE_WEIGHT: f64 = 2.0;
 const INTRO_OVERESTIMATE_WEIGHT: f64 = 0.5;
 const OUTRO_OVERESTIMATE_WEIGHT: f64 = 0.5;
 const OUTRO_UNDERESTIMATE_WEIGHT: f64 = 2.0;
-/// Normalizes cost so an error of one default fade length (4 bars) at the
-/// light weight costs 0.125, and a heavy-direction miss of one fade-pair
-/// width (`2 * fade_bars` = 8 bars, roughly the whole solo-intro gap /
-/// [`funkot_core::MAIN_GAP_BARS`]) costs 1.0.
 const COST_NORM_BARS: f64 = 16.0;
 
-/// BPM sanity band for the downbeat/tempo grid. Outside this, the intro or
-/// outro tempo measurement is probably wrong and bar-count comparisons for
-/// that track aren't meaningful.
 const GRID_BPM_MIN: f64 = 172.0;
 const GRID_BPM_MAX: f64 = 188.0;
-/// Max allowed |intro_bpm - outro_bpm| before flagging a possible mid-track
-/// grid slip (drift/half-double tempo estimate on one side).
 const GRID_BPM_DRIFT_MAX: f64 = 1.0;
 
-/// Confusion-matrix / report axis. Values outside this set collapse to "other".
 const CANDIDATE_BARS: [u32; 7] = [8, 16, 32, 48, 64, 80, 96];
 
 fn main() {
@@ -198,7 +145,6 @@ impl Opts {
     }
 }
 
-/// One label matched to a successfully decoded+analyzed audio file.
 struct TrackEval {
     hash: String,
     file_name: String,
@@ -207,27 +153,15 @@ struct TrackEval {
     intro_pred: u32,
     intro_low_conf: bool,
     intro_cost: f64,
-    /// Structural-boundary label (not `TrackAnalysis::outro_bars`).
     outro_true: u32,
     outro_ok: Vec<u32>,
-    /// `TrackAnalysis::outro_structure_bars` (the analyzer's own structural
-    /// boundary estimate, no lead-in). See the module-level comment.
     outro_pred: u32,
     outro_low_conf: bool,
     outro_cost: f64,
     intro_bpm: f64,
     outro_bpm: f64,
     grid_suspect: bool,
-    /// `true` if the cached `TrackAnalysis` has any hand-edited section
-    /// length (`intro_bars_manual`, `outro_bars_manual`, or
-    /// `outro_structure_bars_manual`). Only possible when `--cache-dir` is
-    /// given and points at a cache populated by `--label-sections` (which
-    /// overwrites the analyzer's own bar count with the label value via
-    /// `cache::set_manual_bars`/`set_manual_structure_bars`). `analyze()`
-    /// itself never sets these flags, so this is always `false` without
-    /// `--cache-dir`.
     manual_override: bool,
-    /// `label.dup_group()` — see `fold_hash` for why this is tracked here.
     dup_group: Option<String>,
 }
 
@@ -276,13 +210,6 @@ fn run(opts: &Opts) -> Result<(), String> {
             continue;
         };
 
-        // A row with only one side labeled (the other still `None`, e.g. a
-        // note-only row saved by `--label-sections`'s `s`/`q` handling)
-        // isn't ready to evaluate. While these are rare, mixing partial rows
-        // into the metrics would need per-side sample counts that differ
-        // from every other report here; excluding them keeps the baseline
-        // comparison simple. Revisit with a side-by-side evaluation once
-        // enough partial rows accumulate to matter.
         let (Some(intro_best), Some(outro_best)) = (label.intro_best, label.outro_best) else {
             partial_labels += 1;
             continue;
@@ -384,11 +311,6 @@ fn run(opts: &Opts) -> Result<(), String> {
     println!("decode errors:    {decode_errors}");
     println!("analyze errors:   {analyze_errors}");
 
-    // Cache-contamination self-check (see `TrackEval::manual_override`).
-    // `analyze()` never sets these flags, so without `--cache-dir` this
-    // block computes to zero and, per the requirement that a no-cache-dir
-    // run's output not change by even one character, is skipped entirely
-    // rather than printed as a zero count.
     let manual_overrides: Vec<&TrackEval> = records.iter().filter(|r| r.manual_override).collect();
     if opts.cache_dir.is_some() {
         println!(
@@ -427,11 +349,6 @@ fn run(opts: &Opts) -> Result<(), String> {
 
     println!();
 
-    // Looks at all loaded labels (not just `records`/evaluated tracks), per
-    // the requirement that a note on a partial or audio-less row still gets
-    // reported. Prints nothing at all when no label has any tag, so today's
-    // tag-free labels.tsv produces byte-identical output to before this
-    // existed.
     print_note_tag_summary(&labels);
 
     if records.is_empty() {
@@ -501,9 +418,6 @@ fn run(opts: &Opts) -> Result<(), String> {
     )
 }
 
-/// Asymmetric DJ-severity cost. `ok` entries always cost 0 regardless of
-/// direction (a value the label considers acceptable is, by definition, not
-/// an error worth penalizing).
 fn section_cost(true_v: u32, pred_v: u32, ok: &[u32], underestimate_w: f64, overestimate_w: f64) -> f64 {
     if ok.contains(&pred_v) {
         return 0.0;
@@ -512,9 +426,6 @@ fn section_cost(true_v: u32, pred_v: u32, ok: &[u32], underestimate_w: f64, over
     let w = if d < 0 { underestimate_w } else { overestimate_w };
     w * (d.unsigned_abs() as f64) / COST_NORM_BARS
 }
-
-// ---------------------------------------------------------------------
-// Metrics
 
 struct SideMetrics {
     n: usize,
@@ -525,7 +436,6 @@ struct SideMetrics {
     low_conf_recall: Option<f64>,
 }
 
-/// `(true, pred, ok_set, cost, low_confidence)` view of one side of one track.
 type SidePoint<'a> = (u32, u32, &'a [u32], f64, bool);
 
 fn compute_side_metrics(points: &[SidePoint]) -> SideMetrics {
@@ -683,13 +593,6 @@ fn fold_of(hash: &str, folds: u32) -> u32 {
     n % folds
 }
 
-/// For every `DUP:` group, the `content_hash` of whichever member appears
-/// first in `records` order (i.e. the order tracks were given on the
-/// command line / in the playlist). That first-seen hash is arbitrary --
-/// it depends on input order, not on any property of the track -- but it is
-/// deterministic for a fixed `records` slice, which is all `fold_hash`
-/// needs: every member of the group must land in the same fold, and this
-/// is a stable way to pick which member's hash decides that fold.
 fn dup_fold_representatives(records: &[TrackEval]) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for r in records {
@@ -700,12 +603,6 @@ fn dup_fold_representatives(records: &[TrackEval]) -> HashMap<String, String> {
     map
 }
 
-/// The hash `fold_of` should use for `r`: its own `content_hash`, unless it
-/// carries a `DUP:` tag, in which case its whole group shares the
-/// representative hash from `dup_representatives` (see
-/// `dup_fold_representatives`). This is what keeps re-releases/edits of the
-/// same underlying track from splitting across folds, without changing the
-/// fold assignment of any track that has no `DUP:` tag.
 fn fold_hash<'a>(dup_representatives: &'a HashMap<String, String>, r: &'a TrackEval) -> &'a str {
     match &r.dup_group {
         Some(g) => dup_representatives.get(g).map(|s| s.as_str()).unwrap_or(r.hash.as_str()),
@@ -741,13 +638,6 @@ fn print_folds(records: &[TrackEval], folds: u32) {
     }
 }
 
-/// Reports every `KEY:VALUE` tag found in any loaded label's `note` (see
-/// `labels::SectionLabel::note_tags`) — deliberately over *all* `labels`,
-/// not just `records` (evaluated tracks), so a note on a partially-labeled
-/// or audio-less row is still visible instead of silently dropped. Prints
-/// nothing at all when no label has any tag, so a labels file with no tags
-/// (today's baseline) produces byte-identical output to before this
-/// section existed.
 fn print_note_tag_summary(labels: &[SectionLabel]) {
     let mut by_key: std::collections::BTreeMap<String, HashMap<String, u32>> =
         std::collections::BTreeMap::new();
@@ -785,8 +675,6 @@ fn print_note_tag_summary(labels: &[SectionLabel]) {
         }
     }
 
-    // Notes carrying free text but zero recognized tags -- flagged so a
-    // labeler's prose doesn't just vanish from this summary.
     let untagged: Vec<&SectionLabel> = labels
         .iter()
         .filter(|l| !l.note.trim().is_empty() && l.note_tags().is_empty())
@@ -799,10 +687,6 @@ fn print_note_tag_summary(labels: &[SectionLabel]) {
     }
     println!();
 }
-
-// ---------------------------------------------------------------------
-// Playlist loading (minimal local reimplementation; funkot-core has no
-// dependency on funkot-cli, so this can't reuse funkot_cli::playlist).
 
 fn load_playlist(path: &Path) -> Result<Vec<PathBuf>, String> {
     let contents = fs::read_to_string(path)
@@ -822,9 +706,6 @@ fn load_playlist(path: &Path) -> Result<Vec<PathBuf>, String> {
     }
     Ok(out)
 }
-
-// ---------------------------------------------------------------------
-// JSON export
 
 #[derive(Serialize)]
 struct SideMetricsJson {
@@ -946,16 +827,11 @@ struct CountsJson {
     audio_files_given: usize,
     evaluated: usize,
     unlabeled: usize,
-    /// Rows with only one side labeled (the other still `None`) — not
-    /// evaluated, see the comment at the exclusion site in `run`.
     partial_labels: usize,
     missing_audio: usize,
     hash_errors: usize,
     decode_errors: usize,
     analyze_errors: usize,
-    /// Evaluated tracks whose cached analysis has a hand-edited
-    /// intro/outro/outro_structure bar count (see
-    /// `TrackEval::manual_override`). Always 0 without `--cache-dir`.
     manual_overrides: usize,
 }
 

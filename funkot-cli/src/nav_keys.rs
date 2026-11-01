@@ -1,13 +1,7 @@
-//! Left/right cursor multi-press coalescing for skip / rewind.
-//!
-//! Window is 500ms (common double-click / multi-tap interval). Same-direction
-//! taps accumulate; a direction change or timeout flushes the prior group.
-
 use std::time::{Duration, Instant};
 
 use funkot_core::engine::NavAction;
 
-/// Standard multi-tap / double-click coalescing window.
 pub const MULTI_PRESS_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +10,6 @@ pub enum NavDir {
     Right,
 }
 
-/// Coalesce rapid left/right taps into a single [`NavAction`].
 #[derive(Debug, Default)]
 pub struct MultiPressAggregator {
     dir: Option<NavDir>,
@@ -29,8 +22,6 @@ impl MultiPressAggregator {
         Self::default()
     }
 
-    /// Record a tap. Returns a completed action when the direction changes
-    /// (flushing the previous group before starting the new one).
     pub fn press(&mut self, dir: NavDir, now: Instant) -> Option<NavAction> {
         match self.dir {
             None => {
@@ -63,7 +54,6 @@ impl MultiPressAggregator {
         }
     }
 
-    /// If the window has elapsed since the last tap, flush the pending group.
     pub fn poll_timeout(&mut self, now: Instant) -> Option<NavAction> {
         let last = self.last?;
         if self.dir.is_none() || self.count == 0 {
@@ -76,7 +66,6 @@ impl MultiPressAggregator {
         }
     }
 
-    /// Force-flush any pending taps (e.g. on shutdown).
     pub fn flush(&mut self) -> Option<NavAction> {
         self.take_action()
     }
@@ -93,11 +82,10 @@ impl MultiPressAggregator {
     }
 }
 
-/// Map a coalesced tap count to a nav action (left ≥3 → jump prev, right ≥2 → jump next).
 pub fn action_for(dir: NavDir, count: u32) -> NavAction {
     match dir {
         NavDir::Left => match count {
-            0 => NavAction::RestartCurrent, // unreachable via take_action
+            0 => NavAction::RestartCurrent,
             1 => NavAction::RestartCurrent,
             2 => NavAction::TransitionToPrev,
             _ => NavAction::JumpToPrevIntro,

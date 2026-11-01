@@ -20,13 +20,8 @@ use funkot_cli::label_session::{bar_frames_for, Side};
 use funkot_core::analysis::beat_phase_comb_scores;
 use funkot_core::{cache, decode::decode_file};
 
-/// Windows with `|d_best| > MOVED_THRESHOLD_BEATS` are counted as "moved"
-/// (comb disagreed with the analysis grid) in the per-track summary.
 const MOVED_THRESHOLD_BEATS: f64 = 0.25;
 
-/// Splits the comb's candidates into the branch near the analysis grid and
-/// the branch around the offbeat. The two flux peaks a Funkot master offers
-/// sit half a beat apart; this is where one stops and the other starts.
 const NEAR_LIMIT_BEATS: f64 = 0.25;
 
 fn main() {
@@ -62,19 +57,11 @@ fn main() {
     }
 }
 
-/// One window's worth of the numbers this diagnostic cares about, pulled out
-/// of [`beat_phase_comb_scores`]'s per-delta list.
 struct WindowStats {
     d_best: f64,
     best_over_zero: f64,
     off_over_zero: f64,
     kick0_over_kickbest: f64,
-    /// Best-scoring delta within `NEAR_LIMIT_BEATS` of the analysis grid, and
-    /// the best outside it, with the ratio between them. `lock_beat_phase`
-    /// compares its winner against `delta == 0` alone, which on these masters
-    /// sits in the *trough* between the two peaks (the grid is a few
-    /// hundredths of a beat off), so that ratio says nothing about how
-    /// decisively the offbeat won. This one does.
     near_d: f64,
     far_d: f64,
     far_over_near: f64,
@@ -86,9 +73,6 @@ fn window_stats(scores: &[funkot_core::analysis::BeatPhaseScore], beat: f64) -> 
     }
     let zero = scores.iter().find(|s| s.delta == 0)?;
     let best = scores.iter().max_by(|a, b| a.flux.total_cmp(&b.flux))?;
-    // The offbeat phase is at one of the two ends of the delta range (the
-    // comb's radius is half a beat), whichever end scores higher — the sign
-    // of the true beat/offbeat split is not known a priori.
     let min_delta = scores.iter().min_by_key(|s| s.delta)?;
     let max_delta = scores.iter().max_by_key(|s| s.delta)?;
     let off = if min_delta.flux >= max_delta.flux {
@@ -126,11 +110,8 @@ fn window_stats(scores: &[funkot_core::analysis::BeatPhaseScore], beat: f64) -> 
     })
 }
 
-/// `(min, median, max)` of `values`, or `NaN`s when empty. Sorts with
-/// [`f64::total_cmp`] rather than `partial_cmp`/`unwrap_or(Equal)`: some
-/// windows report `NaN` ratios (a zero denominator, e.g. a near-silent grid
-/// position), and `Equal`-for-NaN is not a valid total order — the standard
-/// library's sort detects that and panics instead of silently misordering.
+/// Sorts with [`f64::total_cmp`]: some windows report `NaN` ratios, and the
+/// standard library's sort may panic on a comparator that is not a total order.
 fn stats(values: &[f64]) -> (f64, f64, f64) {
     if values.is_empty() {
         return (f64::NAN, f64::NAN, f64::NAN);
@@ -148,11 +129,6 @@ fn stats(values: &[f64]) -> (f64, f64, f64) {
     (min, median, max)
 }
 
-/// Print the whole flux and kick curve for one window, each normalized to its
-/// own maximum, so the two combs' peak positions can be compared directly.
-/// The summary lines only ever compare three points of the curve; deciding
-/// whether the low band can arbitrate a beat/offbeat split needs to see where
-/// its peak actually is, not just how it ranks two phases the flux picked.
 fn dump_window(scores: &[funkot_core::analysis::BeatPhaseScore], beat: f64) {
     let fmax = scores.iter().map(|s| s.flux).fold(0.0f64, f64::max);
     let kmax = scores.iter().map(|s| s.kick).fold(0.0f64, f64::max);

@@ -1,5 +1,3 @@
-//! funkot-autodj CLI: live playback via cpal, or offline WAV render.
-
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -33,13 +31,6 @@ use serde_json::json;
     version,
     arg_required_else_help = true
 )]
-// The two modes that synthesize a click track, as one group so `--click-db`
-// and `--click-duck-db` can `requires` it. Without the group each would have
-// to name a single mode, and dropping the requirement outright (the obvious
-// way to share them) makes a `--click-db` passed to plain playback silently
-// do nothing -- exactly the failure that wastes an evening on "I turned the
-// clicks up and nothing got louder". `multiple = false` also keeps the two
-// modes mutually exclusive, which is why neither carries a `conflicts_with`.
 #[command(group(ArgGroup::new("click_modes").args(["label_sections", "survey"]).multiple(false)))]
 struct Args {
     /// Accept and release this exact generated WAV, then reclaim it immediately
@@ -79,8 +70,6 @@ struct Args {
     #[arg(long = "highpass-hz", default_value_t = 300.0)]
     highpass_hz: f32,
 
-    /// Removed: this named the inverse filter. Retained only to give callers a
-    /// migration error instead of silently applying an unintended effect.
     #[arg(long = "lpf-hz", hide = true)]
     removed_lpf_hz: Option<f32>,
 
@@ -344,7 +333,6 @@ fn run() -> Result<()> {
 
     if args.label_sections {
         validate_rate(args.rate)?;
-        // clap's `requires` guarantees this is Some.
         let labels_path = args.labels.clone().expect("--labels required by clap");
         let playlist = resolve_playlist(&args)?;
         let click_opts = label_session::ClickOptions {
@@ -369,7 +357,6 @@ fn run() -> Result<()> {
 
     if args.survey {
         validate_rate(args.rate)?;
-        // clap's `requires` guarantees this is Some.
         let survey_out = args.survey_out.clone().expect("--survey-out required by clap");
         let playlist = resolve_playlist(&args)?;
         let click_opts = label_session::ClickOptions {
@@ -482,9 +469,6 @@ fn resolve_playlist(args: &Args) -> Result<Vec<PathBuf>> {
     }
 }
 
-/// Shared by `build_options` (normal playback) and the `--label-sections`
-/// branch of `run()`, which never calls `build_options` and so previously
-/// left `--rate` unvalidated on that path.
 fn validate_rate(rate: f64) -> Result<()> {
     if !rate.is_finite() || !(0.5..=2.0).contains(&rate) {
         bail!("--rate must be finite and in [0.5, 2.0], got {}", rate);
@@ -551,7 +535,6 @@ fn fmt_hms(d: Duration) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-/// Local wall-clock HH:MM:SS (no chrono).
 fn local_hms() -> String {
     unsafe {
         let t = libc::time(std::ptr::null_mut());
@@ -572,7 +555,6 @@ fn local_hms() -> String {
     }
 }
 
-/// Wall time spent actually playing (excludes pre-first-track prep and pauses).
 #[derive(Default)]
 struct PlayElapsed {
     start: Option<Instant>,
@@ -588,7 +570,6 @@ impl PlayElapsed {
     }
 
     fn set_paused(&mut self, paused: bool) {
-        // Ignore pause toggles before the first track — prep time is already excluded.
         if self.start.is_none() {
             return;
         }
@@ -613,10 +594,8 @@ impl PlayElapsed {
     }
 }
 
-/// Prints intro/outro/BPM once cache analysis is ready for the current track.
 struct AnalysisPrinter {
     cache_dir: PathBuf,
-    /// Content hash waiting on a background analyze (first live track, cache miss).
     pending_hash: Option<String>,
 }
 
@@ -636,7 +615,6 @@ impl AnalysisPrinter {
         if print_analysis_if_cached(&self.cache_dir, &hash) {
             return;
         }
-        // Cache miss / needs_reanalysis: first live track may still be analyzing.
         self.pending_hash = Some(hash);
     }
 
@@ -664,8 +642,6 @@ fn print_analysis_if_cached(cache_dir: &Path, hash: &str) -> bool {
     true
 }
 
-/// Live `--transitions-only`: delay by preroll so `TransitionStarted` lines up
-/// with the clip window start (same 8-bar lead-in as render clip export).
 struct TransitionPlayGate {
     delay: std::collections::VecDeque<(f32, f32)>,
     preroll_frames: usize,
@@ -683,7 +659,6 @@ impl TransitionPlayGate {
         }
     }
 
-    /// `transition_offsets`: frame indices within this chunk where a transition starts.
     fn process(&mut self, stereo: &mut [f32], n_frames: usize, transition_offsets: &[usize]) {
         for i in 0..n_frames {
             if transition_offsets.iter().any(|&o| o == i) {
@@ -797,22 +772,14 @@ mod transition_play_gate_tests {
 
     #[test]
     fn delay_aligns_window_with_transition() {
-        // preroll=2, clip=3: transition at engine frame 4 → hear delayed frames 2,3,4
         let mut gate = TransitionPlayGate::new(2, 3);
         let mut buf = vec![0.0f32; 10 * 2];
         for i in 0..10 {
-            buf[i * 2] = (i + 1) as f32; // left = engine frame index + 1
+            buf[i * 2] = (i + 1) as f32;
             buf[i * 2 + 1] = -(i as f32);
         }
         gate.process(&mut buf, 10, &[4]);
 
-        // frames 0..2: filling delay → silence
-        // frame 2: output engine0 (muted, play_left still 0)
-        // frame 3: output engine1 (muted)
-        // frame 4: transition → play_left=3, output engine2 (unmuted)
-        // frame 5: output engine3
-        // frame 6: output engine4
-        // frame 7+: muted
         let left: Vec<f32> = (0..10).map(|i| buf[i * 2]).collect();
         assert_eq!(
             &left[..],
@@ -834,7 +801,6 @@ fn run_render(
 ) -> Result<()> {
     let playlist_len = playlist.len();
     let sample_rate = options.output_sample_rate;
-    // Start 8 bars before TransitionStarted so the lead-in is audible.
     const TRANSITION_CLIP_PREROLL_BARS: u32 = 8;
     let transition_enabled =
         transition_clip_seconds.is_finite() && transition_clip_seconds > 0.0 && playlist_len >= 2;
@@ -855,7 +821,6 @@ fn run_render(
         0
     };
     let preroll_samples = (preroll_frames as usize).saturating_mul(2);
-    // Interleaved stereo ending at the next chunk's start (for preroll replay).
     let mut lookback: Vec<f32> = Vec::new();
 
     let mut analysis = AnalysisPrinter::new(options.cache_dir.clone());
@@ -876,8 +841,8 @@ fn run_render(
 
     let mut writer = WavStreamWriter::create(out_path, sample_rate, wav_format)?;
     struct TransitionCapture {
-        start_frame: u64, // output-file frame indices
-        end_frame: u64,   // exclusive
+        start_frame: u64,
+        end_frame: u64,
         writer: WavStreamWriter,
     }
 
@@ -929,7 +894,6 @@ fn run_render(
             .map(|s| s.to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
 
-        // Strip leading track number like "03. " or "12 ".
         let mut s = stem.trim_start();
         let mut i = 0usize;
         for ch in s.chars() {
@@ -948,7 +912,6 @@ fn run_render(
             }
         }
 
-        // Prefer the last "- <number> <title>" segment if present.
         let parts: Vec<&str> = s.split(" - ").collect();
         let mut chosen: Option<&str> = None;
         for p in &parts {
@@ -1006,9 +969,7 @@ fn run_render(
 
     let mut transition_captures: Vec<TransitionCapture> = Vec::new();
     let mut next_transition_idx: u32 = 1;
-    let mut out_frames: u64 = 0; // frames actually written to OUT.wav
-                                 // Mix-timeline cursor so overlapping transition windows are not duplicated
-                                 // when concatenating into OUT under `--transitions-only`.
+    let mut out_frames: u64 = 0;
     let mut out_mix_emitted_through: u64 = 0;
 
     const CHUNK_FRAMES: usize = 8192;
@@ -1020,14 +981,10 @@ fn run_render(
     let mut last_progress_secs = 0u64;
     let wall_start = Instant::now();
     let mut play_elapsed = PlayElapsed::default();
-    // Skip writing long post-track silence while the loader prepares the next
-    // track (render() returns zeros and never blocks). Keep short gaps that
-    // occur between kicks in the material itself.
     let silence_skip_frames = if transition_enabled {
-        // Keep clip boundaries stable in output-file frame indices.
         u64::MAX
     } else {
-        u64::from(sample_rate) // ~1s
+        u64::from(sample_rate)
     };
 
     loop {
@@ -1067,7 +1024,6 @@ fn run_render(
         if silent {
             consecutive_silent_frames += n as u64;
             if consecutive_silent_frames > silence_skip_frames {
-                // Loader-wait padding: yield without bloating the WAV.
                 thread::sleep(Duration::from_millis(5));
                 continue;
             }
@@ -1075,7 +1031,6 @@ fn run_render(
             consecutive_silent_frames = 0;
         }
 
-        // Anchor per-transition clip start on the output-file frame index.
         let chunk_start_frame = rendered_frames;
 
         if transition_enabled
@@ -1101,7 +1056,6 @@ fn run_render(
                 ));
 
                 let mut w = WavStreamWriter::create(&clip_path, sample_rate, wav_format)?;
-                // Replay audio before this chunk (preroll lives in lookback).
                 if start_frame < chunk_start_frame {
                     let lookback_frames = (lookback.len() / 2) as u64;
                     let lookback_start = chunk_start_frame.saturating_sub(lookback_frames);
@@ -1137,7 +1091,6 @@ fn run_render(
             );
         }
 
-        // Also write overlapping samples into active transition capture(s).
         if transition_enabled && clip_len_frames > 0 && !transition_captures.is_empty() {
             let chunk_end_frame = chunk_start_frame + n_frames_u64;
             for cap in transition_captures.iter_mut() {
@@ -1154,7 +1107,6 @@ fn run_render(
                 let overlap = &chunk[src_start..src_end];
                 cap.writer.write_interleaved(overlap)?;
             }
-            // Concatenate the same windows into OUT (dedupe overlapping clips).
             if transitions_only {
                 let mut abs = chunk_start_frame.max(out_mix_emitted_through);
                 while abs < chunk_end_frame {
@@ -1265,7 +1217,6 @@ fn run_live(
     options.output_sample_rate = config.sample_rate;
     let sample_rate = config.sample_rate;
 
-    // Same window as render transition clips: 8 bars before TransitionStarted.
     const TRANSITION_CLIP_PREROLL_BARS: u32 = 8;
     let mut transition_gate = if transitions_only {
         let clip_len = (transition_clip_seconds * f64::from(sample_rate)).round() as u64;
@@ -1281,11 +1232,9 @@ fn run_live(
     };
 
     let mut engine = Engine::new(options, playlist).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
-    // Audio callback must never sleep (preview→Upgrade wait would underrun under load).
     engine.set_realtime(true);
     let nav_tx = engine.nav_sender();
 
-    // ponytail: try_lock dump; async ringbuf writer if dump still underruns
     let dump_path = dump_wav.map(|p| p.to_path_buf());
     let dump = match &dump_path {
         Some(path) => {
@@ -1307,7 +1256,6 @@ fn run_live(
     let timing_cb = timing.clone();
     let timing_error = timing.clone();
     let mut stereo_scratch = Vec::<f32>::new();
-    // Skip engine.render while paused so playheads / transitions stay put.
     let paused = Arc::new(AtomicBool::new(false));
     let paused_cb = Arc::clone(&paused);
 
@@ -1325,8 +1273,6 @@ fn run_live(
         .build_output_stream(
             config,
             move |data: &mut [f32], _| {
-                // Start before every callback work, including paused zero-fill,
-                // channel publication, and conversion into the device layout.
                 let callback_started = timing_cb.as_ref().map(|_| Instant::now());
                 let frames = data.len() / channels as usize;
                 let output_start = timing_cb.as_ref().map_or(0, |timing| timing.emitted_output_frames.load(Ordering::Relaxed));
@@ -1367,8 +1313,6 @@ fn run_live(
                         write_frame(data, i, channels, l, r);
                     }
 
-                    // Same stereo bus that fed write_frame (zeros already filled past n).
-                    // try_lock: never block the audio thread on dump I/O.
                     if let Some(dump) = &dump_cb {
                         if let Ok(mut w) = dump.try_lock() { let _ = w.write_interleaved(stereo); }
                     }
@@ -1393,11 +1337,6 @@ fn run_live(
                     timing.observe_callback(callback_started.elapsed(), render_elapsed, frames as u64, n as u64, sample_rate);
                 }
             },
-            // Same throttle as `--label-sections`: cpal's ALSA worker retries a
-            // generic device error with no backoff, so one line per callback
-            // means tens of thousands of lines a second (see
-            // `funkot_cli::stream_error`). Raw mode is on once the key thread
-            // starts, hence the `\r` framing.
             {
                 let mut throttle = StreamErrorThrottle::new(stream_error::DEFAULT_SUMMARY_INTERVAL);
                 move |err| {
@@ -1419,7 +1358,6 @@ fn run_live(
         MULTI_PRESS_WINDOW.as_millis()
     );
 
-    // Raw keyboard: Enter pause, left/right multi-tap nav. Always restore raw mode.
     let paused_keys = Arc::clone(&paused);
     let play_elapsed_keys = Arc::clone(&play_elapsed);
     let stop_keys = Arc::clone(stop);
@@ -1427,7 +1365,6 @@ fn run_live(
     let key_join = thread::spawn(move || {
         if let Err(e) = enable_raw_mode() {
             eprintln!("warn: raw mode unavailable ({e}); skip/rewind keys disabled");
-            // Fallback: line-mode Enter pause only.
             let stdin = io::stdin();
             let mut line = String::new();
             loop {
@@ -1504,8 +1441,6 @@ fn run_live(
     stop.store(true, Ordering::SeqCst);
     let _ = key_join.join();
     drop(stream);
-    // The stream is stopped and the key sender has joined, so this captures
-    // observations queued just before Ctrl+C without touching callback state.
     while let Ok(event) = event_rx.try_recv() {
         match event {
             LiveEvent::NavSent { action, elapsed } => nav_sends.push(TimingNav { action, elapsed }),
@@ -1566,7 +1501,6 @@ fn handle_key(
     agg: &mut MultiPressAggregator,
     stop: &AtomicBool,
 ) {
-    // Ignore key-up; act on Press (and Repeat for held keys — we still coalesce).
     if key.kind == KeyEventKind::Release {
         return;
     }
@@ -1750,20 +1684,16 @@ fn pick_output_config(
     bail!("no f32 output configuration available on device {device}");
 }
 
-/// ~170 ms @ 48 kHz. Auto-DJ tolerates this latency; small device periods
-/// underrun when the callback is preempted under load.
 const LIVE_BUFFER_FRAMES: u32 = 8192;
 
 fn stable_buffer_size(supported: &SupportedBufferSize) -> BufferSize {
     match *supported {
-        // Real range (ALSA / some devices): stay inside host limits.
         SupportedBufferSize::Range { min, max } if min < max => {
             BufferSize::Fixed(LIVE_BUFFER_FRAMES.clamp(min, max))
         }
         // WASAPI shared software stacks advertise min==max==GetDevicePeriod()
         // (~480 @ 48 kHz). That is the *callback* period, not an Initialize
-        // ceiling — cpal still enlarges the ring buffer from Fixed(n). Clamping
-        // to max here previously forced Fixed(480) and undid the whole point.
+        // ceiling — cpal still enlarges the ring buffer from Fixed(n).
         SupportedBufferSize::Range { min, .. } => BufferSize::Fixed(LIVE_BUFFER_FRAMES.max(min)),
         SupportedBufferSize::Unknown => BufferSize::Fixed(LIVE_BUFFER_FRAMES),
     }
@@ -1811,14 +1741,6 @@ fn fill_missing_cache(playlist: &[PathBuf], cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------
-// `--label-sections`: interactive (or `--render-clips` offline) intro/outro
-// ground-truth annotation. Candidate navigation / accept / skip / ambiguous
-// -set state lives in `funkot_cli::label_session` (pure, unit-tested); this
-// section only wires it to a playlist, `labels.tsv`, the cache, cpal, and
-// crossterm.
-// ---------------------------------------------------------------------
-
 fn run_label_sections(
     playlist: &[PathBuf],
     labels_path: &Path,
@@ -1833,10 +1755,6 @@ fn run_label_sections(
     } else {
         Vec::new()
     };
-    // A row only counts as "labeled" (and so gets skipped on the next run)
-    // once both sides are confirmed. A row with only a note and/or one side
-    // set (see `save_pending_note` / `save_label_and_cache`) is still missing
-    // information, so the track must be offered again.
     let labeled: std::collections::HashSet<String> = existing
         .into_iter()
         .filter(|l| l.intro_best.is_some() && l.outro_best.is_some())
@@ -1880,11 +1798,6 @@ fn run_label_sections(
     )
 }
 
-/// `--render-clips DIR`: for every candidate on both sides of every track in
-/// `playlist`, write the same click-track clip an interactive session would
-/// have played, as WAV. No labels are written — this path exists so the
-/// clip synthesis can be verified without an audio output device (e.g.
-/// inside the dev container).
 fn render_label_clips(
     playlist: &[&PathBuf],
     cache_dir: &Path,
@@ -1928,33 +1841,8 @@ fn render_label_clips(
     Ok(())
 }
 
-/// Highest instantaneous sample magnitude label-sections playback is allowed
-/// to reach after speed/pitch/rate conversion. Same value and same reasoning
-/// as `label_session::CLIP_SAFETY_CEILING` (slightly below 1.0 for float
-/// rounding margin, not because 1.0 itself is a problem) -- that constant
-/// caps what the click-track synthesis in `label_session.rs` produces before
-/// this stage ever sees it; this one caps what `render_track` can do to a
-/// clip that came in under that ceiling.
 const PLAYBACK_PEAK_CEILING: f32 = 0.97;
 
-/// Scale `samples` down by a single factor if their peak magnitude exceeds
-/// [`PLAYBACK_PEAK_CEILING`]; a no-op otherwise.
-///
-/// Needed because `PitchMode::Preserve` at `--rate` 1.10 measurably pushes
-/// hot Funkot masters over full scale: on a real clip (`03. KazuyaP -
-/// Monitoring Db.flac`, intro 16 bars, source peak 0.991) `Preserve` at 1.10
-/// came out at peak 1.749 with 0.1255% of samples over 1.0, i.e. audibly
-/// clipped at the device. Production mixing never sees this because the
-/// engine applies `analysis.gain_db` (RMS-normalizing gain toward
-/// `TARGET_RMS_DBFS`, see `gain_linear` in `funkot-core/src/engine.rs`)
-/// before the mix bus reaches the device; label clips are built straight
-/// from the source material and never go through that gain stage, so
-/// nothing else in this path stops the peak from exceeding full scale.
-///
-/// Scales the whole clip by one scalar rather than per-sample limiting, so
-/// the click/music balance `label_session`'s synthesis decided (via
-/// `click_db_above_rms` and the sidechain ducking) is preserved exactly --
-/// only the overall level moves.
 fn clamp_playback_peak(samples: &mut [f32]) {
     let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
     if peak <= PLAYBACK_PEAK_CEILING {
@@ -1966,39 +1854,6 @@ fn clamp_playback_peak(samples: &mut [f32]) {
     }
 }
 
-/// Prepare a `--label-sections` click clip for playback: apply the `--rate`
-/// playback speed and, in the same pass, match the output device's sample
-/// rate. [`ClipPlayer`] streams whatever buffer it's handed straight into
-/// the device callback with no rate conversion of its own, so both of these
-/// have to happen here or not at all.
-///
-/// Playback runs at `speed` (normally `--rate`, default 1.10) rather than
-/// 1.0 because production DJ playback is always sped up by that factor, and
-/// labeling by ear at the production speed is more representative than
-/// labeling at the source tempo. This is a fixed multiplier on the
-/// material's own tempo, deliberately *not* the engine's 198 BPM
-/// normalization (`180 * rate / intro_bpm`, see `EngineOptions`/loader):
-/// tying the labeling speed to BPM estimation would mean a track whose BPM
-/// was mis-detected at half or double time gets labeled at 2x speed by
-/// accident. The label clips are built from the source material, which is
-/// nominally 180 BPM, so in practice this comes out to the same multiplier
-/// as the engine's normalization anyway.
-///
-/// Device sample-rate matching is unconditional whenever `source_rate !=
-/// device_rate` (e.g. a 48 kHz device against 44.1 kHz Funkot masters);
-/// without it every clip played audibly fast/sharp or slow/flat. It rides
-/// along in the same [`funkot_core::stretch::render_track`] call as the
-/// speed change rather than a separate resample step.
-///
-/// Measured cost (106 s clip, 44.1 kHz → 48 kHz, release build, this dev
-/// environment): `PitchMode::Preserve` 1.67 s, `PitchMode::Shift` 0.46 s,
-/// vs. 0.54 s for the old speed-1.0 resample-only path. So the default
-/// (pitch preserved, matching production) adds roughly 1.2 s of wait per
-/// keystroke; `--pitch-shift` does not.
-///
-/// Runs the result through [`clamp_playback_peak`] before returning: see
-/// that function for why a speed change alone can drive a clip over full
-/// scale here even though nothing else in this path does.
 fn prepare_clip_for_playback(
     clip: Vec<f32>,
     source_rate: u32,
@@ -2050,12 +1905,9 @@ mod prepare_clip_for_playback_tests {
 
     #[test]
     fn mismatched_rates_resample_to_the_device_length() {
-        // The mismatch this fixes: a 44.1 kHz file on a 48 kHz device
-        // (common WASAPI/CoreAudio default) previously played ~8.8% fast
-        // with no rate conversion at all.
         let source_rate = 44_100;
         let device_rate = 48_000;
-        let clip = stereo_sine(4_410, 440.0, source_rate, 0.5); // 100 ms
+        let clip = stereo_sine(4_410, 440.0, source_rate, 0.5);
         let out =
             prepare_clip_for_playback(clip, source_rate, device_rate, 1.0, PitchMode::Preserve);
 
@@ -2070,12 +1922,8 @@ mod prepare_clip_for_playback_tests {
 
     #[test]
     fn same_rate_speed_1_10_preserve_shortens_by_the_rate() {
-        // Amplitude 0.95, not 0.5: the stretch overshoots its input peak by
-        // about 1.35x (measured), so 0.5 comes out at ~0.676 and never reaches
-        // the ceiling -- the peak assertion below would then hold even if
-        // `prepare_clip_for_playback` stopped clamping at all.
         let sr = 44_100;
-        let clip = stereo_sine(sr as usize, 440.0, sr, 0.95); // 1s
+        let clip = stereo_sine(sr as usize, 440.0, sr, 0.95);
         let out = prepare_clip_for_playback(clip.clone(), sr, sr, 1.10, PitchMode::Preserve);
 
         let in_frames = clip.len() / 2;
@@ -2095,12 +1943,9 @@ mod prepare_clip_for_playback_tests {
 
     #[test]
     fn mismatched_rates_and_speed_1_10_combine_both_effects() {
-        // Amplitude 0.95 for the same reason as the same-rate case above: at
-        // 0.5 the stretch's ~1.35x overshoot stops short of the ceiling and the
-        // peak assertion stops testing anything.
         let source_rate = 44_100;
         let device_rate = 48_000;
-        let clip = stereo_sine(source_rate as usize, 440.0, source_rate, 0.95); // 1s
+        let clip = stereo_sine(source_rate as usize, 440.0, source_rate, 0.95);
         let out = prepare_clip_for_playback(
             clip.clone(),
             source_rate,
@@ -2128,7 +1973,7 @@ mod prepare_clip_for_playback_tests {
     #[test]
     fn preserve_and_shift_agree_on_output_length() {
         let sr = 44_100;
-        let clip = stereo_sine(sr as usize, 440.0, sr, 0.5); // 1s
+        let clip = stereo_sine(sr as usize, 440.0, sr, 0.5);
         let preserve =
             prepare_clip_for_playback(clip.clone(), sr, sr, 1.10, PitchMode::Preserve);
         let shift = prepare_clip_for_playback(clip, sr, sr, 1.10, PitchMode::Shift);
@@ -2143,7 +1988,6 @@ mod prepare_clip_for_playback_tests {
 
     #[test]
     fn clamp_playback_peak_scales_an_over_ceiling_clip_down_and_keeps_ratios() {
-        // Mirrors the measured `Preserve` 1.10 overshoot (peak 1.749).
         let mut samples = vec![1.75f32, -0.875, 0.0, -1.75];
         clamp_playback_peak(&mut samples);
 
@@ -2152,9 +1996,6 @@ mod prepare_clip_for_playback_tests {
             peak <= PLAYBACK_PEAK_CEILING + 1e-6,
             "peak {peak} must not exceed the ceiling"
         );
-        // Relative balance within the clip (music vs. click) must be untouched:
-        // the second sample was exactly half the first in magnitude before,
-        // and must still be after a single uniform scale.
         assert!(
             (samples[0].abs() / samples[1].abs() - 2.0).abs() < 1e-4,
             "a single scalar must preserve inter-sample ratios"
@@ -2171,31 +2012,15 @@ mod prepare_clip_for_playback_tests {
     }
 }
 
-/// Sentinel `pos` value meaning "not currently playing".
 const CLIP_PLAYER_IDLE: usize = usize::MAX;
 
-/// Wait this long before trying to reopen a torn-down output stream. A
-/// wedged WSLg PulseAudio makes `snd_pcm_open` block for ~30 s (measured), and
-/// it is the UI thread that would block, so failed reopens must not be retried
-/// on every keystroke.
 const CLIP_STREAM_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
-/// Printed once when a wedged stream is torn down.
 const CLIP_STREAM_WEDGED_NOTE: &str =
     "audio output stopped (device kept failing); press r to retry playback";
 
-/// Error bookkeeping shared between the cpal error callback (audio thread) and
-/// the labeling UI thread.
-///
-/// The callback only *records*; the UI thread prints. That ordering matters:
-/// `--label-sections` runs in crossterm raw mode, where a bare `\n` from
-/// another thread leaves the cursor mid-column and staircases the status line.
-/// Queuing the text keeps every line on the UI thread, which frames it
-/// correctly.
 struct ClipStreamErrors {
     throttle: StreamErrorThrottle,
-    /// Lines the UI thread has not printed yet. Bounded by the throttle: at
-    /// most one entry per [`stream_error::DEFAULT_SUMMARY_INTERVAL`].
     pending: Vec<String>,
 }
 
@@ -2208,34 +2033,16 @@ impl ClipStreamErrors {
     }
 }
 
-/// Minimal single-buffer cpal player for `--label-sections` candidate
-/// clips. Bypasses the mixing engine entirely (per plan constraints): the
-/// audio callback just streams whichever interleaved-stereo f32 buffer
-/// [`ClipPlayer::play`] last handed it, so a new candidate can interrupt
-/// mid-playback the same way the live engine's nav keys do.
-///
-/// The stream is held open across the whole session rather than opened per
-/// clip. Opening lazily was considered and rejected: WSLg's PulseAudio wedges
-/// independently of whether anything is playing (its RDP sink loses the
-/// Windows-side endpoint), and in that state `snd_pcm_open` blocks for ~30 s,
-/// so a per-clip open would freeze the labeling UI for half a minute on every
-/// replay while fixing nothing. Instead the failure is *survived*: see
-/// [`ClipPlayer::poll`].
 struct ClipPlayer {
     device: cpal::Device,
     config: StreamConfig,
     channels: u16,
-    /// `None` while no stream is open, i.e. after a wedged one was torn down.
-    /// Reopened on the next user-initiated playback.
     stream: Option<cpal::Stream>,
     buffer: Arc<Mutex<Vec<f32>>>,
     pos: Arc<AtomicUsize>,
     errors: Arc<Mutex<ClipStreamErrors>>,
-    /// Error total already accounted for, so [`ClipPlayer::poll`] can measure
-    /// a rate rather than a running count.
     seen_errors: u64,
     last_poll: Instant,
-    /// Earliest time a reopen may be attempted, after one failed.
     retry_after: Option<Instant>,
 }
 
@@ -2253,8 +2060,6 @@ impl ClipPlayer {
             last_poll: Instant::now(),
             retry_after: None,
         };
-        // Fail fast at startup: a device that cannot be opened at all is a
-        // setup problem the user needs to see before any track is decoded.
         player.open_stream()?;
         Ok(player)
     }
@@ -2274,8 +2079,6 @@ impl ClipPlayer {
                     if p == CLIP_PLAYER_IDLE {
                         return;
                     }
-                    // try_lock: never block the audio thread on the UI
-                    // thread's play()/stop() swap.
                     let Ok(buf) = buffer_cb.try_lock() else {
                         return;
                     };
@@ -2305,8 +2108,6 @@ impl ClipPlayer {
                 move |err| {
                     let now = Instant::now();
                     let mut errors = errors_cb.lock().unwrap_or_else(|e| e.into_inner());
-                    // record_with: cpal can land here ~90k times a second, and
-                    // formatting the error is the expensive part.
                     if let Some(report) = errors.throttle.record_with(now, || err.to_string()) {
                         errors.pending.push(report.to_line());
                     }
@@ -2321,13 +2122,6 @@ impl ClipPlayer {
         Ok(())
     }
 
-    /// Drain queued error lines, and tear the stream down if the device is
-    /// producing errors far faster than any real glitch could.
-    ///
-    /// Tearing down is what actually stops the damage: cpal's ALSA worker
-    /// retries a generic error with no backoff, so a wedged device pins a CPU
-    /// core and calls the error callback forever. Dropping the stream sets
-    /// cpal's `dropping` flag and joins that worker.
     fn poll(&mut self) -> Vec<String> {
         let now = Instant::now();
         let total = {
@@ -2362,8 +2156,6 @@ impl ClipPlayer {
         self.retry_after = Some(now + CLIP_STREAM_RETRY_COOLDOWN);
     }
 
-    /// Reopen after a teardown, if the cooldown has passed. Queues a note
-    /// either way so the user learns why `r` did nothing.
     fn ensure_stream(&mut self) {
         if self.stream.is_some() {
             return;
@@ -2396,7 +2188,6 @@ impl ClipPlayer {
         errors.pending.push(line);
     }
 
-    /// Stop whatever is playing and start `clip` from the top.
     fn play(&mut self, clip: Vec<f32>) {
         self.ensure_stream();
         self.pos.store(CLIP_PLAYER_IDLE, Ordering::SeqCst);
@@ -2423,9 +2214,6 @@ fn print_label_key_help() {
     println!("\r{LABEL_SECTIONS_KEY_HELP}\r");
 }
 
-/// Print audio-subsystem notices from the UI thread. Raw mode is on, so every
-/// line needs the same `\r` framing the rest of this UI uses -- a bare
-/// `eprintln!` from the cpal thread would staircase the display.
 fn print_label_audio(lines: &[String]) {
     for line in lines {
         eprintln!("\r{line}\r");
@@ -2458,20 +2246,6 @@ fn print_label_status(session: &TrackSession) {
     println!("{line}");
 }
 
-/// Read one line from stdin for `n` (note entry). Raw mode is disabled for
-/// the duration so the terminal echoes normally, then restored.
-///
-/// Reads bytes rather than a `String`, and decodes them lossily. Crossterm
-/// buffers stdin ahead while it is reading key events, so typing into an IME
-/// straight after pressing `n` can leave it holding the leading byte of a
-/// multi-byte character while the continuation bytes are still queued for
-/// this read. `read_line` rejects those with "stream did not contain valid
-/// UTF-8", and when that error propagated it took the whole session down --
-/// which lost the note *and* the label for the track being worked on, because
-/// a track is only written once both sides are accepted. A mangled first
-/// character is a far better outcome than that, so nothing here is fatal:
-/// whatever was read is kept, raw mode is restored on every path, and the
-/// session carries on.
 fn read_note_line() -> Result<String> {
     disable_raw_mode().ok();
     print!("\rnote: ");
@@ -2480,8 +2254,6 @@ fn read_note_line() -> Result<String> {
     let mut bytes = Vec::new();
     let read = io::stdin().lock().read_until(b'\n', &mut bytes);
 
-    // Restore raw mode before reporting anything: the UI it belongs to is
-    // still running whether or not the read worked.
     let raw = enable_raw_mode().context("failed to re-enable raw mode after note entry");
 
     if let Err(e) = read {
@@ -2497,7 +2269,6 @@ fn read_note_line() -> Result<String> {
     Ok(text)
 }
 
-/// Decode one typed note. Lossy on purpose -- see [`read_note_line`].
 fn note_from_bytes(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .trim_end_matches(['\n', '\r'])
@@ -2517,9 +2288,6 @@ mod note_from_bytes_tests {
 
     #[test]
     fn survives_a_character_whose_leading_byte_was_eaten_by_crossterm() {
-        // Continuation bytes of a UTF-8 sequence with the lead byte missing:
-        // what is left in the queue when crossterm's key reader has already
-        // consumed the start of an IME-committed character.
         let mut bytes = "\u{5c0f}\u{7bc0}".as_bytes().to_vec();
         bytes.remove(0);
         bytes.push(b'\n');
@@ -2532,9 +2300,6 @@ mod note_from_bytes_tests {
     }
 }
 
-/// Decode one crossterm key press into a [`LabelKey`], or `None` for a key
-/// with no meaning here. `n` needs a blocking line read (outside raw mode)
-/// to collect the note text, so it's resolved here rather than deferred.
 fn map_label_key(key: KeyEvent) -> Result<Option<LabelKey>> {
     if key.kind == KeyEventKind::Release {
         return Ok(None);
@@ -2558,9 +2323,6 @@ fn map_label_key(key: KeyEvent) -> Result<Option<LabelKey>> {
     })
 }
 
-/// Existing row for `hash` in `labels.tsv`, or `None` if the file doesn't
-/// exist yet, can't be read, or has no row for this track -- any of those
-/// just means there is nothing to merge into, not a fatal error.
 fn existing_label(labels_path: &Path, hash: &str) -> Option<SectionLabel> {
     if !labels_path.exists() {
         return None;
@@ -2571,22 +2333,6 @@ fn existing_label(labels_path: &Path, hash: &str) -> Option<SectionLabel> {
         .find(|l| l.hash == hash)
 }
 
-/// Persist one track's current state to `labels.tsv`, then (only if the
-/// intro side was confirmed this session) reflect it onto the analysis
-/// cache.
-///
-/// `intro` / `outro` are `None` when that side hasn't been decided in this
-/// session -- e.g. a `note`-only save from `s`/`q` before either side (or
-/// only the intro side) was accepted. Each side is written independently:
-/// a side present here overwrites the stored row; a side absent here keeps
-/// whatever was already on disk for that hash (or stays unset if there was
-/// no prior row), so labeling one side now and the other side in a later
-/// session doesn't clobber the first. `note` is always taken from this
-/// call, since notes are meant to be edited/replaced by the labeler.
-///
-/// Returns the row as written, so callers can report what actually ended up
-/// on disk (which may include a side merged in from an earlier session, not
-/// just what was decided just now).
 fn save_label_and_cache(
     labels_path: &Path,
     cache_dir: &Path,
@@ -2623,24 +2369,6 @@ fn save_label_and_cache(
     };
     upsert_label(labels_path, label.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Reflect the intro side onto the cache immediately (so live/render
-    // playback picks it up, and `--purge-auto-cache` keeps it). Only when
-    // this session actually confirmed it: a side merged in from an earlier
-    // row was already reflected to the cache when it was first accepted, so
-    // re-writing it here would be redundant, and skipping it means a
-    // note-only save never touches the cache as a side effect of *reading*
-    // an old row. The outro side is deliberately *not* written here:
-    // `cache::set_manual_bars`'s `outro` argument sets
-    // `TrackAnalysis::outro_bars`, the DJ mix-trigger, which is *not* a
-    // fixed offset from the structural boundary this tool collects (see
-    // `funkot_core::labels` module docs and the `outro_structure_bars` doc
-    // comment in `funkot-core/src/lib.rs`). Synthesizing a lead-in here to
-    // convert one into the other would plant a guessed value in the cache
-    // that the analyzer itself doesn't stand behind -- the exact
-    // outro_bars/outro_structure_bars conflation Stage 0 introduced
-    // `outro_structure_bars` to avoid. The cached outro stays whatever
-    // `analysis::analyze` computed; only the label file records the
-    // structural ground truth, for Stage 2+ to use.
     if let Some(intro) = intro {
         cache::set_manual_bars(cache_dir, hash, Some(intro.best), None)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2648,14 +2376,6 @@ fn save_label_and_cache(
     Ok(label)
 }
 
-/// Save whatever note the user typed for the track being abandoned by `s`
-/// (skip) or `q` (quit), so it survives even though the labeling itself
-/// isn't finished. A no-op when no note was typed, so `s`'s "write nothing"
-/// behavior is unchanged for the common case. The intro side is included if
-/// this session confirmed it (`y` on the intro candidate before `s`/`q`);
-/// the outro side is left for `save_label_and_cache` to merge in from any
-/// prior row, since this session never confirmed it -- reaching `Skip`/
-/// `Quit` from the outro side means outro was *not* accepted.
 fn save_pending_note(
     labels_path: &Path,
     cache_dir: &Path,
@@ -2686,36 +2406,10 @@ fn save_pending_note(
     Ok(())
 }
 
-/// Identifies one candidate clip already prepared for playback: which side,
-/// which candidate bar count on that side, and the listening window's
-/// half-width in bars (`±8`/`±16`, toggled by `+`). Doesn't carry the
-/// [`label_session::ClickGrid`] used to build it -- that's memoized per
-/// track/side by `SideGrids` and is therefore identical for every entry that
-/// shares a `Side`.
 type ClipKey = (Side, u32, u32);
 
-/// How many already-built clips [`ClipCache`] keeps at once.
-///
-/// A cached clip is what `prepare_clip_for_playback` returned, so it is the
-/// *played* length at the device rate: at `±8` bars the clip spans
-/// `2 * 8 + CONTINUE_AFTER_WINDOW_BARS` = 80 bars ~= 107 s of 180 BPM
-/// source, which `--rate` 1.10 shortens to ~97 s, and at 48 kHz stereo
-/// `f32` that is ~37 MB. `+` widens the window to `±16` bars, i.e. 96 bars
-/// ~= 116 s played and ~45 MB. So 4 entries costs ~150 MB normally and
-/// ~180 MB with the wide window held throughout.
-///
-/// Only 3 are normally alive at a time (the current candidate plus its two
-/// neighbours); the 4th is headroom so stepping back after having stepped
-/// forward still hits the cache.
 const CLIP_CACHE_CAPACITY: usize = 4;
 
-/// Insertion-order cache of already-prepared candidate clips for the
-/// *current* track only. A fresh one is built per track in
-/// [`run_label_sections_interactive`], since `buf`/`analysis` change with
-/// the track and this cache must not be reused across them. Evicts the
-/// oldest *insertion* once full, not the least-recently-used entry: the goal
-/// is a small bounded window of candidates around the cursor, not a general
-/// LRU.
 struct ClipCache {
     entries: Vec<(ClipKey, Vec<f32>)>,
 }
@@ -2725,10 +2419,6 @@ impl ClipCache {
         Self { entries: Vec::new() }
     }
 
-    /// A clone of the cached clip for `key`, or `None` if it isn't cached
-    /// yet. Clones rather than borrowing: the caller hands the clip straight
-    /// to `ClipPlayer::play`, which takes ownership, and cloning ~41 MB is
-    /// cheap next to the stretch it would otherwise replace.
     fn get(&self, key: &ClipKey) -> Option<Vec<f32>> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, clip)| clip.clone())
     }
@@ -2737,10 +2427,6 @@ impl ClipCache {
         self.entries.iter().any(|(k, _)| k == key)
     }
 
-    /// No-op if `key` is already cached: the prefetch worker and the
-    /// foreground path can race to build the same candidate, and whichever
-    /// inserts first wins -- the other's (identical, see
-    /// [`build_and_prepare_clip`]) result is simply discarded.
     fn insert(&mut self, key: ClipKey, clip: Vec<f32>) {
         if self.contains(&key) {
             return;
@@ -2808,18 +2494,11 @@ mod clip_cache_tests {
     }
 }
 
-/// One candidate clip to build in the background: `key` names it, `grid` is
-/// the already-measured [`label_session::ClickGrid`] for its side (`Copy`,
-/// cheap to send across the channel).
 struct PrefetchRequest {
     key: ClipKey,
     grid: label_session::ClickGrid,
 }
 
-/// Builds and playback-prepares one candidate clip: the same call sequence
-/// on both the synchronous (foreground) and prefetch (background) paths, so
-/// a cache hit is guaranteed to be the bytes a fresh build would have
-/// produced.
 #[allow(clippy::too_many_arguments)]
 fn build_and_prepare_clip(
     buf: &funkot_core::decode::AudioBuffer,
@@ -2838,10 +2517,6 @@ fn build_and_prepare_clip(
     prepare_clip_for_playback(clip, buf.sample_rate, device_rate, rate, pitch_mode)
 }
 
-/// The clip for `session`'s current side/candidate/width: a cache hit if the
-/// prefetch worker (or an earlier visit) already built it, otherwise built
-/// synchronously here -- same as before prefetching existed -- and cached
-/// for next time.
 #[allow(clippy::too_many_arguments)]
 fn build_or_cached_clip(
     session: &TrackSession,
@@ -2866,12 +2541,6 @@ fn build_or_cached_clip(
     clip
 }
 
-/// Kicks off background builds, via `tx`, for the candidates a single
-/// `Left`/`Right` press from `session`'s current position would land on
-/// ([`TrackSession::neighbour_bars`]) -- so that by the time the user
-/// actually presses it, [`build_or_cached_clip`] hits the cache instead of
-/// re-stretching. Best-effort: a `send` failure (the worker already exited)
-/// is silently ignored, same as the plan calls for.
 fn send_prefetch_requests(
     session: &TrackSession,
     buf: &funkot_core::decode::AudioBuffer,
@@ -2909,9 +2578,6 @@ fn run_label_sections_interactive(
     let _raw_guard = RawModeGuard;
 
     print_label_key_help();
-    // Playback runs at production speed (see `prepare_clip_for_playback`), so
-    // say so up front — otherwise a labeler who doesn't know that can mistake
-    // a sped-up track for one whose BPM was mis-detected.
     let pitch_note = match pitch_mode {
         PitchMode::Preserve => "pitch preserved",
         PitchMode::Shift => "pitch shifted",
@@ -2930,9 +2596,6 @@ fn run_label_sections_interactive(
         let analysis = Arc::new(
             cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?,
         );
-        // Decode + analyze can run for a minute with no key polling; check the
-        // stream now so a device that died meanwhile is torn down here rather
-        // than spinning until the next keystroke.
         print_label_audio(&player.poll());
         if buf.sample_rate != device_rate {
             eprintln!(
@@ -2945,18 +2608,6 @@ fn run_label_sections_interactive(
         let mut session = TrackSession::new(analysis.intro_bars, analysis.outro_structure_bars);
         let mut side_grids = label_session::SideGrids::default();
 
-        // Speculative prefetch: while the user listens to the current
-        // candidate (tens of seconds), a single background worker builds the
-        // clip(s) a `Left`/`Right` press would land on next, so consecutive
-        // arrow presses hit `cache` instead of paying for
-        // `prepare_clip_for_playback`'s stretch again. Both `cache` and the
-        // worker are scoped to this track: they close over this track's
-        // `buf`/`analysis` (via `Arc` clones) and must not survive into the
-        // next one. `prefetch_tx` is a plain `let` inside this loop body, so
-        // it -- and with it the worker's only sender -- is dropped whenever
-        // this iteration ends, however it ends (`continue 'tracks`,
-        // `break 'tracks`, or falling off the end); the worker is not
-        // joined, it simply finishes once `recv` starts returning `Err`.
         let cache: Arc<Mutex<ClipCache>> = Arc::new(Mutex::new(ClipCache::new()));
         let (prefetch_tx, prefetch_rx) = mpsc::channel::<PrefetchRequest>();
         {
@@ -2966,8 +2617,6 @@ fn run_label_sections_interactive(
             let worker_click_opts = *click_opts;
             thread::spawn(move || {
                 for req in prefetch_rx {
-                    // Lock only to check, never held across the stretch
-                    // below.
                     if worker_cache.lock().unwrap().contains(&req.key) {
                         continue;
                     }
@@ -2981,8 +2630,6 @@ fn run_label_sections_interactive(
                         rate,
                         pitch_mode,
                     );
-                    // Lock again only to insert, again never held across the
-                    // stretch that built `clip`.
                     worker_cache.lock().unwrap().insert(req.key, clip);
                 }
             });
@@ -3005,8 +2652,6 @@ fn run_label_sections_interactive(
 
         loop {
             let waiting = !event::poll(Duration::from_millis(100)).unwrap_or(false);
-            // Runs on every tick, including the idle ones: this is what keeps a
-            // failing device from flooding the terminal while the user thinks.
             print_label_audio(&player.poll());
             if waiting {
                 continue;
@@ -3073,26 +2718,6 @@ fn run_label_sections_interactive(
     Ok(())
 }
 
-// ---------------------------------------------------------------------
-// `--survey`: one-window-per-track outro-grid survey. Reuses the raw-mode
-// key loop / `ClipPlayer` / `prepare_clip_for_playback` machinery above,
-// but is otherwise independent of `--label-sections`: a different (much
-// simpler) key vocabulary, a different verdict TSV that is never
-// `funkot_core::labels`, and a fixed one-shot clip per track instead of
-// candidate navigation. See `label_session::build_survey_clip` for the
-// clip itself.
-// ---------------------------------------------------------------------
-
-/// One judged row in a `--survey-out` file: the survey's equivalent of
-/// `funkot_core::labels::SectionLabel`, but deliberately a separate, simpler
-/// type -- `--survey` never reads or writes `labels.tsv`.
-///
-/// On-disk format: tab-separated, header `content_hash\tfile_name\tverdict`,
-/// one row per judgement. Appended to, never rewritten in place: judging the
-/// same track twice leaves two rows, and the later one is what a summarizer
-/// reading the file should treat as authoritative. [`load_survey_judged`]
-/// only needs *whether* a hash has a row at all, so nothing here needs to
-/// resolve that itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SurveyRow {
     hash: String,
@@ -3102,15 +2727,6 @@ struct SurveyRow {
 
 const SURVEY_HEADER: &str = "content_hash\tfile_name\tverdict";
 
-/// Parse `--survey-out` TSV text (split out from [`load_survey_judged`] for
-/// testing without a file). Comment (`#`) and blank lines are ignored
-/// wherever they occur, and the first remaining line is treated as the
-/// header and skipped, the same conventions as
-/// `funkot_core::labels::parse_labels` -- independently implemented here
-/// since this is a different, simpler (3-column) format. A malformed data
-/// row (wrong column count, or an empty hash) is silently dropped rather
-/// than failing the whole load: a partially-written row from a killed
-/// process should not make every other verdict in the file unreadable.
 fn parse_survey_rows(contents: &str) -> Vec<SurveyRow> {
     let mut rows = Vec::new();
     for raw_line in contents.lines() {
@@ -3118,11 +2734,6 @@ fn parse_survey_rows(contents: &str) -> Vec<SurveyRow> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        // Match the header by its text rather than "whatever the first row
-        // happens to be": a content hash can never spell `content_hash`, so
-        // this cannot eat a verdict, and a file that somehow lost its header
-        // still parses in full instead of silently dropping its first track
-        // (which would re-ask that track on every later run).
         if trimmed == SURVEY_HEADER {
             continue;
         }
@@ -3143,9 +2754,6 @@ fn parse_survey_rows(contents: &str) -> Vec<SurveyRow> {
     rows
 }
 
-/// Hashes already judged in `path` (i.e. that have at least one row), so
-/// [`run_survey`] can skip them on this run. Empty (not an error) if `path`
-/// doesn't exist yet -- a fresh survey has nothing to skip.
 fn load_survey_judged(path: &Path) -> Result<std::collections::HashSet<String>> {
     if !path.exists() {
         return Ok(std::collections::HashSet::new());
@@ -3159,11 +2767,6 @@ fn sanitize_survey_field(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
 }
 
-/// Append one judged row to `path`, writing the header first if the file is
-/// new (and creating the parent directory if needed, same as
-/// `funkot_core::labels::save_labels`). Never truncates or rewrites existing
-/// rows -- see [`SurveyRow`]'s doc on why appending (not upserting) is the
-/// point.
 fn append_survey_verdict(path: &Path, hash: &str, file_name: &str, verdict: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -3171,9 +2774,6 @@ fn append_survey_verdict(path: &Path, hash: &str, file_name: &str, verdict: &str
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
     }
-    // Size, not existence: an existing but empty file (a `touch`, or a
-    // crash between create and first write) still needs the header. Keying
-    // off `exists()` alone would leave a headerless file behind.
     let need_header = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -3198,8 +2798,6 @@ mod survey_tsv_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-    /// Process-unique scratch file path under the system temp dir, cleaned
-    /// up on drop -- same pattern as `funkot_core::labels`'s test `TempFile`.
     struct TempFile(PathBuf);
 
     impl TempFile {
@@ -3247,10 +2845,6 @@ mod survey_tsv_tests {
 
     #[test]
     fn a_second_verdict_for_the_same_hash_is_appended_not_overwritten() {
-        // "同じ曲を2回判定したら後の行が勝つ形でよい" -- the file just grows;
-        // this asserts that a summarizer taking the last matching row would
-        // in fact see the later verdict, and that the row count reflects
-        // both judgements rather than one replacing the other on disk.
         let f = TempFile::new("second-verdict");
         append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "half").unwrap();
         append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "ok").unwrap();
@@ -3281,9 +2875,6 @@ bbbb2222\ttrack-b.flac\thalf
 
     #[test]
     fn append_to_an_existing_but_empty_file_still_writes_the_header() {
-        // A `touch`ed (or crash-truncated) file used to satisfy `exists()`
-        // and so never got a header, after which `parse_survey_rows` ate its
-        // first verdict as the header and re-asked that track every run.
         let f = TempFile::new("empty-existing");
         std::fs::write(&f.0, "").unwrap();
         append_survey_verdict(&f.0, "aaaa1111", "track-a.flac", "half").unwrap();
@@ -3309,21 +2900,12 @@ bbbb2222\ttrack-b.flac\thalf
     }
 }
 
-/// One user keystroke for `--survey`, already decoded from the terminal.
-/// Deliberately a separate, smaller vocabulary than [`LabelKey`]: `--survey`
-/// is a single fixed window per track judged with one keypress, not
-/// `--label-sections`' two-sided candidate navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurveyKey {
-    /// `o`: the click grid sits on the beat.
     Ok,
-    /// `h`: the click grid sits half a beat off (clicks land on the offbeat).
     Half,
-    /// `?`: can't tell (too thin, can't lock onto the beat by ear, etc).
     Unknown,
-    /// `r`: replay the same window.
     Replay,
-    /// `s`: skip this track without judging it (offered again next run).
     Skip,
     Quit,
 }
@@ -3335,8 +2917,6 @@ fn print_survey_key_help() {
     println!("\r{SURVEY_KEY_HELP}\r");
 }
 
-/// Decode one crossterm key press into a [`SurveyKey`], or `None` for a key
-/// with no meaning here.
 fn map_survey_key(key: KeyEvent) -> Option<SurveyKey> {
     if key.kind == KeyEventKind::Release {
         return None;
@@ -3369,8 +2949,6 @@ mod survey_cli_tests {
 
     #[test]
     fn click_flags_need_one_of_the_two_click_modes() {
-        // Sharing `--click-db` between `--label-sections` and `--survey` must
-        // not turn it into a flag that plain playback silently ignores.
         assert!(Args::try_parse_from(["funkot-autodj", "--click-db", "12", "a.flac"]).is_err());
         assert!(
             Args::try_parse_from(["funkot-autodj", "--click-duck-db", "6", "a.flac"]).is_err()
@@ -3448,13 +3026,6 @@ mod map_survey_key_tests {
     }
 }
 
-/// `--survey`'s per-track loop: decode + analyze, build the one fixed
-/// listening clip ([`label_session::build_survey_clip`]), and wait for a
-/// single judgement keystroke before moving to the next track. Reuses
-/// [`ClipPlayer`] / [`prepare_clip_for_playback`] / [`pick_output_config`]
-/// verbatim from `--label-sections`'s interactive loop; the only new piece
-/// is the smaller [`SurveyKey`] vocabulary and [`append_survey_verdict`]
-/// instead of `labels.tsv`.
 fn run_survey(
     playlist: &[PathBuf],
     survey_out: &Path,
@@ -3492,8 +3063,6 @@ fn run_survey(
     let _raw_guard = RawModeGuard;
 
     print_survey_key_help();
-    // Same reasoning as `--label-sections`: playback runs at production
-    // speed (see `prepare_clip_for_playback`), so say so up front.
     let pitch_note = match pitch_mode {
         PitchMode::Preserve => "pitch preserved",
         PitchMode::Shift => "pitch shifted",
@@ -3511,9 +3080,6 @@ fn run_survey(
         let buf = decode_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
         let analysis =
             cache::get_or_analyze(path, cache_dir, &buf).map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Decode + analyze can run for a while with no key polling; check the
-        // stream now so a device that died meanwhile is torn down here
-        // rather than spinning until the next keystroke.
         print_label_audio(&player.poll());
         if buf.sample_rate != device_rate {
             eprintln!(
@@ -3588,7 +3154,6 @@ fn gen_test_fixtures(dir: &Path) -> Result<()> {
     let owned = checkout.open(SystemTime::now());
     let sr = 44_100u32;
 
-    // Eight-bar sections exercise low-confidence fallback below the structural minimum.
     let specs: Vec<(&str, SynthOptions, serde_json::Value)> = vec![
         (
             "classic_180_i8_m8_o8.wav",

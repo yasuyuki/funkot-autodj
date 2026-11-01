@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Each ./dev.sh test run must execute a binary built from its own checkout.
-# Two fixture sources share crate and test names; A passes, B fails.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/dev-source-attribution.XXXXXXXX")
@@ -16,7 +14,7 @@ trap cleanup EXIT
 failures=0
 dependency_built=0
 
-fixture() { # dir value [mtime]
+fixture() {
     mkdir -p "$1/fx/src" "$1/tools" "$1/tracked"
     cp "$root/dev.sh" "$root/Dockerfile" "$1/"
     cp "$root/tools/dev_source_guard.py" "$1/tools/"
@@ -33,7 +31,7 @@ RS
     if [[ -n ${3:-} ]]; then find "$1" -exec touch -h -d "$3" {} +; fi
 }
 
-expect() { # dir A|B label
+expect() {
     local out want=fx-value=1 status=0 input_before input_after
     [[ $2 == B ]] && want=fx-value=2
     input_before=$(sha256sum "$1/fx/src/lib.rs" "$1/fx/build.rs" "$1/tracked/value" "$1/fx/src/space 'quote'.rs")
@@ -54,7 +52,7 @@ expect() { # dir A|B label
     LAST_OUTPUT=$out
 }
 
-replace() { # dir from
+replace() {
     find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
     (cd "$2" && tar cf - .) | (cd "$1" && tar xpf -)
 }

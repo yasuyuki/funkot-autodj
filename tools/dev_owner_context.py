@@ -112,7 +112,7 @@ class RegistrationHandler(socketserver.StreamRequestHandler):
         try:
             self.wfile.write(json.dumps(response).encode())
         except OSError:
-            pass  # Docker may have exited before consuming the acknowledgement.
+            pass
 
 
 def client(address, argv):
@@ -160,7 +160,6 @@ def run(docker_args):
                         signal.signal(sig, handler)
                 return status if status >= 0 else 128 - status
             finally:
-                # Acknowledgements stay available until Docker has exited.
                 server.shutdown()
                 with server.connection_lock:
                     connections = list(server.connections)

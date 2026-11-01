@@ -79,14 +79,6 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
         (analysis.total_frames as f64 - fd) / bar_frames,
     );
 
-    // `refit`: kill the drift at its source instead of letting the lock
-    // absorb it. Lock the farthest outro candidate (64 bars in, so still
-    // dense material even on masters that fade out), then read off how many
-    // *whole beats* separate it from `first_downbeat` — the nominal estimate
-    // is off by less than half a beat on every master measured, so that
-    // integer is unambiguous, and dividing by it pins the beat period to
-    // ~0.001%. Bar identity is untouched (still `fd + 4k beats`); only the
-    // period is refined, so this stays deterministic grid arithmetic.
     let ref_nominal = boundary_frame(&analysis, Side::Outro, 64);
     let ref_locked =
         lock_boundary_to_groove(&buf, ref_nominal, bar_frames, NORMAL_HALF_WIDTH_BARS);
@@ -107,25 +99,21 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
     for &bars in OUTRO_CANDIDATES.iter() {
         let span = (bar_frames * f64::from(bars)).round() as i64;
 
-        // local: pre-bbf684c anchor.
         let nominal_local = analysis.total_frames as i64 - span;
         let locked_local =
             lock_boundary_to_groove(&buf, nominal_local, bar_frames, NORMAL_HALF_WIDTH_BARS);
 
-        // prop: what HEAD ships.
         let nominal_prop = boundary_frame(&analysis, Side::Outro, bars);
         let locked_prop =
             lock_boundary_to_groove(&buf, nominal_prop, bar_frames, NORMAL_HALF_WIDTH_BARS);
 
-        // hybrid: local phase, propagated bar identity.
         let d_bars = (locked_local as f64 - fd) / bar_frames;
-        let frac_bars = d_bars - d_bars.round(); // (-0.5, 0.5] bars
-        let to_bar_head_beats = -frac_bars * 4.0; // (-2, 2] beats
+        let frac_bars = d_bars - d_bars.round();
+        let to_bar_head_beats = -frac_bars * 4.0;
         let k = to_bar_head_beats.round();
         let hybrid = locked_local + (k * beat).round() as i64;
-        let left_beats = to_bar_head_beats - k; // drift we deliberately keep
+        let left_beats = to_bar_head_beats - k;
 
-        // refit: same propagated construction, refined period.
         let bars_to_end_refit = ((analysis.total_frames as f64 - fd) / bar_refit).round();
         let nominal_refit = (fd + (bars_to_end_refit - f64::from(bars)) * bar_refit).round() as i64;
         let locked_refit =

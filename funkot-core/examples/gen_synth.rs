@@ -1,8 +1,3 @@
-//! Generate synthetic Funkot-like test tracks into a directory.
-//!
-//! Usage (inside the dev container):
-//!   cargo run -p funkot-core --example gen_synth --features testutil --release -- testdata/synth
-
 use std::time::SystemTime;
 
 use funkot_core::owned_wav::Checkout;
@@ -21,7 +16,6 @@ fn main() {
     let checkout = Checkout::this();
     let owned = checkout.open(SystemTime::now());
 
-    // (name, bpm, intro_bars, main_bars, outro_bars)
     let specs = [
         ("track_a_180_i16_o16.wav", 180.0, 16u32, 48u32, 16u32),
         ("track_b_178_i32_o8.wav", 178.0, 32, 48, 8),

@@ -61,8 +61,6 @@ pub struct FunkotEvent {
     pub detail: [c_char; 256],
 }
 
-/// Copy the largest valid UTF-8 prefix of `src` that fits in `dst` (leaving room
-/// for a trailing NUL). Always NUL-terminates when `dst` is non-empty.
 fn copy_utf8_prefix(dst: &mut [u8], src: &str) {
     if dst.is_empty() {
         return;
@@ -255,7 +253,6 @@ pub unsafe extern "C" fn funkot_engine_new(
         };
         match Engine::new(engine_opts, playlist) {
             Ok(mut engine) => {
-                // Match cpal live path: audio hosts must not sleep in render.
                 engine.set_realtime(true);
                 Box::into_raw(Box::new(FunkotEngine {
                     engine,

@@ -1,8 +1,3 @@
-//! Golden/tolerance tests for downbeat + section detection.
-//!
-//! `tests/fixtures/golden.json` stores synth recipes + tolerances.
-//! Optional WAVs (gitignored) can be regenerated with:
-//!   `cargo run -p funkot-cli --release -- --gen-test-fixtures funkot-core/tests/fixtures`
 
 use std::fs;
 use std::path::PathBuf;
@@ -180,10 +175,6 @@ fn groove_refine_stays_within_half_beat_of_marker() {
     }
 }
 
-/// Dense, loud stand-in for a Funkot master: kick on every beat, 16th hats
-/// with the on-beat hit accented, and a broadband bed. Thin fixtures do not
-/// exercise a phase lock — see HANDOFF §9 ("合成フィクスチャは音が薄すぎて
-/// 実音源の問題を検出できない").
 fn synth_gridded_stereo(frames: usize, sr: u32, first_beat: u64, beat: f64) -> Vec<f32> {
     let mut state = 0x1234_5678u32;
     let rnd = move |st: &mut u32| -> f32 {
@@ -205,7 +196,6 @@ fn synth_gridded_stereo(frames: usize, sr: u32, first_beat: u64, beat: f64) -> V
         if at >= frames as f64 {
             break;
         }
-        // kick (cosine phase: low-band energy peaks at the attack)
         let klen = (0.20 * sr_f) as usize;
         for j in 0..klen {
             let f = at.round() as usize + j;
@@ -218,7 +208,6 @@ fn synth_gridded_stereo(frames: usize, sr: u32, first_beat: u64, beat: f64) -> V
             out[f * 2] += v;
             out[f * 2 + 1] += v;
         }
-        // 16th hats, on-beat accented
         for sixteenth in 0..4 {
             let amp = if sixteenth == 0 { 0.6 } else { 0.28 };
             let start = (at + beat * f64::from(sixteenth) / 4.0).round() as usize;
@@ -242,12 +231,6 @@ fn synth_gridded_stereo(frames: usize, sr: u32, first_beat: u64, beat: f64) -> V
     out
 }
 
-/// `lock_beat_phase` exists because a marker counted back from the file end
-/// can be up to half a beat off (real case: `AntonFer - … - 02 IVY.flac`,
-/// +0.494 beat), which `refine_groove_phase`'s ±0.45-beat window cannot
-/// reach. Check both halves of its contract: it recovers a near-half-beat
-/// error, and it never moves a marker by half a beat or more (that would
-/// change which beat the marker names).
 #[test]
 fn beat_phase_lock_recovers_near_half_beat_error() {
     let sr = 44_100u32;

@@ -52,7 +52,6 @@ struct Args {
     reuse_cache: bool, engine_options: Option<PathBuf>, full_until_frame: Option<u64>,
 }
 
-/// Output-frame interval captured in the WAV. `end` is exclusive.
 #[derive(Clone, Copy, Debug)]
 struct CaptureWindow {
     start: u64,
@@ -323,7 +322,6 @@ fn run() -> Result<(), String> {
         }
         options.cache_dir = args.cache_dir.clone();
     }
-    // Initial track preparation completes before the measured render calls.
     let prepared = prepare_tracks_parallel(&options, &args.files, 1)
         .map_err(|e| format!("prepare real input: {e}"))?;
     if prepared.len() != 2 { return Err("prepare did not return both input tracks".into()); }
@@ -469,7 +467,6 @@ fn event_json(event: &EngineEvent, files: &[PathBuf; 2]) -> Value {
     match event {
         EngineEvent::TrackStarted { index, path, .. } => json!({"kind": "track_started", "index": index, "track_id": track_index(path, files)}),
         EngineEvent::TransitionStarted { from, to, .. } => json!({"kind": "transition_started", "from_track_id": track_index(from, files), "to_track_id": track_index(to, files)}),
-        // Loader messages can embed a source path, so keep only the stable track id.
         EngineEvent::TrackFailed { path, .. } => json!({"kind": "track_failed", "track_id": track_index(path, files)}),
         EngineEvent::Finished => json!({"kind": "finished"}),
     }

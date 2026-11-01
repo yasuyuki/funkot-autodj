@@ -134,7 +134,6 @@ impl Generation {
             }
             let output_lock = dir.output_lock(&absolute)?;
             let lock = receipts.lock(&absolute)?;
-            // Never adopt pre-existing outputs or old/unknown receipts.
             if dir.exists(&name)? || dir.exists(&format!(".{name}.owned"))? {
                 #[cfg(target_os = "linux")]
                 return Err(invalid("pre-existing output or receipt; retained"));
@@ -163,7 +162,6 @@ impl Generation {
                 #[cfg(windows)]
                 { windows::create_marker(&dir, &mut claim)?; receipts.persist(&side, &claim, false)?; }
             }
-            // Exclusive creation cannot adopt a file raced in after registration.
             let file = dir.create_regular(&name)?;
             #[cfg(target_os = "linux")]
             file.try_lock().map_err(|e| io::Error::other(format!("output busy: {e}")))?;
@@ -312,12 +310,8 @@ fn reclaim(dir: &Directory, receipts: &Directory, side: &str, c: &mut Claim) -> 
         output_lock = verify_output(dir, &tomb, c)?;
         output_lock.try_lock().map_err(|e| io::Error::other(format!("output busy: {e}")))?;
     }
-    // Check again after rename. Never overwrite a raced-in new output to restore
-    // a mismatch; preserve it and the quarantined inode for explicit resolution.
     verify_output(dir, &tomb, c)?; dir.revalidate()?;
     if dir.exists(name)? { return Err(invalid("new output at reclaimed name; retained")); }
-    // Acceptance alone is not evidence of owner deletion. Persist this only
-    // after the exact quarantined inode/hash and original-name absence checks.
     c.result = Some(LINUX_DELETE_INTENT.into()); receipts.persist(side, c, false)?;
     fs::remove_file(dir.child(&tomb))?; dir.sync()?;
     #[cfg(all(test, target_os = "linux"))]
@@ -392,7 +386,7 @@ impl Directory {
     #[cfg(not(windows))]
     fn child(&self, name: &str) -> PathBuf { self.pinned().join(name) }
     fn sync(&self) -> io::Result<()> {
-        #[cfg(windows)] { Ok(()) } // Native receipt persistence flushes its handle before and after rename.
+        #[cfg(windows)] { Ok(()) }
         #[cfg(not(windows))] { self.file.sync_all() }
     }
     fn revalidate(&self) -> io::Result<()> {
@@ -774,8 +768,6 @@ mod tests {
         assert!(complete(&output, &generation, None, "accepted:test", "released:test").is_err());
         assert_eq!(claim(&receipt).state, "pending"); assert!(output.exists());
         drop(busy);
-        // The regular generation entry retries accepted work before rejecting
-        // this name's existing receipt; it must never adopt that old receipt.
         assert!(Generation::begin(&output).is_err());
         assert!(!output.exists());
         let after = claim(&receipt); assert_eq!(after.state, "reclaimed");

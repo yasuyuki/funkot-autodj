@@ -1,4 +1,3 @@
-//! Integration tests for the C ABI (`ffi` module / `include/funkot.h`).
 
 use std::ffi::{c_char, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -137,7 +136,6 @@ fn ffi_single_track_render_and_events() {
 
 #[test]
 fn ffi_null_and_invalid_inputs() {
-    // NULL options → NULL engine + error message.
     let mut err = [0i8; 128];
     let engine = unsafe {
         funkot_engine_new(
@@ -152,7 +150,6 @@ fn ffi_null_and_invalid_inputs() {
     let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
     assert!(msg.contains("NULL"), "err={msg}");
 
-    // Empty playlist: creation succeeds; first render returns 0; FINISHED queued.
     let dir = temp_dir("empty");
     let cache = dir.join("cache");
     let _ = std::fs::create_dir_all(&cache);
@@ -164,8 +161,6 @@ fn ffi_null_and_invalid_inputs() {
     assert!(!engine.is_null(), "empty playlist should succeed");
 
     let mut buf = vec![1.0f32; 64];
-    // Loader may need a timeslice before Exhausted is visible (never block in
-    // the engine itself; hosts pull in realtime).
     let mut n = 1usize;
     for _ in 0..500 {
         n = unsafe { funkot_engine_render(engine, buf.as_mut_ptr(), 32) };
@@ -193,7 +188,6 @@ fn ffi_null_and_invalid_inputs() {
         funkot_engine_free(engine);
     }
 
-    // Invalid UTF-8 path → NULL + error message.
     let bad: &[u8] = b"bad\xffpath\0";
     let bad_ptr = bad.as_ptr().cast::<c_char>();
     let path_ptrs = [bad_ptr];
@@ -204,13 +198,11 @@ fn ffi_null_and_invalid_inputs() {
     let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
     assert!(msg.contains("UTF-8"), "err={msg}");
 
-    // free(NULL) is safe.
     unsafe {
         funkot_engine_free(std::ptr::null_mut());
         funkot_engine_stop(std::ptr::null_mut());
     }
 
-    // poll with NULL event pointer returns 0 (and does not require a live engine).
     assert_eq!(
         unsafe { funkot_engine_poll_event(std::ptr::null_mut(), std::ptr::null_mut()) },
         0
@@ -247,7 +239,6 @@ fn ffi_path_truncation_valid_utf8() {
         unsafe { funkot_engine_new(&options, path_ptrs.as_ptr(), 1, std::ptr::null_mut(), 0) };
     assert!(!engine.is_null());
 
-    // Pull until TRACK_STARTED appears (loader may take a moment).
     let mut buf = vec![0.0f32; 1024 * 2];
     let mut started_path = None;
     for _ in 0..10_000_000 {
@@ -261,13 +252,11 @@ fn ffi_path_truncation_valid_utf8() {
         while unsafe { funkot_engine_poll_event(engine, &mut event) } == 1 {
             if event.type_ == FunkotEventType::TrackStarted {
                 let s = event_path_str(&event).to_string();
-                // Must be NUL-terminated inside 512 and a valid UTF-8 prefix.
                 assert!(s.len() < 512);
                 assert!(
                     full.starts_with(&s),
                     "truncated path is not a prefix:\n  got={s}\n  full={full}"
                 );
-                // Ensure we actually truncated.
                 assert!(s.len() < full.len());
                 started_path = Some(s);
                 break;

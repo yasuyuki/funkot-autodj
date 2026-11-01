@@ -82,9 +82,6 @@ fn render(
 
     match side {
         Side::Outro => {
-            // What the grid already corrected for, so a listener reading
-            // these clips knows whether `plus0` is the propagated grid or an
-            // already-shifted one.
             let applied =
                 music_end_bar(&buf, &analysis, bar_frames_for(&analysis, Side::Outro), 0)
                     .map(|end_bar| {
@@ -94,9 +91,6 @@ fn render(
             println!("{stem}  (grid already applies +{applied} beat)");
         }
         Side::Intro => {
-            // The labeling grid never shifts the intro side by a whole beat:
-            // `plus0` below is exactly the boundary `--label-sections` would
-            // click on, not a corrected one.
             println!(
                 "{stem}  (labeling applies no intro phase shift; plus0 is what labeling hears)"
             );
@@ -125,12 +119,6 @@ fn render(
             Side::Intro => grid,
         };
 
-        // Both numbers must describe the clip written just below, so they come
-        // from the same call `build_candidate_clip_on_grid` makes -- including
-        // the branch-consensus correction, which a bare
-        // `lock_boundary_to_groove` would miss. At `offset == 0` this is also
-        // exactly what `examples/click_phase_diag.rs` prints, so `plus0` can be
-        // cross-checked against that diagnostic verbatim.
         let nominal = boundary_frame_on_grid(clip_analysis, side, bars, shifted_grid);
         let locked = locked_boundary_on_grid(
             &buf,

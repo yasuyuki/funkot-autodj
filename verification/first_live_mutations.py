@@ -20,7 +20,6 @@ FIRST_LIVE_MUTATIONS = (
      (("!blocking || replay_pending", "replay_pending"),), None),
 )
 
-# Receiver replacement is a channel ownership adapter, outside the pure Kani facts.
 FIRST_LIVE_ENGINE_MUTATIONS = (
     ("first_live_receiver", None, (),
      "future_commit_retires_prepared_preparing_and_old_messages_and_permits"),

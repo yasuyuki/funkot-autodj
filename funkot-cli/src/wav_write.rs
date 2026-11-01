@@ -1,5 +1,3 @@
-//! Offline WAV writers with optional TPDF dither for integer PCM.
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -7,7 +5,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 
-/// Offline render sample format (`--wav-format`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum WavFormat {
     /// 32-bit IEEE float (default). Preserves the f32 mix bus; no clamp.
@@ -44,14 +41,10 @@ impl WavFormat {
     }
 }
 
-/// Peak / over-level stats accumulated while writing.
 #[derive(Debug, Default, Clone)]
 pub struct PeakStats {
-    /// Maximum absolute sample value seen (after NaN/Inf → 0 sanitization).
     pub peak: f32,
-    /// Number of interleaved samples with `|x| > 1.0`.
     pub over_samples: u64,
-    /// Number of stereo frames containing at least one over sample.
     pub over_frames: u64,
 }
 
@@ -78,7 +71,6 @@ impl PeakStats {
     }
 }
 
-/// Tiny deterministic xorshift32 PRNG for TPDF dither (no extra deps).
 pub struct XorShift32 {
     state: u32,
 }
@@ -99,14 +91,11 @@ impl XorShift32 {
         x
     }
 
-    /// Uniform in (-0.5, 0.5).
     fn next_unit(&mut self) -> f64 {
-        // Exclude 0 and 1.0 endpoints via (1..2^32) mapped to (0,1).
         let u = (self.next_u32() as f64) / (u32::MAX as f64 + 1.0);
         u - 0.5
     }
 
-    /// Triangular PDF in (-1, 1) LSB units (sum of two independent uniforms).
     pub fn tpdf(&mut self) -> f64 {
         self.next_unit() + self.next_unit()
     }
@@ -121,19 +110,15 @@ fn sanitize(sample: f32) -> f32 {
     }
 }
 
-/// Quantize `sample` (full-scale ±1.0) to signed integer with ±1 LSB TPDF dither.
 fn quantize_tpdf(sample: f32, max_pos: i32, rng: &mut XorShift32) -> i32 {
     let x = sanitize(sample);
     let scale = f64::from(max_pos);
-    // dither amplitude = 1 LSB in the scaled domain
     let dithered = f64::from(x) * scale + rng.tpdf();
-    // Two's complement: positive full-scale = max_pos, negative = -(max_pos+1).
     let min = i64::from(-(max_pos + 1));
     let max = i64::from(max_pos);
     (dithered.round() as i64).clamp(min, max) as i32
 }
 
-/// Streaming WAV writer for interleaved stereo f32 chunks.
 pub struct WavStreamWriter {
     format: WavFormat,
     // Flush/drop the writer before releasing the generation's handles and lease.
@@ -152,7 +137,6 @@ impl WavStreamWriter {
         Ok(writer)
     }
 
-    /// The caller retains responsibility for completing the owning generation.
     pub fn from_file(file: File, sample_rate: u32, format: WavFormat) -> Result<Self> {
         let writer = hound::WavWriter::new(BufWriter::new(file), format.wav_spec(sample_rate))?;
         Ok(Self {
@@ -176,7 +160,6 @@ impl WavStreamWriter {
                 }
             }
             WavFormat::S24 => {
-                // hound 24-bit uses i32 in the range ±(2^23−1).
                 const MAX: i32 = 8_388_607;
                 for &sample in chunk {
                     let q = quantize_tpdf(sample, MAX, &mut self.rng);
@@ -220,7 +203,6 @@ mod tests {
     #[test]
     fn peak_stats_count_overs() {
         let mut stats = PeakStats::default();
-        // One frame with L over, one clean, one with both over.
         stats.observe_chunk(&[1.5, 0.0, 0.5, -0.5, -1.1, 1.2]);
         assert!((stats.peak - 1.5).abs() < 1e-6);
         assert_eq!(stats.over_samples, 3);

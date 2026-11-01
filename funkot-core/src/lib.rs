@@ -1,19 +1,3 @@
-//! funkot-core: Funkot auto-DJ mixing engine.
-//!
-//! Design summary (see README for the full spec):
-//! - Funkot tracks are nominally 180 BPM; intros/outros are steady machine
-//!   rhythm, mid-song tempo is unreliable. Only the head/tail are analyzed.
-//! - Every track is time-stretched by a single constant ratio
-//!   `target_bpm / track_intro_bpm` where `target_bpm = 180 * rate`
-//!   (rate defaults to 1.10 → 198 BPM). Pitch is preserved by default.
-//! - Transition is scheduled backward from the next track's intro end (T0):
-//!   next enters `2·fade_bars + MAIN_GAP_BARS` earlier (HPF, vol 0), fades in
-//!   linearly over `fade_bars`, then HPF flips to the previous track and that
-//!   track fades out linearly so it reaches silence exactly [`MAIN_GAP_BARS`]
-//!   (8) bars before T0; the previous deck is dropped at that endpoint.
-//!   Long intros are entered mid-way (`skip`) so the audible overlap stays the
-//!   fade pair only (~8 bars at default F=4).
-
 pub mod analysis;
 pub mod cache;
 pub mod convert;
@@ -79,7 +63,7 @@ pub struct ClassifyScores {
     pub tail_half_ratio: f64,
 }
 
-/// serde_json rejects `f64::INFINITY`; map non-finite ↔ JSON `null`.
+/// serde_json writes non-finite `f64` as `null` but cannot read `null` back as `f64`; read `null` as `+inf`.
 mod serde_inf_f64 {
     use serde::{Deserialize, Deserializer, Serializer};
 

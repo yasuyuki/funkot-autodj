@@ -1,22 +1,4 @@
 #!/bin/sh
-# Run a command inside the dev container with the repo mounted at /work.
-# Cargo registry and target dir live in named volumes so rebuilds are fast.
-# DEV_TARGET_PREFIX names one shared target volume (default funkot-target).
-# dev_source_guard.py invalidates only checkout-local Cargo fingerprints when
-# the mounted sources cannot be attributed to recorded content.
-#
-# Usage: ./dev.sh cargo build --workspace
-# Optional: DEV_BIND_SRC=/host/path DEV_BIND_DST=/host/path (default: same as src)
-#
-# FUNKOT_TESTDATA_DIR is forwarded when set (see funkot_core::testdata). Pointing
-# it outside the repo needs DEV_BIND_SRC too, or the path won't exist in here.
-#
-# Local CI speed (dev.sh only; GitHub Actions is unchanged):
-#   DEV_JOBS             — cargo/rustc/test parallelism (default: nproc / hw.ncpu)
-#   CARGO_BUILD_JOBS     — override build jobs (default: DEV_JOBS)
-#   RUST_TEST_THREADS    — override test threads (default: DEV_JOBS)
-#   CARGO_PROFILE_RELEASE_LTO — default false (matches GH test job; thin LTO is slow)
-#   CARGO_INCREMENTAL    — default 1 (faster local release rebuilds)
 set -eu
 cd "$(dirname "$0")"
 
@@ -29,15 +11,12 @@ fi
 
 IMAGE=funkot-autodj-dev
 
-# Refresh the image when its declared dependencies change, including an old
-# image built before this label existed.
 DOCKERFILE_SHA=$(sha256sum Dockerfile | cut -d ' ' -f 1)
 IMAGE_DOCKERFILE_SHA=$(docker image inspect --format '{{ index .Config.Labels "org.funkot.dev-dockerfile" }}' "$IMAGE" 2>/dev/null || true)
 if [ "$IMAGE_DOCKERFILE_SHA" != "$DOCKERFILE_SHA" ]; then
     docker build --label "org.funkot.dev-dockerfile=$DOCKERFILE_SHA" -t "$IMAGE" . >&2
 fi
 
-# Host CPU count → container cargo/test parallelism.
 if [ -z "${DEV_JOBS:-}" ]; then
     if command -v nproc >/dev/null 2>&1; then
         DEV_JOBS=$(nproc)
@@ -49,12 +28,9 @@ if [ -z "${DEV_JOBS:-}" ]; then
 fi
 : "${CARGO_BUILD_JOBS:=$DEV_JOBS}"
 : "${RUST_TEST_THREADS:=$DEV_JOBS}"
-# GH test job sets LTO=false; keep official release artifacts on Actions/cross-build.
 : "${CARGO_PROFILE_RELEASE_LTO:=false}"
 : "${CARGO_INCREMENTAL:=1}"
 
-# Skip named volume /work/target (multi-GB); only fix bind-mount ownership.
-#
 # Only do this under rootful Docker. Under rootless Docker, container UID 0
 # already *is* the invoking host user, and any other container UID (such as
 # $HOST_UID) is remapped through /etc/subuid to a disjoint high host UID
@@ -68,20 +44,11 @@ else
     CHOWN_WORK='find /work -mindepth 1 -maxdepth 1 ! -name target -exec chown -R "$HOST_UID:$HOST_GID" {} + 2>/dev/null || true'
 fi
 
-# The container runs as root; hand ownership of anything it wrote in the
-# mounted workspace (Cargo.lock, testdata, ...) back to the invoking user.
-#
-# DEV_BIND_*: same-path (or remapped) bind for music dirs outside the repo
-# (work.sh playlists with /mnt/c/... paths). Quoted -v keeps spaces safe.
-# Preserve the command as argv throughout: no shell evaluation of context or
-# user arguments. Build Docker options before the image/command boundary.
-#
 # Cargo's mtime freshness cannot distinguish restored or metadata-preserving
 # source edits. The content guard invalidates affected local fingerprints.
 SOURCE_PATH=$(pwd -P)
 TARGET_VOLUME=${DEV_TARGET_PREFIX:-funkot-target}
 docker volume create "$TARGET_VOLUME" >/dev/null
-# HEAD names the build only when the checkout does not differ from it.
 SOURCE_REVISION=
 if [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$SOURCE_PATH" ] \
     && [ -z "$(git status --porcelain)" ]; then
@@ -104,9 +71,6 @@ if [ -n "${DEV_BIND_SRC:-}" ]; then
     set -- -v "$DEV_BIND_SRC:${DEV_BIND_DST:-$DEV_BIND_SRC}:ro" "$@"
 fi
 if [ -n "${WORKSPACE_LIFECYCLE_CONTEXT:-}" ]; then
-    # Registration runs on the host with the supervisor's existing lease.
-    # The container receives only a fixed run-scoped registration socket,
-    # its task checkout, and its external owner receipt directory.
     exec python3 tools/dev_owner_context.py run "$@"
 fi
 exec docker run --rm -i "$@"

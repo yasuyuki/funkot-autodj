@@ -1,7 +1,4 @@
 #!/bin/sh
-# phase_ab clips for every labeling candidate (the absolute-path lines of
-# testdata/file_list.txt -- the bare names are the already-labeled testdata
-# set). Both sides, bars 16, plus0..plus3 each.
 set -eu
 cd /work
 IFS='

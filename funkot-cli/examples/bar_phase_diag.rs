@@ -48,9 +48,6 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
         .chunks_exact(2)
         .map(|f| (f[0] + f[1]) * 0.5)
         .collect();
-    // One digit per `block` bars: which beat slot is quietest there, '.' when
-    // the four slots are too close for the answer to mean anything. With
-    // DETAIL set, print the four levels too (relative to the block's loudest).
     let block: i64 = std::env::var("BLOCK")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -96,8 +93,6 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
     }
     println!("{:<46} {line}", &name[..name.len().min(46)]);
 
-    // The comparison that matters for the guide clicks: does the bar phase
-    // near the outro still agree with the one near the intro?
     const WIN: i64 = 48;
     let intro = phase_of(&mono, fd, bar_frames, 4, 4 + WIN);
     let outro = phase_of(&mono, fd, bar_frames, end_bar - 4 - WIN, end_bar - 4);
@@ -107,11 +102,6 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
             format!("shift {shift:+} beat")
         }
         (Some((qi, _)), Some((qo, _))) => {
-            // Same gate as `outro_beat_phase_shift`: the intro window's
-            // quietest slot isn't 3, so its own relative shift can't be
-            // trusted as evidence the grid moved (see that function's doc,
-            // `Andai Tak Berpisah`) -- abstain, but still show what the
-            // relative form would have said.
             let shift = (qo + 4 - qi) % 4;
             format!(
                 "shift +0 beat (intro window {qi}, not 3 -- abstained; \
@@ -128,8 +118,6 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Quietest beat slot over `[lo, hi)` bars, with its margin over the next
-/// quietest, or `None` when the four slots are too close to call.
 fn phase_of(mono: &[f32], fd: f64, bar_frames: f64, lo: i64, hi: i64) -> Option<(i64, f64)> {
     const CLEAR_DB: f64 = 0.8;
     let beat_frames = bar_frames / 4.0;

@@ -1,17 +1,4 @@
 #!/bin/sh
-# Cross-build release artifacts for non-Linux targets (Docker + mingw / Android NDK).
-#
-# Usage:
-#   ./cross-build.sh                 # Windows x64
-#   ./cross-build.sh windows         # same
-#   ./cross-build.sh android         # Android arm64 (funkot-core C-ABI SDK)
-#   ./cross-build.sh --clean         # wipe target-cross + dist, then build
-#   ./cross-build.sh windows --clean # same
-#
-# Output:
-#   windows: dist/windows-x64/funkot-autodj.exe (+ MinGW runtime DLLs)
-#   android: dist/android-arm64/{libfunkot_core.so,libfunkot_core.a,
-#            libc++_shared.so,include/funkot.h}
 set -eu
 cd "$(dirname "$0")"
 
@@ -80,7 +67,6 @@ if [ "$TARGET_ARG" = windows ]; then
     '
     BUILT="$DIST_DIR/funkot-autodj.exe"
 else
-    # funkot-cli has no Android host (cpal + terminal keys); only the core SDK.
     # The cdylib links libc++_shared.so, so ship it alongside — a static libc++
     # is not an option once an app loads more than one .so.
     BUILD_SCRIPT='

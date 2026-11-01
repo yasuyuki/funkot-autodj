@@ -102,16 +102,12 @@ fn manual_plan_rejects_bad_marker_and_does_not_bridge_a_break() {
     assert!(recovered.start + recovered.prev_nudge + recovered.fade_out_end <= active.frames);
     assert!(recovered.entry + recovered.fade_out_end <= next.frames);
 
-    // A discontinuity inside the proposed real overlap must still reject the
-    // beat-only candidate; historical marker loss alone is not enough.
     let mut overlap_break = track(2, 180.0);
     Arc::make_mut(&mut overlap_break.samples)[10 * 58_800 * 2..11 * 58_800 * 2].fill(0.0);
     let delayed = build_manual_plan(request(&overlap_break, &next, 8 * 58_800, 4));
     assert!(!delayed.simple, "{}", delayed.reason);
     assert_eq!(delayed.start, 11 * 58_800);
 
-    // A recovered 90/120 BPM island in the actual overlap is just as unsafe
-    // as silence there. The historical break must not turn it into Beat.
     for bpm in [90.0, 120.0] {
         let mut excursion = active.clone();
         let different_tempo = synth_track(bpm, 4, 0, 0, 44_100);
@@ -124,7 +120,6 @@ fn manual_plan_rejects_bad_marker_and_does_not_bridge_a_break() {
         assert_ne!(rejected.reason, "beat sync: structural identity unknown");
     }
 
-    // A break in the target's actual overlap still rejects beat sync.
     let mut broken_target = next.clone();
     Arc::make_mut(&mut broken_target.samples)[2 * 58_800 * 2..3 * 58_800 * 2].fill(0.0);
     let rejected = build_manual_plan(request(&active, &broken_target, earliest, 4));
@@ -196,8 +191,6 @@ fn manual_plan_does_not_overlap_large_fixed_speed_drift() {
     let active = track(0, 176.0);
     let next = track(1, 180.0);
     let plan = build_manual_plan(request(&active, &next, 4 * 58_800, 4));
-    // A 32-beat overlap differs by 0.71 beats; neither an initial kick match
-    // nor a narrow-band BPM candidate establishes safe fixed-speed mixing.
     assert!(plan.simple, "{}", plan.reason);
 }
 
@@ -255,8 +248,6 @@ fn real_worker_correction_reaches_realtime_output_at_exact_sample() {
     for sr in [44_100, 48_000] {
         let active = track_at(0, 180.0, sr);
         let mut next = track_at(1, 180.0, sr);
-        // Deliberately stale fractional marker: the audio pulse is a quarter
-        // beat later. A nominal entry demonstrably produces different audio.
         let delay = (sr as f64 * 60.0 / 180.0 / 4.0).round() as usize;
         let mut delayed = vec![0.0; delay * 2];
         delayed.extend_from_slice(&next.samples);
@@ -265,8 +256,6 @@ fn real_worker_correction_reaches_realtime_output_at_exact_sample() {
         let options = EngineOptions { rate: 1.0, output_sample_rate: sr, ..EngineOptions::default() };
         let mut engine = Engine::from_prepared(options.clone(), vec![active.clone(), next.clone()]).unwrap();
         engine.set_realtime(true);
-        // Proxy the real worker's result channel to control its arrival without
-        // depending on wall-clock sleeps or replacing the production builder.
         let (delivery_tx, delivery_rx) = mpsc::sync_channel(1);
         let real_rx = std::mem::replace(&mut engine.manual_rx, delivery_rx);
         let (observation_tx, observation_rx) = mpsc::sync_channel(1);
@@ -304,8 +293,6 @@ fn real_worker_correction_reaches_realtime_output_at_exact_sample() {
         nominal.commit_manual_plan(nominal_plan);
 
         let mut actual_out = vec![0.0; 4096];
-        // Small uneven chunks must preserve the same sample schedule as one
-        // large reference callback with an identical already-ready plan.
         for chunk in actual_out.chunks_mut(514) { engine.render(chunk); }
         let mut expected = vec![0.0; actual_out.len()];
         let mut uncorrected = expected.clone();
@@ -322,7 +309,6 @@ fn real_worker_correction_reaches_realtime_output_at_exact_sample() {
 fn engine_adopts_deadline_limited_one_bar_plan_at_its_exact_deadline() {
     let bar = 58_800u64;
     let mut active = track(0, 180.0);
-    // The deadline is a one-bar marker boundary but not a four-bar boundary.
     active.outro_start_out = 5 * bar;
     active.outro_end_anchored_out = active.outro_start_out;
     let mut next = active.clone();
