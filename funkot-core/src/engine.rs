@@ -7550,6 +7550,51 @@ mod natural_handoff_tests {
     }
 
     #[test]
+    fn future_update_after_outro_starts_on_a_bar_with_remaining_material() {
+        for resolution in ["abort", "commit", "append"] {
+            let tracks = if resolution == "append" {
+                vec![handoff_track(0, 8, 16)]
+            } else {
+                vec![handoff_track(0, 8, 16), handoff_track(1, 24, 16)]
+            };
+            let mut engine = Engine::from_prepared(handoff_options(), tracks).unwrap();
+            engine.set_realtime(true);
+            engine.poll_events();
+            let release_at = 8 * BAR + BAR / 2;
+            if resolution == "append" {
+                render_frames(&mut engine, release_at);
+            }
+            let token = engine.begin_future_update().expect("future update accepted");
+            if resolution != "append" {
+                render_frames(&mut engine, release_at);
+            }
+            engine.poll_events();
+            let messages = if resolution == "abort" {
+                engine.abort_future_update(token);
+                None
+            } else {
+                let (replacement, messages) = controlled_replacement();
+                drop(engine.commit_future_update(token, replacement));
+                messages.send(LoaderMsg::Ready(handoff_track(1, 24, 16), None)).unwrap();
+                Some(messages)
+            };
+            engine.poll_events();
+            assert_eq!(engine.ready_ahead(), 1, "{resolution}: successor ready");
+            let (frames, events) = render_until_event(&mut engine, BAR);
+            let playhead = release_at + frames - 1;
+            assert!(events.iter().any(|event| matches!(event, EngineEvent::TransitionStarted { .. })),
+                "{resolution}: missing transition: {events:?}");
+            assert_eq!(playhead, 9 * BAR,
+                "{resolution}: crossfade must wait for the next outro bar line");
+            let transition = engine.transition.as_ref().expect("crossfade active");
+            assert!(!transition.simple, "{resolution}: remaining bars support the full plan");
+            assert_eq!(transition.fade_out_end, 8 * BAR,
+                "{resolution}: plan must retain the full fade pair within the remaining outro");
+            drop(messages);
+        }
+    }
+
+    #[test]
     fn natural_handoff_waits_for_b_own_outro_and_reports_remaining_frames() {
         for (name, release_at, expected_remaining) in [
             ("gap", 24 * BAR, 24 * BAR - 1),
