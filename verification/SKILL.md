@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`e49cac5f12f089afa38393eb832a2e4e0a9c2afe`. This is an audit anchor, not a pin.
+`282572a7caef63f9c079b5ad6aa94851f5bd0b2b`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
@@ -222,6 +222,12 @@ cover a successor after silence or on the outgoing track's final frame,
 the successor's own outro countdown and transition frame, and repeated
 path/index/marker values with ready or pending old phase work. They also check
 adoption of the actual new phase-worker result in realtime mode.
+
+After a future-update abort or commit, an active non-head occurrence already in
+its outro resumes delayed adoption on the outro bar grid with the remaining
+budget. The `future_update_after_outro` regressions cover abort, commit and
+last-track append, reduced full plans, and a solo EOF handoff when no fade pair
+fits. The delayed wait remains until that occurrence ends.
 
 Neither TLC model includes automatic outro waiting or phase workers. These
 native regressions check that adapter; the models do not prove this lifecycle.
