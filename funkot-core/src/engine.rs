@@ -1751,7 +1751,17 @@ impl Engine {
 
     pub fn abort_future_update(&mut self, token: FutureUpdate) {
         self.check_future_token(&token);
+        self.resume_future_adoption();
+    }
+
+    fn resume_future_adoption(&mut self) {
         self.future_fence = None;
+        if let Some(active) = self.active.as_ref().filter(|d| {
+            !d.track.head_only && d.playhead >= d.track.outro_start_out
+        }) {
+            self.awaiting_next_at_outro = true;
+            self.outro_anchor = active.track.outro_start_out;
+        }
     }
 
     /// Infallible for this engine's live token. No filesystem work, thread
@@ -1776,8 +1786,7 @@ impl Engine {
         self.permit_tx = permit_tx;
         self.loader_exhausted = false;
         self.source_generation = self.source_generation.wrapping_add(1);
-        self.future_fence = None;
-        self.awaiting_next_at_outro = false;
+        self.resume_future_adoption();
         self.clear_phase_align();
         self.cancel_pending_nav();
         // Account for retained decks/history against the NEW permit pool.
@@ -3211,7 +3220,6 @@ impl Engine {
         };
         if o_remaining < 2 * f_eff {
             // Let prev finish; start next solo when active ends.
-            self.awaiting_next_at_outro = false;
             return;
         }
 
@@ -7551,6 +7559,55 @@ mod natural_handoff_tests {
 
     #[test]
     fn future_update_after_outro_starts_on_a_bar_with_remaining_material() {
+        for (release_at, expected_start, expected_fade_end) in [
+            (8 * BAR + BAR / 2, 9 * BAR, 8 * BAR),
+            (18 * BAR + BAR / 2, 19 * BAR, 4 * BAR),
+        ] {
+            for resolution in ["abort", "commit", "append"] {
+                let tracks = if resolution == "append" {
+                    vec![handoff_track(0, 8, 16)]
+                } else {
+                    vec![handoff_track(0, 8, 16), handoff_track(1, 24, 16)]
+                };
+                let mut engine = Engine::from_prepared(handoff_options(), tracks).unwrap();
+                engine.set_realtime(true);
+                engine.poll_events();
+                if resolution == "append" {
+                    render_frames(&mut engine, release_at);
+                }
+                let token = engine.begin_future_update().expect("future update accepted");
+                if resolution != "append" {
+                    render_frames(&mut engine, release_at);
+                }
+                engine.poll_events();
+                let messages = if resolution == "abort" {
+                    engine.abort_future_update(token);
+                    None
+                } else {
+                    let (replacement, messages) = controlled_replacement();
+                    drop(engine.commit_future_update(token, replacement));
+                    messages.send(LoaderMsg::Ready(handoff_track(1, 24, 16), None)).unwrap();
+                    Some(messages)
+                };
+                engine.poll_events();
+                assert_eq!(engine.ready_ahead(), 1, "{resolution}: successor ready");
+                let (frames, events) = render_until_event(&mut engine, BAR);
+                let playhead = release_at + frames - 1;
+                assert!(events.iter().any(|event| matches!(event, EngineEvent::TransitionStarted { .. })),
+                    "{resolution}: missing transition: {events:?}");
+                assert_eq!(playhead, expected_start,
+                    "{resolution}: crossfade must wait for the next outro bar line");
+                let transition = engine.transition.as_ref().expect("crossfade active");
+                assert!(!transition.simple, "{resolution}: remaining bars support the full plan");
+                assert_eq!(transition.fade_out_end, expected_fade_end,
+                    "{resolution}: plan must retain the full fade pair within the remaining outro");
+                drop(messages);
+            }
+        }
+    }
+
+    #[test]
+    fn future_update_after_outro_too_late_starts_successor_solo() {
         for resolution in ["abort", "commit", "append"] {
             let tracks = if resolution == "append" {
                 vec![handoff_track(0, 8, 16)]
@@ -7560,7 +7617,7 @@ mod natural_handoff_tests {
             let mut engine = Engine::from_prepared(handoff_options(), tracks).unwrap();
             engine.set_realtime(true);
             engine.poll_events();
-            let release_at = 8 * BAR + BAR / 2;
+            let release_at = 23 * BAR + BAR / 2;
             if resolution == "append" {
                 render_frames(&mut engine, release_at);
             }
@@ -7581,15 +7638,11 @@ mod natural_handoff_tests {
             engine.poll_events();
             assert_eq!(engine.ready_ahead(), 1, "{resolution}: successor ready");
             let (frames, events) = render_until_event(&mut engine, BAR);
-            let playhead = release_at + frames - 1;
-            assert!(events.iter().any(|event| matches!(event, EngineEvent::TransitionStarted { .. })),
-                "{resolution}: missing transition: {events:?}");
-            assert_eq!(playhead, 9 * BAR,
-                "{resolution}: crossfade must wait for the next outro bar line");
-            let transition = engine.transition.as_ref().expect("crossfade active");
-            assert!(!transition.simple, "{resolution}: remaining bars support the full plan");
-            assert_eq!(transition.fade_out_end, 8 * BAR,
-                "{resolution}: plan must retain the full fade pair within the remaining outro");
+            assert_eq!(release_at + frames, 24 * BAR, "{resolution}: solo handoff at EOF");
+            assert!(events.iter().any(|event| matches!(event, EngineEvent::TrackStarted { index: 1, .. })),
+                "{resolution}: missing solo start: {events:?}");
+            assert!(!events.iter().any(|event| matches!(event, EngineEvent::TransitionStarted { .. })),
+                "{resolution}: unexpected transition: {events:?}");
             drop(messages);
         }
     }
