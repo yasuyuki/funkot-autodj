@@ -66,10 +66,12 @@ jobs:
       - name: dev.sh runs the build of its own checkout
         run: ./scripts/test-dev-source-attribution.sh
       - name: Engine rejects the geometry admission mutation
-        env: { CARGO_PROFILE_RELEASE_LTO: "false" }
+        env: { CARGO_PROFILE_RELEASE_LTO: "false", CARGO_PROFILE_RELEASE_INCREMENTAL: "true" }
         shell: bash
         run: |
-          variant=$(mktemp -d)
+          variant="$RUNNER_TEMP/engine-mutant"
+          rm -rf "$variant"
+          mkdir "$variant"
           git archive HEAD | tar -xf - -C "$variant"
           python3 - "$variant/funkot-core/src/transition_geometry.rs" <<'PYTHON'
           from pathlib import Path
@@ -93,39 +95,40 @@ jobs:
           name: transition-engine-sensitivity
           path: /tmp/transition-engine-sensitivity.log
       - name: Engine detects navigation and first-live guard mutations
-        env: { CARGO_PROFILE_RELEASE_LTO: "false", PYTHONDONTWRITEBYTECODE: "1" }
+        env: { CARGO_PROFILE_RELEASE_LTO: "false", CARGO_PROFILE_RELEASE_INCREMENTAL: "true", PYTHONDONTWRITEBYTECODE: "1" }
         run: |
           python3 -B - <<'PYTHON'
-          import io, os, subprocess, tarfile, tempfile
+          import io, os, shutil, subprocess, tarfile
           from pathlib import Path
           from verification.manual_navigation_mutations import NAVIGATION_MUTATIONS, ENGINE_MUTATION_EDITS
           from verification.first_live_mutations import FIRST_LIVE_MUTATIONS, FIRST_LIVE_ENGINE_MUTATIONS, ENGINE_MUTATION_EDITS as FIRST_LIVE_ENGINE_EDITS
           archive = subprocess.check_output(["git", "archive", "HEAD"])
           variants = NAVIGATION_MUTATIONS + tuple(item for item in FIRST_LIVE_MUTATIONS if item[3] is not None) + FIRST_LIVE_ENGINE_MUTATIONS
           adapter_edits = ENGINE_MUTATION_EDITS | FIRST_LIVE_ENGINE_EDITS
+          tree = Path(os.environ["RUNNER_TEMP"]) / "engine-mutant"
           for label, _, edits, test in variants:
-              with tempfile.TemporaryDirectory() as temporary:
-                  tree = Path(temporary)
-                  with tarfile.open(fileobj=io.BytesIO(archive)) as source:
-                      source.extractall(tree, filter="data")
-                  module = "first_live.rs" if label.startswith("first_live_") else "manual_navigation.rs"
-                  path = tree / "funkot-core/src" / module
-                  text = path.read_text()
-                  for original, broken in edits:
-                      assert text.count(original) == 1
-                      text = text.replace(original, broken)
-                  path.write_text(text)
-                  for filename, original, broken in adapter_edits.get(label, ()):
-                      adapter = tree / filename
-                      text = adapter.read_text()
-                      assert text.count(original) == 1
-                      adapter.write_text(text.replace(original, broken))
-                  name = "engine::tests::" + test
-                  env = dict(os.environ, CARGO_TARGET_DIR=str(Path.cwd() / "target"))
-                  result = subprocess.run(["cargo", "test", "--locked", "--manifest-path", str(tree / "Cargo.toml"), "-p", "funkot-core", "--release", "--lib", name], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                  print(result.stdout)
-                  assert result.returncode == 101 and "test " + name + " ... FAILED" in result.stdout, label + ": missing real-engine counterexample"
-                  print(label + " EXPECTED_FAIL")
+              shutil.rmtree(tree, ignore_errors=True)
+              tree.mkdir()
+              with tarfile.open(fileobj=io.BytesIO(archive)) as source:
+                  source.extractall(tree, filter="data")
+              module = "first_live.rs" if label.startswith("first_live_") else "manual_navigation.rs"
+              path = tree / "funkot-core/src" / module
+              text = path.read_text()
+              for original, broken in edits:
+                  assert text.count(original) == 1
+                  text = text.replace(original, broken)
+              path.write_text(text)
+              for filename, original, broken in adapter_edits.get(label, ()):
+                  adapter = tree / filename
+                  text = adapter.read_text()
+                  assert text.count(original) == 1
+                  adapter.write_text(text.replace(original, broken))
+              name = "engine::tests::" + test
+              env = dict(os.environ, CARGO_TARGET_DIR=str(Path.cwd() / "target"))
+              result = subprocess.run(["cargo", "test", "--locked", "--manifest-path", str(tree / "Cargo.toml"), "-p", "funkot-core", "--release", "--lib", name], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              print(result.stdout)
+              assert result.returncode == 101 and "test " + name + " ... FAILED" in result.stdout, label + ": missing real-engine counterexample"
+              print(label + " EXPECTED_FAIL")
           PYTHON
 
   transition-proof:
