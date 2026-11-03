@@ -140,7 +140,7 @@ expect_linked_metadata_readonly() {
 
 expect_real_linked_engine() {
     local checkout=$1 label=$2 out status=0
-    out=$("$checkout/dev.sh" cargo test --locked -p funkot-core --release --lib engine::tests::recorded_first_live_recreates_the_actual_production_buffers --exact --nocapture 2>&1) || status=$?
+    out=$("$checkout/dev.sh" cargo test --locked -p funkot-core --release --lib engine::tests::recorded_first_live_recreates_the_actual_production_buffers -- --exact --nocapture 2>&1) || status=$?
     if [[ $status == 0 ]] && grep -Fq 'test engine::tests::recorded_first_live_recreates_the_actual_production_buffers ... ok' <<<"$out"; then
         echo "ok   $label"
     else
