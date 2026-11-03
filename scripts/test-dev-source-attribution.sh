@@ -102,7 +102,7 @@ expect_attribution() {
         failures=$((failures + 1))
         return
     }
-    out=$(FUNKOT_SOURCE_REVISION="$revision" "$checkout/dev.sh" cargo run --locked --quiet -p fx 2>&1) || status=$?
+    out=$("$checkout/dev.sh" env "FUNKOT_SOURCE_REVISION=$revision" cargo run --locked --quiet -p fx 2>&1) || status=$?
     actual=$(sed -n 's/^fixture-revision=//p' <<<"$out" | tail -1)
     if [[ $status == 0 && $actual == "$want" ]] && grep -q '^fixture-revision=' <<<"$out"; then
         echo "ok   $label ($actual)"
@@ -115,11 +115,46 @@ expect_attribution() {
 
 expect_linked_metadata_readonly() {
     local checkout=$1 label=$2 out status=0
-    out=$(FUNKOT_SOURCE_REVISION="$revision" "$checkout/dev.sh" sh -c 'metadata=$(git -c safe.directory=/work rev-parse --absolute-git-dir) && test ! -w "$metadata"' 2>&1) || status=$?
-    if [[ $status == 0 ]]; then
+    out=$("$checkout/dev.sh" env "FUNKOT_SOURCE_REVISION=$revision" sh -c '
+        metadata=$(git -c safe.directory=/work rev-parse --absolute-git-dir) &&
+        index=$(git -c safe.directory=/work rev-parse --path-format=absolute --git-path index) &&
+        objects=$(git -c safe.directory=/work rev-parse --path-format=absolute --git-path objects) &&
+        common=$(git -c safe.directory=/work rev-parse --path-format=absolute --git-common-dir) &&
+        git -c safe.directory=/work rev-parse --verify "HEAD^{commit}" >/dev/null &&
+        test -z "$(git -c safe.directory=/work status --porcelain --untracked-files=all)" &&
+        test -r "$metadata/HEAD" && test ! -w "$metadata/HEAD" &&
+        test -r "$index" && test ! -w "$index" &&
+        test -r "$objects" && test ! -w "$objects" &&
+        test ! -e "$common/workspace-lifecycle/private-state" &&
+        test ! -e "$common/unrelated-sibling-state" &&
+        cargo run --locked --quiet -p fx
+    ' 2>&1) || status=$?
+    if [[ $status == 0 ]] && grep -qx "fixture-revision=$revision" <<<"$out"; then
         echo "ok   $label"
     else
         echo "FAIL $label: linked Git metadata was unavailable or writable"
+        echo "$out" | tail -20
+        failures=$((failures + 1))
+    fi
+}
+
+expect_real_linked_engine() {
+    local checkout=$1 label=$2 out status=0
+    out=$("$checkout/dev.sh" cargo test --locked -p funkot-core --release --lib engine::tests::recorded_first_live_recreates_the_actual_production_buffers --exact --nocapture 2>&1) || status=$?
+    if [[ $status == 0 ]] && grep -Fq 'test engine::tests::recorded_first_live_recreates_the_actual_production_buffers ... ok' <<<"$out"; then
+        echo "ok   $label"
+    else
+        echo "FAIL $label: production engine test did not pass"
+        echo "$out" | tail -20
+        failures=$((failures + 1))
+    fi
+
+    status=0
+    out=$("$checkout/work.sh" --self-check 2>&1) || status=$?
+    if [[ $status == 0 ]] && grep -qx 'ok' <<<"$out"; then
+        echo "ok   $label work.sh self-check"
+    else
+        echo "FAIL $label: work.sh self-check failed"
         echo "$out" | tail -20
         failures=$((failures + 1))
     fi
@@ -235,10 +270,20 @@ primary="$work/attribution primary"
 linked="$work/attribution linked worktree"
 attribution_fixture "$primary"
 revision=$(git -C "$primary" rev-parse HEAD)
-git -C "$primary" worktree add --detach "$linked" HEAD >/dev/null
+git -C "$primary" branch -M main
+git -C "$primary" worktree add -b linked-attribution "$linked" HEAD >/dev/null
+common=$(git -C "$primary" rev-parse --path-format=absolute --git-common-dir)
+mkdir -p "$common/workspace-lifecycle"
+printf 'private\n' > "$common/workspace-lifecycle/private-state"
+printf 'unrelated\n' > "$common/unrelated-sibling-state"
+printf 'ignored-untracked\n' > "$common/info/exclude"
+git -C "$primary" pack-refs --all
 expect_attribution "$primary" "$revision" "production build revision in primary checkout"
 expect_attribution "$linked" "$revision" "production build revision in linked worktree"
 expect_linked_metadata_readonly "$linked" "linked Git metadata is read-only in the container"
+printf 'ignored\n' > "$linked/ignored-untracked"
+expect_attribution "$linked" "$revision" "ignored untracked linked worktree has build revision"
+rm "$linked/ignored-untracked"
 printf 'dirty\n' > "$linked/tracked"
 expect_attribution "$linked" "" "dirty tracked linked worktree has no build revision"
 git -C "$linked" checkout -- tracked
@@ -247,5 +292,13 @@ expect_attribution "$linked" "" "untracked linked worktree has no build revision
 rm "$linked/untracked"
 printf 'gitdir: /metadata/that-is-not-mounted\n' > "$linked/.git"
 expect_attribution "$linked" "" "linked worktree with inaccessible metadata has no build revision"
+
+root_revision=$(git -C "$root" rev-parse HEAD)
+real_primary="$work/production primary"
+real_linked="$work/production linked worktree"
+git clone --no-hardlinks "$root" "$real_primary" >/dev/null
+git -C "$real_primary" checkout --detach "$root_revision" >/dev/null
+git -C "$real_primary" worktree add --detach "$real_linked" "$root_revision" >/dev/null
+expect_real_linked_engine "$real_linked" "linked checkout runs the production engine regression"
 
 exit $((failures > 0))

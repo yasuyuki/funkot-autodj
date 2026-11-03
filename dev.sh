@@ -67,6 +67,18 @@ set -- -v "$PWD":/work \
     -e RUST_TEST_THREADS="$RUST_TEST_THREADS" \
     -e CARGO_PROFILE_RELEASE_LTO="$CARGO_PROFILE_RELEASE_LTO" \
     -e CARGO_INCREMENTAL="$CARGO_INCREMENTAL" "$@"
+if [ -f .git ]; then
+    for GIT_METADATA_NAME in HEAD index commondir gitdir config config.worktree packed-refs shallow info/exclude refs objects reftable; do
+        GIT_METADATA_PATH=$(git rev-parse --path-format=absolute --git-path "$GIT_METADATA_NAME" 2>/dev/null || true)
+        if [ -n "$GIT_METADATA_PATH" ] && [ -e "$GIT_METADATA_PATH" ]; then
+            set -- -v "$GIT_METADATA_PATH:$GIT_METADATA_PATH:ro" "$@"
+        fi
+    done
+    GIT_SHARED_INDEX_PATH=$(git rev-parse --path-format=absolute --shared-index-path 2>/dev/null || true)
+    if [ -n "$GIT_SHARED_INDEX_PATH" ] && [ -e "$GIT_SHARED_INDEX_PATH" ]; then
+        set -- -v "$GIT_SHARED_INDEX_PATH:$GIT_SHARED_INDEX_PATH:ro" "$@"
+    fi
+fi
 if [ -n "${DEV_BIND_SRC:-}" ]; then
     set -- -v "$DEV_BIND_SRC:${DEV_BIND_DST:-$DEV_BIND_SRC}:ro" "$@"
 fi
