@@ -2240,6 +2240,17 @@ impl Engine {
         self.kick_manual_plan_if_idle();
     }
 
+    /// A plan built from the replaced samples is stale, but the request that
+    /// produced it is not: accept it again against the new material, or a
+    /// host waiting for that request to resolve waits for the track to end.
+    fn replan_pending_nav(&mut self) {
+        let action = self.manual_action;
+        self.cancel_pending_nav();
+        if let Some(action) = action {
+            self.begin_nav(action);
+        }
+    }
+
     fn cancel_pending_nav(&mut self) {
         self.pending_nav = None;
         self.manual_pending = None;
@@ -2846,7 +2857,7 @@ impl Engine {
                     frames_into: 0, frames: declick_frames(self.options.output_sample_rate) });
                 // Markers / buffer changed — any in-flight align is stale.
                 self.clear_phase_align();
-                self.cancel_pending_nav();
+                self.replan_pending_nav();
                 self.kick_phase_align_if_needed();
                 return;
             }
@@ -2864,7 +2875,7 @@ impl Engine {
                 }
                 retire_prepared(old);
                 self.clear_phase_align();
-                self.cancel_pending_nav();
+                self.replan_pending_nav();
                 self.kick_phase_align_if_needed();
                 return;
             }
@@ -6548,6 +6559,36 @@ mod tests {
         engine.pending_nav = Some(PendingNav::Planned(reply));
         engine.tick_pending_nav();
         assert!(engine.transition.is_none());
+        assert!(engine.pending_nav.is_none());
+    }
+
+    #[test]
+    fn active_upgrade_keeps_the_requested_next_with_a_fresh_plan() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        engine.request_nav(NavAction::TransitionToNext);
+        let accepted = engine.nav_gen;
+        assert_eq!(engine.manual_action, Some(NavAction::TransitionToNext));
+        let mut replacement = engine.active.as_ref().unwrap().track.clone();
+        replacement.samples = Arc::new(vec![0.1; replacement.samples.len()]);
+        engine.apply_upgrade(replacement, None);
+        assert_eq!(engine.manual_action, Some(NavAction::TransitionToNext));
+        assert_ne!(engine.nav_gen, accepted, "a reply for the old samples stays stale");
+        assert!(engine.pending_nav.is_none());
+        assert!(engine.manual_deadline.is_some());
+        assert!(engine.manual_pending.as_ref().is_some_and(|demand| demand.generation == engine.nav_gen)
+            || engine.manual_in_flight);
+    }
+
+    #[test]
+    fn next_upgrade_keeps_the_requested_next_with_a_fresh_plan() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        engine.request_nav(NavAction::TransitionToNext);
+        let accepted = engine.nav_gen;
+        let mut replacement = engine.next_track.as_ref().unwrap().clone();
+        replacement.samples = Arc::new(vec![0.1; replacement.samples.len()]);
+        engine.apply_upgrade(replacement, None);
+        assert_eq!(engine.manual_action, Some(NavAction::TransitionToNext));
+        assert_ne!(engine.nav_gen, accepted);
         assert!(engine.pending_nav.is_none());
     }
 
