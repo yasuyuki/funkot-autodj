@@ -11,7 +11,7 @@ Use an explicitly selected `funkot-autodj` working-set member. Read its
 project instructions. Update the source and distribution together.
 
 Last synchronization with product code is
-`282572a7caef63f9c079b5ad6aa94851f5bd0b2b`. This is an audit anchor, not a pin.
+`7b08c039a9c89966faf32053a2bfff693024a7f0`. This is an audit anchor, not a pin.
 Advance it only after reading every intervening change to covered code and
 confirming that the verifier still describes the new source. A pass against
 stale caller assumptions is not a product proof.
@@ -92,7 +92,7 @@ boundaries when updating the checker after a code change.
 
 The navigation coverage is `engine.rs::begin_nav`, `poll_nav_tempo`,
 `manual_plan_matches`, `kick_manual_plan_if_idle`, `tick_pending_nav`,
-`commit_manual_plan`, `cancel_pending_nav`, `drop_prev`, `push_history`,
+`commit_manual_plan`, `cancel_pending_nav`, `replan_pending_nav`, `drop_prev`, `push_history`,
 `apply_upgrade`, `drain_loader`, and the begin/abort/commit future-update methods.
 Inspect every new writer of their active/target/history identities, navigation
 generation, deadline or future fence. A source change invalidates navigation
@@ -125,8 +125,8 @@ before calling it a product bug. The accepted-Prev/history-rollover trace is
 already replayed by `history_rollover_cancels_an_accepted_previous_navigation`.
 Preserve its cancellation and the companion Next/Restart preservation test.
 
-The runner checks generation, exact-start, missing-deadline and old-history
-variants in isolated model copies. The shared Rust generation/identity/deadline/
+The runner checks generation, exact-start, missing-deadline, old-history and
+cancel-on-upgrade variants in isolated model copies. The shared Rust generation/identity/deadline/
 start variants must fail completed Kani safety assertions and their named Engine
 regressions. `manual_navigation_mutations.py` owns edits and test names; the
 native identity variant also disables the independent Engine identity recheck.
