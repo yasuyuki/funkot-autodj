@@ -159,19 +159,21 @@ Neither result proves progress for an unbounded or permanently stopped system.
 | `Apply` | `commit_manual_plan` checks identity and `admit_frames` before taking next/history or emitting a start, invalidates rejected work, then `begin_transition_to` installs admitted decks atomically. |
 | `Advance` | `render_one_frame` advances the active playhead. DSP and frame lengths are abstracted away. |
 | `Cancel`, `Stop` | `cancel_pending_nav` and `stop` invalidate outstanding work. |
-| `UpgradeActive`, `UpgradeNext`, `ReadyNext` | `drain_loader` and `apply_upgrade` adopt current loader messages. The future fence prevents those adoptions. |
+| `UpgradeActive`, `UpgradeNext`, `ReadyNext` | `drain_loader` and `apply_upgrade` adopt current loader messages. The future fence prevents those adoptions. An upgrade's `replan_pending_nav` cancels the plan built from the old samples and accepts the same manual action again under a new generation. |
 | `HistoryRollover` | `drop_prev` and `push_history` retain the actual outgoing deck, skip a shared Restart deck, and cancel pending Prev before replacing its target. |
 | `FutureBegin`, `FutureAbort`, `FutureCommit` | `begin_future_update`, `abort_future_update` and `commit_future_update` preserve or replace future state and invalidate old navigation. Persistence is outside this model. |
 
 The safety invariants cover generation/source/active/target identity at adoption,
 accepted target stability, exact reply start, adoption once, start/consumption
-correspondence, and no future adoption while fenced. Admission rejection and
+correspondence, no future adoption while fenced, and an accepted request that
+survives a preview upgrade (`RequestSurvivesUpgrade`). A replan is a new
+generation without a new command, so `GenerationOrder` counts it. Admission rejection and
 worker failure leave decks and consumption unchanged. The source epoch is
 invalidated through navigation generation, as in the product; the model does
 not invent a source-epoch field in `ManualKey`.
 
 The deliberate TLC variants remove generation checking, exact-start checking,
-deadline fallback, and history-target cancellation. Each must produce its
+deadline fallback, history-target cancellation, and the upgrade replan. Each must produce its
 specified invariant or temporal counterexample. Identity checking is separately
 broken in the real shared Rust predicate and Engine regression. In the bounded
 protocol model, correct invalidation can make that defensive check redundant.

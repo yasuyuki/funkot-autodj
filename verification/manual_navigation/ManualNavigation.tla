@@ -1,6 +1,6 @@
 ----------------------- MODULE ManualNavigation -----------------------
 EXTENDS Naturals, Sequences, FiniteSets
-CONSTANTS CheckGeneration, CheckIdentity, CheckTiming, CheckDeadline, CancelHistory, Stable
+CONSTANTS CheckGeneration, CheckIdentity, CheckTiming, CheckDeadline, CancelHistory, ReplanUpgrade, Stable
 VARIABLES e, w, m, sent, used
 vars == <<e, w, m, sent, used>>
 Ops == 1..2
@@ -17,6 +17,9 @@ Target(action) == CASE action = "Next" -> e.next
 HasTarget(action) == CASE action = "Next" -> e.hasNext
                          [] action = "Prev" -> e.hasHistory
                          [] OTHER -> TRUE
+TargetIn(x, action) == CASE action = "Next" -> x.next
+                           [] action = "Prev" -> x.history
+                           [] OTHER -> x.active
 KeyMatches(p) == HasTarget(p.action) /\ p.active = e.active /\ p.target = Target(p.action)
 Current(p) == (CheckGeneration => p.gen = e.op) /\ (CheckIdentity => KeyMatches(p))
 Exact == IF e.pending = NoPlan THEN FALSE
@@ -45,7 +48,8 @@ Init == /\ e \in {[op |-> 0, action |-> "None", deadline |-> 0, now |-> 0,
         /\ m = [accepted |-> NoSnapshot, adopted |-> [g \in Ops |-> 0], starts |-> 0,
                  generationSafe |-> TRUE, identitySafe |-> TRUE, epochSafe |-> TRUE,
                  frameSafe |-> TRUE, targetSafe |-> TRUE, fenceSafe |-> TRUE,
-                 consumptionSafe |-> TRUE, nextConsumed |-> 0, historyConsumed |-> 0]
+                 consumptionSafe |-> TRUE, nextConsumed |-> 0, historyConsumed |-> 0,
+                 requestSafe |-> TRUE, replans |-> 0]
         /\ sent = 0 /\ used = 0
 SendNav == /\ sent < 2 /\ ~e.stopped
            /\ \E action \in Actions: e' = [e EXCEPT !.deferred = Append(@,action)]
@@ -118,10 +122,27 @@ Tick == DeadlineFallback \/ TickReply
 Advance == /\ ~e.stopped /\ e.now < 2
            /\ e' = [e EXCEPT !.now = @+1] /\ UNCHANGED <<w,m,sent,used>>
 Cancel == /\ ~Stable /\ e.op \in Ops /\ Settle(Cancelled,m)
+\* apply_upgrade -> replan_pending_nav: the stale plan is cancelled and the
+\* accepted action is accepted again (begin_nav) under a new generation. The
+\* upgrade does not change which targets exist, so begin_nav always accepts.
+Upgrade(base) ==
+    IF e.op \in Ops
+    THEN IF ReplanUpgrade
+         THEN /\ used < 2 /\ used' = used+1 /\ UNCHANGED sent
+              /\ \E deadline \in {e.now,2}:
+                   e' = [base EXCEPT !.op = used+1, !.action = e.action,
+                                    !.deadline = deadline, !.demand = TRUE]
+              /\ w' = [Rekey(used+1) EXCEPT !.attempts = 0]
+              /\ m' = [m EXCEPT !.replans = @+1,
+                                !.accepted = [active |-> base.active,
+                                                target |-> TargetIn(base, e.action),
+                                                action |-> e.action, epoch |-> e.epoch]]
+         ELSE Settle(base, [m EXCEPT !.requestSafe = FALSE])
+    ELSE Settle(base, m)
 UpgradeActive == /\ ~Stable /\ e.active.preview /\ ~e.fence /\ ~e.stopped
-                 /\ Settle([Cancelled EXCEPT !.active.pcm = 1, !.active.preview = FALSE],m)
+                 /\ Upgrade([Cancelled EXCEPT !.active.pcm = 1, !.active.preview = FALSE])
 UpgradeNext == /\ ~Stable /\ e.next.preview /\ e.hasNext /\ ~e.fence /\ ~e.stopped
-               /\ Settle([Cancelled EXCEPT !.next.pcm = 1, !.next.preview = FALSE],m)
+               /\ Upgrade([Cancelled EXCEPT !.next.pcm = 1, !.next.preview = FALSE])
 HistoryRollover == /\ e.overlap.live /\ (~Stable \/ e.op = 0 \/ e.action # "Prev")
                    /\ IF e.overlap.outgoing.occ = e.active.occ
                       THEN Settle([e EXCEPT !.overlap = NoOverlap],m)
@@ -154,7 +175,8 @@ SafetySpec == Init /\ [][Next]_vars
 Spec == SafetySpec /\ WF_vars(Advance) /\ WF_vars(Tick)
 TypeOK == /\ e.op \in 0..2 /\ e.epoch \in 0..1 /\ e.now \in 0..2
           /\ sent \in 0..2 /\ used \in 0..2 /\ w.attempts \in 0..2
-GenerationOrder == /\ used <= sent /\ e.op \in {0,used}
+\* Each generation comes from a sent command or from an upgrade's replan.
+GenerationOrder == /\ used <= sent + m.replans /\ e.op \in {0,used}
                    /\ \A msg \in w.replies: msg.plan.gen \in 1..used
 GenerationSafe == m.generationSafe
 IdentitySafe == m.identitySafe
@@ -165,6 +187,8 @@ FenceSafe == m.fenceSafe
 AdoptOnce == \A g \in Ops: m.adopted[g] <= 1
 EventsFollowAdoption == m.starts = m.adopted[1] + m.adopted[2]
 ConsumptionFollowsAdoption == m.consumptionSafe
+\* An upgrade replaces samples, not the request: an accepted action stays accepted.
+RequestSurvivesUpgrade == m.requestSafe
 EventuallyResolved == \A g \in Ops: (e.op = g) ~> (e.op # g)
 StableAdoption == \A g \in Ops: (e.op = g) ~> (m.adopted[g] = 1)
 =============================================================================

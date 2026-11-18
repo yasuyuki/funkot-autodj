@@ -160,6 +160,7 @@ def main():
                     ("start_frame", "CheckTiming", "Invariant ExactFrameSafe is violated"),
                     ("deadline", "CheckDeadline", "Temporal properties were violated"),
                     ("history_rollover", "CancelHistory", "Invariant AcceptedTargetSafe is violated"),
+                    ("upgrade_replan", "ReplanUpgrade", "Invariant RequestSurvivesUpgrade is violated"),
                 ):
                     anchor = constant + " = TRUE"
                     if cfg.count(anchor) != 1:
