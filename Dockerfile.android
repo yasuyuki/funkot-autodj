@@ -1,18 +1,6 @@
-# Cross-build container: Linux host → Android arm64 (NDK).
-#
-# Build the image:
-#   docker build -f Dockerfile.android -t funkot-autodj-android .
-# Prefer:
-#   ./cross-build.sh android
-#
-# Only funkot-core is built here; funkot-cli needs cpal + a terminal and has no
-# Android host. The GUI app links funkot-core as a Cargo dependency, so this
-# target exists as a regression guard (a new dep that breaks the NDK build should
-# fail here, not downstream) and to ship a C-ABI SDK bundle like the other targets.
 FROM rust:1.93-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Host C++ + libclang for bindgen (signalsmith-stretch)
     g++ \
     libclang-dev \
     curl unzip ca-certificates \
@@ -56,8 +44,6 @@ ENV CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-si
 # because src/wrapper.h includes nothing else.
 ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$NDK_SYSROOT"
 
-# Pin the host libclang by symlink so the LLVM version bundled with the base
-# image can change without editing this file.
 RUN ln -s "$(dirname "$(ls /usr/lib/llvm-*/lib/libclang.so | head -1)")" /opt/libclang
 ENV LIBCLANG_PATH=/opt/libclang
 

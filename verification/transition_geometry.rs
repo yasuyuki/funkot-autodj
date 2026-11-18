@@ -86,3 +86,9 @@ fn trigger_all_u32() {
     kani::cover!(structure <= room && room - structure >= 16);
     kani::cover!(structure == u32::MAX && track == u32::MAX);
 }
+
+#[path = "manual_navigation.rs"]
+mod manual_navigation_proofs;
+
+#[path = "first_live.rs"]
+mod first_live_proofs;

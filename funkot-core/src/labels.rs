@@ -1,11 +1,8 @@
 //! Ground-truth intro/outro section-length labels, for offline evaluation.
 //!
-//! This is Stage 0 of the section-length rework: before touching
-//! `analysis.rs`, we need a way to measure whether a change helps. Labels
-//! are the input to that measurement (`examples/eval_sections.rs` is the
-//! consumer). Tracks are identified by [`crate::cache::content_hash`], not
-//! by path, so labels survive file moves/renames and match whatever the
-//! cache already keys on.
+//! `examples/eval_sections.rs` is the consumer. Tracks are identified by
+//! [`crate::cache::content_hash`], not by path, so labels survive file
+//! moves/renames and match whatever the cache already keys on.
 //!
 //! On-disk format: `testdata/labels.tsv`, tab-separated, first non-comment/
 //! non-blank line is the header:
@@ -45,7 +42,6 @@ use std::path::Path;
 
 use crate::{Error, Result};
 
-/// Column count of a well-formed data row (see module docs for the layout).
 const COLUMN_COUNT: usize = 7;
 
 /// One track's hand-verified intro/outro section lengths.
@@ -135,9 +131,6 @@ impl SectionLabel {
     }
 }
 
-/// Whether `key` is a valid [`SectionLabel::note_tags`] key: an ASCII
-/// uppercase letter followed by one or more of `[A-Z0-9_]` (two characters
-/// minimum total).
 fn is_tag_key(key: &str) -> bool {
     let mut chars = key.chars();
     match chars.next() {
@@ -169,7 +162,6 @@ pub fn load_labels(path: &Path) -> Result<Vec<SectionLabel>> {
     parse_labels(&contents)
 }
 
-/// Parse label TSV text (split out from [`load_labels`] for testing without a file).
 fn parse_labels(contents: &str) -> Result<Vec<SectionLabel>> {
     let mut labels = Vec::new();
     let mut seen_header = false;
@@ -180,9 +172,6 @@ fn parse_labels(contents: &str) -> Result<Vec<SectionLabel>> {
             continue;
         }
         if !seen_header {
-            // First non-comment/non-blank line is the header; not validated
-            // beyond being present, so hand-edited files with a slightly
-            // different header wording still load.
             seen_header = true;
             continue;
         }
@@ -191,8 +180,6 @@ fn parse_labels(contents: &str) -> Result<Vec<SectionLabel>> {
     Ok(labels)
 }
 
-/// Parse one data row. `note` is allowed to contain tabs, so only the first
-/// six tabs are split on.
 fn parse_row(raw_line: &str, line_no: usize) -> Result<SectionLabel> {
     let fields: Vec<&str> = raw_line.splitn(COLUMN_COUNT, '\t').collect();
     if fields.len() != COLUMN_COUNT {
@@ -224,8 +211,6 @@ fn parse_row(raw_line: &str, line_no: usize) -> Result<SectionLabel> {
     })
 }
 
-/// Parses a `best` column: empty (after trim) means "not labeled yet"
-/// (`None`); anything else must be a valid non-negative integer.
 fn parse_u32_opt(field: &str, line_no: usize, name: &str) -> Result<Option<u32>> {
     let trimmed = field.trim();
     if trimmed.is_empty() {
@@ -258,7 +243,6 @@ fn parse_ok_list(field: &str, line_no: usize, name: &str) -> Result<Vec<u32>> {
         .collect()
 }
 
-/// Serialize labels as TSV text (header + one row per label, in order given).
 fn render_labels(labels: &[SectionLabel]) -> String {
     let mut out = String::from(
         "content_hash\tfile_name\tintro_best\tintro_ok\toutro_best\toutro_ok\tnote\n",
@@ -271,11 +255,6 @@ fn render_labels(labels: &[SectionLabel]) -> String {
 }
 
 fn render_row(label: &SectionLabel) -> String {
-    // Defensively strip tabs/newlines from fields that aren't supposed to
-    // carry them, so a hand-typed file_name/note can't corrupt the column
-    // layout on the next save. `note` is the last column so it could in
-    // principle carry tabs safely, but keeping it single-line matches what
-    // `load_labels` writes back out and is easiest to hand-edit.
     let file_name = sanitize_field(&label.file_name);
     let note = sanitize_field(&label.note);
     format!(
@@ -294,7 +273,6 @@ fn sanitize_field(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
 }
 
-/// Renders a `best` column: `None` as an empty field, `Some(v)` as `v`.
 fn render_opt(v: Option<u32>) -> String {
     v.map(|v| v.to_string()).unwrap_or_default()
 }
@@ -346,7 +324,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Process-unique scratch file path under the system temp dir.
     struct TempFile(std::path::PathBuf);
 
     impl TempFile {
@@ -579,8 +556,6 @@ aaaa1111\ttrack-a.flac\t\t\t\t\tconstruction boundary, no candidate fits
 
     #[test]
     fn existing_numeric_only_tsv_still_loads() {
-        // Regression guard for backward compatibility: a file written before
-        // best columns could be empty must still parse identically.
         let text = "\
 content_hash\tfile_name\tintro_best\tintro_ok\toutro_best\toutro_ok\tnote
 aaaa1111\ttrack-a.flac\t32\t48\t32\t\tclean drop

@@ -1,5 +1,3 @@
-//! Analysis and cache tests (unit tests so `cfg(test)` exposes `testutil`).
-
 use std::path::PathBuf;
 
 use crate::analysis::{
@@ -49,8 +47,6 @@ fn classic_180_16_32_16() {
         "outro_bpm {} not within 0.3 of {bpm}",
         a.outro_bpm
     );
-    // Sharp synth outro collapses at 16; mix trigger walks back OUTRO_LEAD (→32).
-    // Both sides high-confidence: keep intro 16 < outro 32.
     assert_eq!(a.intro_bars, 16);
     assert_eq!(a.outro_bars, 32);
     assert!(!a.intro_bars_low_confidence);
@@ -70,7 +66,6 @@ fn classic_180_16_32_16() {
     let fd_secs = a.first_downbeat as f64 / f64::from(sr);
     assert!(fd_secs.abs() < 0.05, "first_downbeat {fd_secs}s not near 0");
 
-    // outro_start = end − outro_bars; with lead, that is 16 bars into the old main.
     let expected_outro = (16 + 32 + 16 - 32) as f64 * bar_len_frames(bpm, sr);
     let outro_secs = a.outro_start as f64 / f64::from(sr);
     let expected_secs = expected_outro / f64::from(sr);
@@ -106,7 +101,6 @@ fn local_sync_span_covers_future_break_and_tempo_excursion() {
         broken[10 * sr as usize * 2..11 * sr as usize * 2].fill(0.0);
         assert!(local_sync_span(&broken, start, end, sr, 180.0).is_none());
         assert!(!local_grid_continuous(&broken, 0, end, sr, 180.0));
-        // Same starting/ending tempo, but a slower middle followed by recovery.
         let slow = synth_track(120.0, 2, 0, 0, sr);
         broken = buf.samples.clone();
         broken[8 * sr as usize * 2..12 * sr as usize * 2]
@@ -166,7 +160,6 @@ fn local_tempo_near_target_estimates_stretched_bpm() {
     let rate = 1.10;
     let target = source_bpm * rate;
     let buf = synth_track(source_bpm, 16, 32, 16, sr);
-    // Stretch like the engine: source 180 → target 198.
     let speed = target / source_bpm;
     let out =
         stretch::render_track(&buf.samples, sr, sr, speed, PitchMode::Preserve).expect("stretch");
@@ -216,7 +209,6 @@ fn bpm_178_intro32_outro8_keeps_sides() {
         "unexpected outro length {}",
         a.outro_bars
     );
-    // Sharp synth boundaries should not force the 64 fallback.
     assert_ne!(a.intro_bars, FALLBACK_BARS);
 }
 
@@ -230,10 +222,6 @@ fn long_track_64_bar_sections() {
     assert!((a.intro_bpm - bpm).abs() < 0.3, "intro_bpm {}", a.intro_bpm);
     assert!((a.outro_bpm - bpm).abs() < 0.3, "outro_bpm {}", a.outro_bpm);
     assert_eq!(a.intro_bars, 64);
-    // The case the conditional lead-in used to get wrong: a 64-bar outro hit
-    // the `FALLBACK_BARS` clamp, `outro_bars` came out equal to the boundary,
-    // and the whole transition then ran inside the outro. The trigger is the
-    // boundary plus the lead now, and this track is long enough to hold it.
     assert_eq!(a.outro_structure_bars, 64);
     assert_eq!(a.outro_bars, 80);
     assert!(!a.bars_estimated_low_confidence);
@@ -245,7 +233,6 @@ fn long_track_64_bar_sections() {
 fn long_intro_80_sharp_main() {
     let sr = 44_100;
     let bpm = 180.0;
-    // Kick-only intro → bright main: long path sharp-rise gate at 80.
     let buf = synth_track(bpm, 80, 32, 32, sr);
     let a = analyze(&buf, "intro80.wav").expect("analyze");
     assert_eq!(a.intro_bars, 80);
@@ -256,7 +243,6 @@ fn long_intro_80_sharp_main() {
 fn long_intro_96_sharp_main() {
     let sr = 44_100;
     let bpm = 180.0;
-    // At 80 the after-window is still kick-only intro; sharp main lands at 96.
     let buf = synth_track(bpm, 96, 32, 32, sr);
     let a = analyze(&buf, "intro96.wav").expect("analyze");
     assert_eq!(a.intro_bars, 96);
@@ -265,8 +251,6 @@ fn long_intro_96_sharp_main() {
 
 #[test]
 fn intro_64_tension_drop_beats_80_rebuild() {
-    // Bright intro → tension-drop main (sparse) → mid/high rebuild at +16.
-    // Without 64 on the long-cue path, local_rise/ratio at the rebuild picks 80.
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track_with_options(SynthOptions {
@@ -296,9 +280,6 @@ fn intro_48_sharp_main() {
 
 #[test]
 fn intro_48_tension_drop_beats_64_rebuild() {
-    // Shirube-like: bright intro → tension-drop main at 48 → mid/high rebuild
-    // at +16 (= bar 64). Without preferring the 48 drop, long fill/rise at 64
-    // wins first.
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track_with_options(SynthOptions {
@@ -318,9 +299,6 @@ fn intro_48_tension_drop_beats_64_rebuild() {
 
 #[test]
 fn intro_48_shout_beats_64_mid_main_drop() {
-    // Starmine-like: bright intro → pre-boundary spectral shout at 48 → main
-    // continues at similar RMS → quieter mid-main at +16 (= bar 64). Without
-    // checking medium-48 shout before long {64}, the mid-main drop wins.
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track_with_options(SynthOptions {
@@ -343,7 +321,6 @@ fn intro_48_shout_beats_64_mid_main_drop() {
 fn short_intro_16_short_outro_keeps_unequal() {
     let sr = 44_100;
     let bpm = 180.0;
-    // Intro 16 / collapse at 16 → mix trigger 32; both confident → keep 16/32.
     let buf = synth_track(bpm, 16, 48, 16, sr);
     let a = analyze(&buf, "short_io.wav").expect("analyze");
     assert_eq!(a.intro_bars, 16);
@@ -354,9 +331,6 @@ fn short_intro_16_short_outro_keeps_unequal() {
 
 #[test]
 fn outro_mid_plateau_rejects_early_drop_to_48() {
-    // IVY-like: sparse floor (16) + mid-outro plateau (16) before main.
-    // Early floor→plateau recovery must not become the mix trigger (32);
-    // true collapse is at 32 → +lead → 48.
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track_with_options(SynthOptions {
@@ -366,7 +340,6 @@ fn outro_mid_plateau_rejects_early_drop_to_48() {
         outro_bars: 32,
         sample_rate: sr,
         outro_mid_plateau_bars: 16,
-        // Near-main brightness so after/far ≥ mid-plateau reject threshold.
         outro_mid_plateau_level: 0.92,
         ..SynthOptions::default()
     });
@@ -381,9 +354,6 @@ fn outro_mid_plateau_rejects_early_drop_to_48() {
 
 #[test]
 fn outro_end_tag_does_not_inflate_floor_to_48() {
-    // Starmine-like: 32-bar outro (16 mid-plateau + 16 sparse) plus a bright
-    // final fill. Floor must use a low robust estimate so the ~16 drop + lead
-    // stays 32; a median floor raised by the tag used to skip to 32+lead=48.
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track_with_options(SynthOptions {
@@ -433,7 +403,6 @@ fn no_section_contrast_falls_back() {
 
 #[test]
 fn bright_intro_outro_still_detects() {
-    // Percussion already present in intro/outro, but main is clearly brighter.
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track_with_options(SynthOptions {
@@ -447,7 +416,6 @@ fn bright_intro_outro_still_detects() {
         ..SynthOptions::default()
     });
     let a = analyze(&buf, "bright_io.wav").expect("analyze");
-    // Drop at 16 + lead → 32; short intro may stay below outro when both confident.
     assert_eq!(a.outro_bars, 32);
     assert!(!a.outro_bars_low_confidence);
     assert!(
@@ -487,7 +455,6 @@ fn gradual_intro_layering_detects_and_reconciles() {
 
 #[test]
 fn main_body_energy_without_hf_ratio_jump() {
-    // Main adds bass/body; HF ratio stays similar to a moderately bright intro.
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track_with_options(SynthOptions {
@@ -518,7 +485,6 @@ fn main_body_energy_without_hf_ratio_jump() {
 
 #[test]
 fn ambiguous_near_flat_falls_back() {
-    // Full brightness in intro/outro matching the main — no usable boundary.
     let sr = 44_100;
     let bpm = 180.0;
     let buf = synth_track_with_options(SynthOptions {
@@ -596,17 +562,14 @@ fn reconcile_rules_unit() {
         structure_bars: bars,
     };
 
-    // Both confident, intro >= outro (unequal OK): keep both.
     let (i, o, il, ol) = reconcile_intro_outro(hi(64, 5.0, 3.0), hi(32, 4.0, 2.5));
     assert_eq!((i, o), (64, 32));
     assert!(!il && !ol);
 
-    // Equal confident lengths still kept.
     let (i, o, il, ol) = reconcile_intro_outro(hi(32, 5.0, 3.0), hi(32, 4.0, 2.5));
     assert_eq!((i, o), (32, 32));
     assert!(!il && !ol);
 
-    // Both confident, intro < outro → keep both (short-intro tracks).
     let (i, o, il, ol) = reconcile_intro_outro(hi(32, 8.0, 4.0), hi(64, 3.0, 2.5));
     assert_eq!((i, o), (32, 64));
     assert!(!il && !ol);
@@ -615,27 +578,22 @@ fn reconcile_rules_unit() {
     assert_eq!((i, o), (16, 32));
     assert!(!il && !ol);
 
-    // Intro low + outro credible 32 → max(64, 32)/32, intro stays low.
     let (i, o, il, ol) = reconcile_intro_outro(lo(16), hi(32, 6.0, 2.0));
     assert_eq!((i, o), (64, 32));
     assert!(il && !ol);
 
-    // Intro low + longer credible outro → max(64, outro).
     let (i, o, il, ol) = reconcile_intro_outro(lo(16), hi(64, 6.0, 2.0));
     assert_eq!((i, o), (64, 64));
     assert!(il && !ol);
 
-    // Intro credible 64 + outro low 16 → outro = min(64, intro) = 64, outro low.
     let (i, o, il, ol) = reconcile_intro_outro(hi(64, 5.0, 3.0), lo(16));
     assert_eq!((i, o), (64, 64));
     assert!(!il && ol);
 
-    // Intro credible 32 + outro low → outro capped to intro (never longer).
     let (i, o, il, ol) = reconcile_intro_outro(hi(32, 5.0, 3.0), lo(16));
     assert_eq!((i, o), (32, 32));
     assert!(!il && ol);
 
-    // The public compatibility API lacks a duration, retaining fallback 64.
     let (i, o, il, ol) = reconcile_intro_outro(lo(16), lo(32));
     assert_eq!((i, o), (FALLBACK_BARS, FALLBACK_BARS));
     assert!(il && ol);
@@ -653,7 +611,6 @@ fn both_low_sections_fit_track_geometry_at_candidate_boundaries() {
     }
 }
 
-/// A boundary within the track body keeps its ordering relative to the trigger.
 #[test]
 fn valid_outro_structure_does_not_exceed_the_derived_trigger() {
     let intro = SectionEstimate {
@@ -686,9 +643,6 @@ fn valid_outro_structure_does_not_exceed_the_derived_trigger() {
     );
 }
 
-/// The lead-in is unconditional now. It used to be dropped when the boundary
-/// reached `FALLBACK_BARS`, which put the trigger *on* the boundary and ran
-/// the whole transition inside the outro -- the one place it must not go.
 #[test]
 fn trigger_keeps_the_lead_in_at_the_deepest_boundary() {
     assert_eq!(outro_trigger_bars(64, 64, 400), 80);
@@ -697,7 +651,6 @@ fn trigger_keeps_the_lead_in_at_the_deepest_boundary() {
     assert_eq!(outro_trigger_bars(8, 8, 400), 24);
 }
 
-/// Contradictory boundaries cannot create material before the intro end.
 #[test]
 fn trigger_gives_way_to_a_track_too_short_to_hold_it() {
     assert_eq!(outro_trigger_bars(8, 8, 24), 16, "24-bar track, 8-bar intro");
@@ -722,9 +675,7 @@ fn post_stretch_kick_refine_corrects_ms_error() {
     let out_frames = (rendered.len() / 2) as u64;
     let scale = position_scale(in_frames, out_frames);
 
-    // True first kick is at frame 0 in the synth; after stretch, scale maps it.
     let true_out = (0.0 * scale).round() as u64;
-    // Deliberately offset the marker by 20–40 ms (stretcher-like phase error).
     let err_frames = ((0.030 * f64::from(sr)).round() as u64).max(1);
     let wrong = true_out.saturating_add(err_frames);
 
@@ -735,7 +686,6 @@ fn post_stretch_kick_refine_corrects_ms_error() {
         "refined marker {refined} vs true {true_out}: {err_ms:.2}ms (wrong was {wrong})"
     );
 
-    // Negative offset as well.
     let wrong_neg = true_out.saturating_add(err_frames / 2);
     let wrong_neg = wrong_neg.saturating_sub(err_frames);
     let refined_neg = refine_kick_marker(&rendered, sr, wrong_neg.max(1), 45.0);
@@ -770,7 +720,6 @@ fn cache_roundtrip_and_hand_edit() {
     let a2 = get_or_analyze(&wav_path, &cache_dir, &buf).expect("second load");
     assert_eq!(a1, a2);
 
-    // Hand-edit intro_bars in the JSON and confirm cache is honored.
     let mut text = std::fs::read_to_string(&json_path).expect("read cache");
     text = text.replacen(
         &format!("\"intro_bars\": {}", a1.intro_bars),
@@ -808,14 +757,12 @@ fn provisional_skips_analyze_and_cache_write() {
     assert_eq!(a.outro_bars, a.intro_bars);
     assert_eq!(a.first_downbeat, 0);
     assert!(a.bars_estimated_low_confidence);
-    // 16+16+16 bars → section = min(64, 48/3) = 16
     assert_eq!(a.intro_bars, 16);
     assert!(
         !cache_dir.exists() || cache_dir.read_dir().unwrap().next().is_none(),
         "provisional must not write cache"
     );
 
-    // After a real analyze, provisional path must honor the cache.
     let real = get_or_analyze(&wav_path, &cache_dir, &buf).expect("analyze");
     let (cached, was_provisional) =
         get_cached_or_provisional(&wav_path, &cache_dir, &buf).expect("cached");
@@ -893,10 +840,10 @@ fn purge_auto_deletes_and_clears_manual() {
 
     let cleared = cache::load(&cache_dir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").expect("kept");
     assert!(cleared.needs_reanalysis);
-    assert!(cleared.is_funkot); // stub until reanalysis
+    assert!(cleared.is_funkot);
     assert_eq!(cleared.intro_bars, 8);
     assert!(cleared.intro_bars_manual);
-    assert_eq!(cleared.outro_bars, 0); // not manual → cleared
+    assert_eq!(cleared.outro_bars, 0);
     assert!(!cleared.outro_bars_manual);
     assert_eq!(cleared.intro_bpm, 0.0);
 
@@ -924,8 +871,6 @@ fn get_or_analyze_merges_manual_after_purge() {
     assert_eq!(hit.intro_bars, 8);
     assert!(hit.intro_bars_manual);
     assert!(!hit.needs_reanalysis);
-    // Auto outro should be restored from analysis (not necessarily equal to a1 if
-    // reconcile differs, but should be a valid non-zero section).
     assert!(hit.outro_bars > 0);
     assert!(!hit.outro_bars_manual);
     assert!(hit.intro_bpm > 0.0);
@@ -934,7 +879,6 @@ fn get_or_analyze_merges_manual_after_purge() {
     assert!(!did2, "complete cache must skip");
     assert_eq!(again, hit);
 
-    // Sanity: untouched fields from first analyze still make sense vs original.
     let _ = a1;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -942,7 +886,6 @@ fn get_or_analyze_merges_manual_after_purge() {
 #[test]
 fn short_track_errors() {
     let sr = 44_100;
-    // 5 seconds of kick-only audio.
     let frames = sr * 5;
     let mut samples = Vec::with_capacity((frames * 2) as usize);
     for _ in 0..frames {
@@ -961,7 +904,6 @@ fn short_track_errors() {
     }
 }
 
-/// Optional local regression: the master is gitignored / not shipped; skip if absent.
 #[test]
 fn love_and_joy_intro_64_if_testdata_present() {
     let Some(path) = crate::testdata::track("Surya Groxyn - Gakumas no Remix 2 - 06 Love & Joy")
@@ -977,10 +919,6 @@ fn love_and_joy_intro_64_if_testdata_present() {
     );
 }
 
-/// Optional local regression: the master is gitignored / not shipped; skip if absent.
-///
-/// IVY enters its vocal main at 48 with RMS held but the machine hats stepping
-/// back (brightness tension drop); a later fill at 62 used to false-trigger 64.
 #[test]
 fn ivy_intro_48_if_testdata_present() {
     let Some(path) = crate::testdata::track("AntonFer - Gakumas no Remix 2 - 02 IVY") else {
@@ -995,7 +933,6 @@ fn ivy_intro_48_if_testdata_present() {
     );
 }
 
-/// Optional local regression: the master is gitignored / not shipped; skip if absent.
 #[test]
 fn shirube_intro_48_if_testdata_present() {
     let Some(path) = crate::testdata::track("DimsR - Gakumas no Remix 2 - 10 Shirube") else {
@@ -1010,11 +947,6 @@ fn shirube_intro_48_if_testdata_present() {
     );
 }
 
-/// Optional local regression: the master is gitignored / not shipped; skip if absent.
-///
-/// Starmine enters main with a spectral shout at bar 47–48 (RMS barely moves);
-/// a quieter mid-main at 64 used to win on the long-cue path. Outro is 32 bars;
-/// a bright end-tag used to inflate the floor and report 48.
 #[test]
 fn starmine_intro_48_outro_32_if_testdata_present() {
     let Some(path) = crate::testdata::track("Maks Sopian - Gakumas no Remix 2 - 07 Starmine") else {
@@ -1034,9 +966,6 @@ fn starmine_intro_48_outro_32_if_testdata_present() {
     );
 }
 
-// The observed intro groove has bar heads and offbeat kicks, not a kick on
-// every beat. A structural continuity check must not equate missing on-beats
-// with a tempo change.
 pub(crate) fn syncopated_pulse_track(bpm: f64, bars: u32, sr: u32) -> AudioBuffer {
     pulse_pattern_track(bpm, bars, sr, &[0.0, 1.5, 2.5])
 }
@@ -1074,7 +1003,7 @@ fn structural_grid_preserves_syncopated_bars_without_every_beat_kicks() {
         broken[(4.0 * bar).round() as usize * 2..(5.0 * bar).round() as usize * 2].fill(0.0);
         assert!(!local_grid_continuous(&broken, 0, audio.frames, sr, 198.0));
         let boundary = (4.0 * bar).round() as usize * 2;
-        let shift = (bar / 16.0).round() as usize * 2; // one quarter beat
+        let shift = (bar / 16.0).round() as usize * 2;
         let mut shifted = audio.samples.clone();
         shifted.copy_within(boundary..audio.samples.len() - shift, boundary + shift);
         shifted[boundary..boundary + shift].fill(0.0);
@@ -1227,8 +1156,6 @@ fn groove_continuity_allows_density_changes_but_rejects_missing_pulses() {
             assert!(local_grid_continuous(&samples, 0, audio.frames, sr, 198.0),
                 "one dense reference bar at gain {gain}, {sr}Hz erased the groove");
         }
-        // A dropout anywhere must reject, including gaps inside the phase
-        // reference context and gaps that cross a bar boundary.
         for index in [0, 1, 2, 3, 4, 5, 6, 7, 12] {
             for phase in [0.0, 0.5, 2.0, 3.5] {
                 let start = ((index as f64 + phase / 4.0) * bar).round() as usize;

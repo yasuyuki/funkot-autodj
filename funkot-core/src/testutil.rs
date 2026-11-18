@@ -163,7 +163,6 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
         let in_outro_end_tag = in_outro && end_tag_bars > 0 && beat_start >= end_tag_start;
         let in_intro_shout = in_intro && shout_bars > 0 && beat_start >= shout_start;
 
-        // Kick on every beat (thinner during sparse main entry = tension drop).
         let kick_amp = if in_main_sparse { 0.35 } else { 0.8 };
         add_kick(
             &mut mono,
@@ -177,8 +176,6 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
         if (in_main && opt.main_midhigh && !in_main_sparse)
             || (opt.intro_outro_midhigh && (in_intro || in_outro))
         {
-            // Keep early-main brightness near a bright intro so RMS tension-drop
-            // at the true boundary stays weak (Starmine-like); shout carries 48.
             bright = if in_main
                 && opt.intro_bright_level > 0.0
                 && opt.main_sparse_after_bars > 0
@@ -223,8 +220,6 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
                 0.25 * bright * opt.amplitude_scale,
                 &mut rng,
             );
-            // Intro body pad: short HF bursts alone barely move bar RMS, so
-            // tension-drop cues (bright intro → sparse main) need sustained mid.
             if in_intro && opt.intro_bright_level > 0.0 {
                 add_tone_burst(
                     &mut mono,
@@ -248,7 +243,6 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
             );
         }
 
-        // Quiet offbeat tick in sparse intro/outro only.
         let sparse_io = (in_intro || in_outro)
             && !opt.intro_outro_midhigh
             && bright < 0.15
@@ -268,7 +262,6 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
         }
     }
 
-    // Interleaved stereo (identical L/R).
     let mut samples = Vec::with_capacity(total_frames * 2);
     for &s in &mono {
         samples.push(s);
@@ -284,7 +277,7 @@ pub fn synth_track_with_options(opt: SynthOptions) -> AudioBuffer {
 
 fn add_kick(buf: &mut [f32], start: usize, len: usize, sr: f64, amp: f32) {
     let end = (start + len).min(buf.len());
-    let tau = 0.020f64; // ~80 ms audible with e^{-t/tau}
+    let tau = 0.020f64;
     for (i, frame) in (start..end).enumerate() {
         let t = i as f64 / sr;
         let env = (-t / tau).exp() as f32;
@@ -304,7 +297,6 @@ fn add_tone_burst(buf: &mut [f32], start: usize, len: usize, sr: f64, freq: f32,
 
 fn add_noise_burst(buf: &mut [f32], start: usize, len: usize, amp: f32, rng: &mut u32) {
     let end = (start + len).min(buf.len());
-    // Simple 1-pole low-pass to keep noise from being pure white (still mid/high rich).
     let mut lp = 0.0f32;
     for (i, frame) in (start..end).enumerate() {
         let white = next_rand(rng) * 2.0 - 1.0;
@@ -315,7 +307,6 @@ fn add_noise_burst(buf: &mut [f32], start: usize, len: usize, amp: f32, rng: &mu
 }
 
 fn next_rand(state: &mut u32) -> f32 {
-    // xorshift32
     let mut x = *state;
     x ^= x << 13;
     x ^= x >> 17;

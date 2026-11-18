@@ -18,7 +18,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::analysis::{local_grid_continuous, local_sync_span, refine_groove_phase};
 use crate::filter::StereoHighPass;
+use crate::first_live::{self, FailedPermit, PreviewWait};
 use crate::stretch::{self, position_scale};
 use crate::{cache, decode, EngineOptions, Error, Result, BEATS_PER_BAR, MAIN_GAP_BARS};
 
@@ -277,28 +278,14 @@ fn bar_to_frames(bars: u32, bar_frames: f64) -> u64 {
     (f64::from(bars) * bar_frames).round() as u64
 }
 
-/// Hop size for transition phase-lock energy envelopes.
 const PHASE_ALIGN_HOP: usize = 256;
-/// Compare this many bars when locking next entry to prev (intro-head /
-/// outro-edge groove; longer than a single fade bar so sparse kick+hat settle).
 pub(crate) const PHASE_ALIGN_BARS: u32 = 8;
-/// Relative weight of hi-hat envelope vs kick in [`align_next_entry_scored`].
-/// Kick dominates bar/downbeat identity; hat breaks pure 4-on-floor ties.
 const PHASE_ALIGN_HAT_WEIGHT: f64 = 0.40;
-/// Micro-adjust half-width (fraction of one beat). Whole-beat offsets are NOT
-/// searched: Funkot intros/outros put kicks on every beat, so ±1/±2 beat peaks
-/// are ambiguous and steal bar identity from the analysis markers.
 const PHASE_ALIGN_FINE_BEATS: f64 = 0.5;
-/// Ignore the adjustment when the best normalized correlation is below this.
 const PHASE_ALIGN_MIN_CORR: f64 = 0.45;
-/// Shared preview/upgrade/tail de-click duration.
 const HEAD_DECLICK_SECS: f64 = 0.010;
-/// Bars before file end used as the sparse outro-tail phase anchor.
 const OUTRO_TAIL_ANCHOR_BARS: u32 = 4;
 
-// Thread-local on purpose: phase work done by the worker is not attributed to
-// the render caller. Realtime tests can assert that their render thread did no
-// synchronous phase search while a worker may still be computing elsewhere.
 #[cfg(test)]
 thread_local! {
     static PHASE_ALIGN_CALLS_ON_THREAD: Cell<u64> = const { Cell::new(0) };
@@ -319,8 +306,7 @@ fn phase_align_calls_on_thread() -> u64 {
 /// Only searches within ±[`PHASE_ALIGN_FINE_BEATS`] of the marker-derived
 /// entry. Bar identity stays with analysis markers (file-end outro / intro
 /// downbeat); kick-energy xcorr cannot resolve mod-4 bar phase on machine
-/// rhythm and previously shifted 2→3 by a full beat (beats locked, bars wrong).
-/// Rejects edge-clamped adjustments that would slam entry to 0.
+/// rhythm. Rejects edge-clamped adjustments that would slam entry to 0.
 pub fn align_next_entry_to_prev(
     prev_interleaved: &[f32],
     prev_start: u64,
@@ -386,9 +372,6 @@ fn phase_envelopes(mono: &[f32], sample_rate: u32) -> (Vec<f64>, Vec<f64>, Vec<f
     (kick, hat, groove)
 }
 
-/// Request-local cached outro reference for repeated candidate entry scoring.
-/// It owns only the filtered envelope prefixes; the original slice remains the
-/// source of truth for geometry and the previous-deck nudge clamp.
 pub(crate) struct PreparedPhaseReference<'a> {
     prev_interleaved: &'a [f32],
     prev_start: u64,
@@ -502,7 +485,6 @@ fn align_next_entry_from_envelopes(
 
     let (lag_groove, corr_groove) = best_lag(prev_groove, next_groove);
 
-    // Kick/hat micro-phase disagreement (e.g. on-beat vs off-beat hats): trust kick.
     let disagree_hops = (0.25 * geometry.hops_per_beat).round().max(1.0) as i64;
     let (lag_hops, fine_corr) = if corr_kick.is_finite()
         && corr_hat.is_finite()
@@ -521,8 +503,6 @@ fn align_next_entry_from_envelopes(
 
     let lag_frames = lag_hops.saturating_mul(PHASE_ALIGN_HOP as i64);
     if lag_frames >= 0 {
-        // Positive lag → next is early → prefer an earlier entry. When the intro
-        // is already at the file head, skip the same amount on prev instead.
         let want = lag_frames as u64;
         if want > next_entry {
             let nudge = want
@@ -556,13 +536,12 @@ fn align_next_entry_from_envelopes(
 /// the matching next entry is near `nominal + (grid - end_anchored)`.
 ///
 /// Stage 1 — phase: both hypotheses are micro-aligned (±0.5 beat); end wins only
-/// when its kick/groove score is clearly better. Ties keep intro-grid (v14
-/// `GRID_LATER_SLACK` stole a beat on KazuyaP→Totsumal).
+/// when its kick/groove score is clearly better. Ties keep intro-grid.
 ///
 /// Stage 2 — bar identity: from each phase nominal, try whole-beat offsets
-/// `{0,1,2,3}` and re-micro-align. Kick-only coarse ±1/±2 search is forbidden
-/// (v10: beats locked, bars wrong on 2→3). Scoring uses the same kick+hat
-/// groove as micro-align; a non-zero offset must clearly beat `(grid,0)`.
+/// `{0,1,2,3}` and re-micro-align. Kick-only coarse ±1/±2 search is not used.
+/// Scoring uses the same kick+hat groove as micro-align; a non-zero offset must
+/// clearly beat `(grid,0)`.
 ///
 /// Returns `(next_entry, prev_nudge_frames)` — the nudge skips a few frames of
 /// the previous deck when next cannot move earlier (intro already at head).
@@ -595,7 +574,6 @@ pub fn align_next_entry_with_phase_hypotheses(
         }
     }
 
-    // Baseline: intro-grid at bar offset 0 (preserves marker bar identity).
     let (mut best_entry, mut best_score, mut best_nudge) = align_next_entry_scored(
         prev_interleaved,
         prev_start,
@@ -607,7 +585,6 @@ pub fn align_next_entry_with_phase_hypotheses(
 
     for (hyp_i, &base) in phase_nominals.iter().enumerate() {
         for bar_off in 0u32..BEATS_PER_BAR {
-            // (grid, 0) already scored as baseline.
             if hyp_i == 0 && bar_off == 0 {
                 continue;
             }
@@ -625,8 +602,6 @@ pub fn align_next_entry_with_phase_hypotheses(
                 sample_rate,
                 beat_frames,
             );
-            // Must clearly beat the current best (and therefore grid+0). Near-ties
-            // keep the earlier choice so ambiguous 4-on-floor never steals a bar.
             if score > best_score + SCORE_EPS {
                 best_entry = entry;
                 best_score = score;
@@ -747,28 +722,41 @@ fn energy_xcorr_at_win(a: &[f64], b: &[f64], lag: i64, win: usize) -> f64 {
     corr / denom
 }
 
+#[derive(Clone)]
+enum FailedAttempt {
+    BeforeReady,
+    AfterPreview(Weak<Vec<f32>>),
+}
+
+impl FailedAttempt {
+    fn permit(&self) -> FailedPermit {
+        match self {
+            Self::BeforeReady => FailedPermit::Untransferred,
+            Self::AfterPreview(_) => FailedPermit::TransferredToPreview,
+        }
+    }
+}
+
 enum LoaderMsg {
     Ready(PreparedTrack, Option<FirstLiveProvenance>),
-    /// Replace the playing (or queued) first-track preview with the full stretch.
     Upgrade(PreparedTrack, Option<FirstLiveProvenance>),
     Failed {
         index: usize,
         path: PathBuf,
         message: String,
+        attempt: FailedAttempt,
     },
     Exhausted,
 }
 
 struct Deck {
     track: PreparedTrack,
-    /// Current read position in the prepared buffer (frames).
     playhead: u64,
     highpass_enabled: bool,
     filter: StereoHighPass,
     upgrade_fade: Option<UpgradeFade>,
 }
 
-/// Old preview retained briefly while a full first-live buffer takes over.
 struct UpgradeFade {
     track: PreparedTrack,
     playhead: u64,
@@ -779,14 +767,15 @@ struct UpgradeFade {
 struct ActiveTransition {
     frames_into: u64,
     fade_in_end: u64,
-    /// Start of the cached one-beat raw/HPF handoff before `fade_in_end`.
     handoff_start: u64,
     fade_out_start: u64,
     fade_out_end: u64,
-    /// Simultaneous linear crossfade without HPF / phase-align (local BPM out of range).
     simple: bool,
 }
 
+use crate::manual_navigation::{
+    reply_is_current, tick_decision, DeadlineFact, PlanFact, TickDecision,
+};
 use crate::transition_geometry::admit_frames;
 
 #[derive(Clone)]
@@ -794,9 +783,6 @@ enum PendingNav {
     Planned(ManualPlan),
 }
 
-/// Identity for a prepared deck as observed by the local-sync planner.  This is
-/// deliberately value-only: a reply never keeps a PCM buffer alive and cannot
-/// be applied to a replacement occupying the same queue slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManualKey {
     action: NavAction,
@@ -931,7 +917,6 @@ struct ManualRequest {
     generation: u64,
     key: ManualKey,
     playhead: u64,
-    /// Fixed navigation deadline captured before dispatching the worker.
     deadline: u64,
     active: Arc<Vec<f32>>,
     target: Arc<Vec<f32>>,
@@ -956,8 +941,6 @@ fn manual_key(action: NavAction, active: &PreparedTrack, target: &PreparedTrack)
     }
 }
 
-/// Pure, off-audio-thread local plan builder.  A repeating beat may validate
-/// propagation from an existing structural marker, but never invents one.
 fn build_manual_plan(request: ManualRequest) -> ManualPlan {
     let simple_at = |reason, entry: u64| {
         let entry = entry.min(request.key.target_frames.saturating_sub(1));
@@ -983,9 +966,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
     if target_main >= request.key.target_frames {
         return simple("main outside material");
     }
-    // A file's analysed first pulse is an existing structural anchor, not a
-    // new origin selected from the request window. Reject markers preceded by
-    // equally strong material: a one-beat marker error must not become identity.
     let anchors = manual_anchor_supported(&request.active, request.key.active_first, beat)
         && manual_anchor_supported(&request.target, request.key.target_first, beat);
     if !anchors { return simple("structural marker uncertain"); }
@@ -996,8 +976,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
         let mut bars = (relative / request.bar_frames / grid_bars).floor() * grid_bars;
         let mut start = request.key.active_first
             .saturating_add((bars * request.bar_frames).round() as u64);
-        // Compare rounded sample positions, not continuous times: ceil would
-        // skip a valid boundary whenever its ideal fractional frame rounds up.
         if start < request.playhead {
             bars += grid_bars;
             start = request.key.active_first
@@ -1025,8 +1003,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
             return simple("deadline boundary unavailable");
         }
     };
-    // Keep the historically anchored position first. If it is unsafe, search
-    // the live beat grid up to the deadline captured when Next was pressed.
     let mut searching_later = false;
     let next_candidate = |start: u64, searching_later: bool| {
         let next = if searching_later {
@@ -1061,8 +1037,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
                 return simple("insufficient remaining material");
             }
 
-            // Historical marker continuity proves bar identity. A later
-            // candidate uses only its corrected, locally checked beat span.
             let active_continuous = !beat_only && local_grid_continuous(
                 &request.active, request.key.active_first,
                 start.saturating_add(overlap), request.sample_rate,
@@ -1092,8 +1066,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
                 return simple("phase evidence uncertain");
             }
 
-            // Check the corrected overlap, including an earlier target entry
-            // and the active deck's fractional phase nudge.
             let prev_start = start.saturating_add(nudge);
             let prev_end = prev_start.saturating_add(overlap);
             let target_end = entry.saturating_add(overlap);
@@ -1119,9 +1091,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
                 request.sample_rate, request.target_bpm,
             ) else {
                 if !shortened_for_target && schedule.f_eff > 1 {
-                    // A shorter fade enters later in the prepared intro while
-                    // preserving the gap before its main section. Recheck both
-                    // decks, phase, and drift for the new overlap.
                     schedule = plan_transition(
                         (schedule.f_eff / 2).max(1), request.key.target_intro, remaining,
                     );
@@ -1136,8 +1105,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
                 return simple_at("target overlap unsafe", nominal);
             };
             let delta = (a_hi - b_lo).abs().max((b_hi - a_lo).abs());
-            // Keep the provisional drift ceiling and revalidate after any
-            // fade shortening, because the target entry may change.
             let drift = delta * overlap as f64 / request.sample_rate as f64 / 60.0;
             if drift > 0.125 {
                 if !shortened_for_drift {
@@ -1159,8 +1126,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
                 return simple("tempo drift");
             }
 
-            // This long marker corridor only labels a safe plan. Failed
-            // candidates need their corrected local overlap checks alone.
             let target_structure_known = local_grid_continuous(
                 &request.target, request.key.target_first,
                 nominal.saturating_add(overlap), request.sample_rate,
@@ -1201,8 +1166,6 @@ fn build_manual_plan(request: ManualRequest) -> ManualPlan {
 fn manual_anchor_supported(samples: &[f32], anchor: u64, beat: f64) -> bool {
     let frames = (samples.len() / 2) as u64;
     if anchor >= frames || !beat.is_finite() || beat <= 0.0 { return false; }
-    // At the physical beginning there is no earlier pulse to confuse with the
-    // supplied marker. A lead-in marker must separate quiet from audible audio.
     if (anchor as f64) < beat / 2.0 { return true; }
     let before = anchor.saturating_sub((beat * 4.0).round() as u64);
     let after = anchor.saturating_add((beat * 4.0).round() as u64).min(frames);
@@ -1214,21 +1177,14 @@ fn manual_anchor_supported(samples: &[f32], anchor: u64, beat: f64) -> bool {
     post > 1e-12 && energy(before, anchor) < post / 2.0
 }
 
-/// Free a finished deck off the audio thread.
-///
-/// Dropping the last `Arc` of a multi-minute stretch buffer can take milliseconds
-/// of allocator work; doing that inside `render` underruns under load.
 fn retire_deck(deck: Deck) {
     thread::spawn(move || drop(deck));
 }
 
-/// Same as [`retire_deck`] for a bare [`PreparedTrack`] (surplus Ready, Upgrade, history).
 fn retire_prepared(track: PreparedTrack) {
     thread::spawn(move || drop(track));
 }
 
-/// Preserve the history/current ownership while retiring an interrupted
-/// Upgrade's preview off the render thread.
 fn deck_track_retiring_upgrade(mut deck: Deck) -> PreparedTrack {
     retire_upgrade_fade(deck.upgrade_fade.take());
     deck.track
@@ -1251,13 +1207,8 @@ fn retire_upgrade_fade(fade: Option<UpgradeFade>) {
 /// 10連打に2本の余裕。1本あたり 20 秒 head ≈ 7.7 MB（48 kHz ステレオ f32）。
 pub const HEAD_ONLY_PREFETCH: usize = 12;
 
-/// nav コマンドの容量。通常モードが持っていた 8 に、ラベリング中の
-/// 一斉連打ぶんを足しただけ。
 const NAV_QUEUE_CAP: usize = 8 + HEAD_ONLY_PREFETCH;
 
-/// Prefetch depth for the given options: `HEAD_ONLY_PREFETCH` in labeling
-/// mode, `0` (single-slot `next_track`, unchanged normal-mode behavior)
-/// otherwise.
 fn prefetch_depth_for(options: &EngineOptions) -> usize {
     if options.head_only_secs.is_some() {
         HEAD_ONLY_PREFETCH
@@ -1311,8 +1262,6 @@ impl PreparedSourceReplacement {
         let join = thread::Builder::new().name("funkot-replacement".into())
             .stack_size(8 * 1024 * 1024).spawn(move || {
                 if let Ok(options) = start.recv() {
-                    // Future tracks must be complete: a queued preview cannot
-                    // rely on an Upgrade that races its eventual adoption.
                     loader_main_mode(options, source, tx, permit_rx, flag, false);
                 }
             }).map_err(|e| Error::Engine(format!("spawn replacement loader: {e}")))?;
@@ -1339,43 +1288,25 @@ pub struct Engine {
     bar_frames: f64,
     shutdown: Arc<AtomicBool>,
     loader_rx: Receiver<LoaderMsg>,
-    /// Permits the loader to prepare another track (bounds in-flight buffers).
     permit_tx: SyncSender<()>,
     loader_join: Option<JoinHandle<()>>,
-    /// Next prepared track waiting to enter a transition (at most one).
     next_track: Option<PreparedTrack>,
-    /// Labeling-mode overflow behind `next_track`: extra prepared heads
-    /// waiting their turn. Always empty when `prefetch_depth() == 0`
-    /// (normal mode has no queue behind the single `next_track` slot).
     head_queue: VecDeque<PreparedTrack>,
-    /// Previous track kept for rewind (holds a loader permit while present).
     last_track: Option<PreparedTrack>,
     active: Option<Deck>,
     prev: Option<Deck>,
     transition: Option<ActiveTransition>,
-    /// Waiting for next track after crossing outro_start without a ready next.
     awaiting_next_at_outro: bool,
     outro_anchor: u64,
     pending_events: Vec<EngineEvent>,
     finished: bool,
     finished_emitted: bool,
-    /// Gain ramp only after resuming a naturally finished finite source.
-    /// Loader-wait silence must not consume these frames.
     resume_fade: Option<(u64, u64)>,
     stopped: bool,
-    /// Third loader permit (history / in-transition `prev`) armed after a slot exists.
-    ///
-    /// Seeding all three permits at startup let the loader prepare a track while
-    /// `active` + `next_track` were already full and `last_track` was still empty;
-    /// each surplus `Ready` was dropped and the permit re-released, causing a
-    /// decode/probe loop (~every prepare duration) and spam Symphonia junk warnings.
     third_permit_armed: bool,
-    /// Playlist exhausted signal from loader (no more tracks coming).
     loader_exhausted: bool,
-    /// When true, [`Self::render`] spin-waits if the first-track head preview
-    /// ends before Upgrade (CPU-speed pulls / offline). Realtime hosts set
-    /// this false via [`Self::set_realtime`] so the audio callback never sleeps.
     block_on_preview_upgrade: bool,
+    failed_preview: Option<Weak<Vec<f32>>>,
     render_diagnostics: RenderDiagnostics,
     first_live_ready_frame: Option<u64>,
     first_live_evidence: Option<FirstLiveReplayEvidence>,
@@ -1386,10 +1317,8 @@ pub struct Engine {
     replay_ready_at: Option<u64>,
     replay_upgrade_pending: bool,
     queued_first_live_upgrade_frame: Option<u64>,
-    /// Background phase-align result: `(prev_start, next_entry, prev_nudge)`.
     phase_align_ready: Option<(u64, u64, u64)>,
     phase_align_rx: Option<Receiver<(u64, u64, u64)>>,
-    /// Host → engine nav commands (audio thread drains in [`Self::render`]).
     nav_tx: SyncSender<NavAction>,
     nav_rx: Receiver<NavAction>,
     deferred_nav: VecDeque<NavAction>,
@@ -1399,8 +1328,6 @@ pub struct Engine {
     navigation_trace_tx: Option<SyncSender<NavigationTrace>>,
     navigation_trace_dropped: AtomicUsize,
     active_navigation_trace: Option<ActiveNavigationTrace>,
-    /// One long-lived local planner.  The request channel is capacity one;
-    /// when it is occupied the engine retains just the newest snapshot.
     manual_tx: SyncSender<ManualRequest>,
     manual_rx: Receiver<ManualPlan>,
     manual_pending: Option<ManualDemand>,
@@ -1437,11 +1364,6 @@ impl Engine {
         }
         let shutdown = Arc::new(AtomicBool::new(false));
         let (msg_tx, msg_rx) = mpsc::sync_channel::<LoaderMsg>(1);
-        // Permit capacity is fixed at construction (no live labeling switch):
-        // 3 for history + current + next in normal mode, plus the labeling
-        // head queue's depth when `head_only_secs` is set. Only seed
-        // current+next (`2 + prefetch`) until rewind history / in-transition
-        // prev actually exists.
         let prefetch = prefetch_depth_for(&options);
         let (permit_tx, permit_rx) = mpsc::sync_channel::<()>(3 + prefetch);
         for _ in 0..(2 + prefetch) {
@@ -1451,8 +1373,7 @@ impl Engine {
 
         let opts = options.clone();
         let shutdown_flag = Arc::clone(&shutdown);
-        // Windows default thread stack (~2 MiB) is tight for decode/stretch; overflow
-        // was observed on long m4a prepares ("thread 'funkot-loader' has overflowed its stack").
+        // Rust's default spawned-thread stack (2 MiB) overflowed on long m4a decode/stretch prepares.
         let join = thread::Builder::new()
             .name("funkot-loader".into())
             .stack_size(8 * 1024 * 1024)
@@ -1492,6 +1413,7 @@ impl Engine {
             third_permit_armed: false,
             loader_exhausted: false,
             block_on_preview_upgrade: true,
+            failed_preview: None,
             render_diagnostics: RenderDiagnostics::default(),
             first_live_ready_frame: None,
             first_live_evidence: None,
@@ -1525,7 +1447,7 @@ impl Engine {
     /// The first two tracks are installed synchronously. A `sync_channel(1)` loader
     /// alone is unsafe for CPU-speed pullers: `send_msg` sleeps 50ms when the
     /// channel is full, and release-mode render can burn past outro before the
-    /// next `Ready` is delivered (GitHub CI flake; local Docker often "wins").
+    /// next `Ready` is delivered.
     pub fn from_prepared(options: EngineOptions, tracks: Vec<PreparedTrack>) -> Result<Self> {
         if options.output_sample_rate == 0 {
             return Err(Error::Engine("output_sample_rate must be > 0".into()));
@@ -1561,9 +1483,6 @@ impl Engine {
         let rest = tracks;
         let rest_empty = rest.is_empty();
 
-        // Slots already filled by first/second are not free for the loader.
-        // Do not seed the history/prev spare until that slot exists (see
-        // `arm_third_permit_if_needed`).
         let initial_permits = (2 + prefetch)
             .saturating_sub(usize::from(first.is_some()))
             .saturating_sub(usize::from(second.is_some()));
@@ -1611,6 +1530,7 @@ impl Engine {
             third_permit_armed: false,
             loader_exhausted: rest_empty,
             block_on_preview_upgrade: true,
+            failed_preview: None,
             render_diagnostics: RenderDiagnostics::default(),
             first_live_ready_frame: None,
             first_live_evidence: None,
@@ -1704,8 +1624,6 @@ impl Engine {
     /// The current audio advances; if it ends before resolution it stays silent
     /// at its end rather than consuming the old future.
     pub fn begin_future_update(&mut self) -> std::result::Result<FutureUpdate, FutureUpdateBusy> {
-        // Preserve queued commands in order while inspecting them. A refusal
-        // must not lose an already-requested old-source navigation action.
         if self.future_fence.is_none() { self.defer_nav_commands(); }
         let busy = if self.future_fence.is_some() { Some(FutureUpdateBusy::UpdateInProgress) }
             else if self.stopped { Some(FutureUpdateBusy::Stopped) }
@@ -1728,7 +1646,17 @@ impl Engine {
 
     pub fn abort_future_update(&mut self, token: FutureUpdate) {
         self.check_future_token(&token);
+        self.resume_future_adoption();
+    }
+
+    fn resume_future_adoption(&mut self) {
         self.future_fence = None;
+        if let Some(active) = self.active.as_ref().filter(|d| {
+            !d.track.head_only && d.playhead >= d.track.outro_start_out
+        }) {
+            self.awaiting_next_at_outro = true;
+            self.outro_anchor = active.track.outro_start_out;
+        }
     }
 
     /// Infallible for this engine's live token. No filesystem work, thread
@@ -1736,9 +1664,6 @@ impl Engine {
     /// belong to disconnected channels and can never affect this generation.
     pub fn commit_future_update(&mut self, token: FutureUpdate, replacement: PreparedSourceReplacement) -> RetiredFuture {
         self.check_future_token(&token);
-        // This empty observation linearizes the source change for the shared
-        // navigation sender. Commands submitted before it belong to the old
-        // future; subsequent sends are commands for the replacement.
         self.deferred_nav.clear();
         while self.nav_rx.try_recv().is_ok() {}
         let PreparedSourceReplacement { activate, shutdown, rx, permit_tx, join } = replacement;
@@ -1753,21 +1678,15 @@ impl Engine {
         self.permit_tx = permit_tx;
         self.loader_exhausted = false;
         self.source_generation = self.source_generation.wrapping_add(1);
-        self.future_fence = None;
-        self.awaiting_next_at_outro = false;
+        self.resume_future_adoption();
         self.clear_phase_align();
         self.cancel_pending_nav();
-        // Account for retained decks/history against the NEW permit pool.
         self.third_permit_armed = self.last_track.is_some();
-        // While finished, poll_events may accept a next track long before
-        // resume adopts it. Reserve the vacant current slot until then so a
-        // second Ready cannot be discarded as surplus in the single next slot.
         self.replacement_current_slot_reserved = self.active.is_none();
         let occupied = 1 + usize::from(self.last_track.is_some());
         for _ in 0..(2 + self.prefetch_depth() + usize::from(self.third_permit_armed)).saturating_sub(occupied) {
             self.release_permit();
         }
-        // Receiver exists on the parked thread until this activation arrives.
         let _ = activate.try_send(self.options.clone());
         retired
     }
@@ -1872,7 +1791,6 @@ impl Engine {
 
         self.drain_loader();
 
-        // Still waiting for the first track (or between tracks): silence.
         if self.active.is_none() && self.prev.is_none() {
             if self.future_fence.is_some() {
                 out.fill(0.0);
@@ -1919,9 +1837,12 @@ impl Engine {
                     self.mark_finished();
                 }
                 if let Some((frame, _)) = self.resume_fade.as_mut() { *frame = 0; }
+                let waiting = first_live::waiting_output_frames(want_frames - frames_done, self.finished);
                 for s in out[frames_done * 2..].iter_mut() {
                     *s = 0.0;
                 }
+                self.render_frame = self.render_frame.saturating_add(waiting as u64);
+                frames_done += waiting;
                 break;
             }
 
@@ -2029,17 +1950,14 @@ impl Engine {
         self.resume_fade = None;
         self.shutdown.store(true, Ordering::SeqCst);
         while let Ok(msg) = self.loader_rx.try_recv() {
-            if let LoaderMsg::Failed { index, path, message } = msg {
+            if let LoaderMsg::Failed { index, path, message, .. } = msg {
                 self.pending_events
                     .push(EngineEvent::TrackFailed { index, path, message });
             }
         }
-        // Unblock loader waiting on a permit.
         let _ = self.permit_tx.try_send(());
         let _ = self.permit_tx.try_send(());
         let _ = self.permit_tx.try_send(());
-        // Detach: prepare_track ignores shutdown and can take minutes (decode/stretch).
-        // Joining here made Ctrl+C hang until the in-flight prepare finished or crashed.
         drop(self.loader_join.take());
         self.finished = true;
     }
@@ -2052,16 +1970,12 @@ impl Engine {
         prefetch_depth_for(&self.options)
     }
 
-    /// 次に鳴る1本を取り出し、控えの先頭をその場に繰り上げる。連打中も
-    /// `next_track_path()` が空にならないのはこの繰り上げによる。
     fn take_next(&mut self) -> Option<PreparedTrack> {
         let track = self.next_track.take()?;
         self.next_track = self.head_queue.pop_front();
         Some(track)
     }
 
-    /// 先頭へ差し戻す。押し出された1本は控えの先頭へ回る ——
-    /// ただし通常モードには控えが無いので、従来どおり permit を返して破棄する。
     fn push_front_next(&mut self, track: PreparedTrack) {
         if let Some(displaced) = self.next_track.replace(track) {
             if self.prefetch_depth() == 0 {
@@ -2083,10 +1997,6 @@ impl Engine {
         usize::from(self.next_track.is_some()) + self.head_queue.len()
     }
 
-    /// Enable the third loader permit once a distinct history/prev buffer exists.
-    ///
-    /// `RestartCurrent` parks the same track on `prev` without an extra permit;
-    /// arming there would recreate the surplus-prepare loop.
     fn arm_third_permit_if_needed(&mut self) {
         if self.third_permit_armed {
             return;
@@ -2103,7 +2013,6 @@ impl Engine {
         self.release_permit();
     }
 
-    /// Drop the previous deck into rewind history (keeps its permit while stored).
     fn drop_prev(&mut self) {
         if let Some(deck) = self.prev.take() {
             let same = self.active.as_ref().is_some_and(|a| {
@@ -2111,7 +2020,6 @@ impl Engine {
                     && a.track.path == deck.track.path
             });
             if same {
-                // RestartCurrent: shared buffer / single permit with active.
                 retire_upgrade_fade(deck.upgrade_fade);
                 return;
             }
@@ -2120,8 +2028,10 @@ impl Engine {
     }
 
     fn push_history(&mut self, track: PreparedTrack) {
+        if self.manual_action == Some(NavAction::TransitionToPrev) {
+            self.cancel_pending_nav();
+        }
         if let Some(old) = self.last_track.replace(track) {
-            // Replaced prior history slot → free that permit.
             self.release_permit();
             retire_prepared(old);
         } else {
@@ -2132,7 +2042,6 @@ impl Engine {
     fn retire_active(&mut self) {
         if let Some(deck) = self.active.take() {
             self.push_history(deck_track_retiring_upgrade(deck));
-            // History keeps the permit; do not release here.
         }
     }
 
@@ -2141,9 +2050,6 @@ impl Engine {
         self.phase_align_rx = None;
     }
 
-    /// Normal mode coalesces a burst of taps into the last one (the single
-    /// `next_track` slot has no runway for more). Labeling mode has the head
-    /// queue for exactly this burst, so every tap is applied in order instead.
     fn defer_nav_commands(&mut self) {
         while let Ok(action) = self.nav_rx.try_recv() {
             self.deferred_nav.push_back(action);
@@ -2172,8 +2078,6 @@ impl Engine {
             self.deferred_nav.push_back(action);
             return;
         }
-        // Labeling mode: a head-only deck has no fade material and no outro to
-        // schedule a bar-grid transition against, so any nav is a hard cut.
         let action = match self.active.as_ref() {
             Some(active) if active.track.head_only => match action {
                 NavAction::TransitionToNext => NavAction::JumpToNextIntro,
@@ -2213,7 +2117,6 @@ impl Engine {
             }
         };
 
-        // Immediate jumps skip BPM / bar wait.
         if matches!(
             action,
             NavAction::JumpToPrevIntro | NavAction::JumpToNextIntro
@@ -2228,9 +2131,6 @@ impl Engine {
         self.nav_gen = self.nav_gen.wrapping_add(1);
         self.accept_navigation_trace(action, target_index);
         let Some(active) = self.active.as_ref() else { return };
-        // The worker gets only the material that can still be used.  When that
-        // deadline passes we make one bounded simple transition, never restart
-        // an obsolete analysis loop indefinitely.
         let simple_fade = bar_to_frames(self.options.fade_bars.max(1), self.bar_frames);
         let material_end = active.track.frames.saturating_sub(simple_fade);
         let natural_end = if active.track.outro_start_out > active.playhead { active.track.outro_start_out } else { material_end };
@@ -2322,22 +2222,74 @@ impl Engine {
     }
 
     fn poll_nav_tempo(&mut self) {
-        loop { match self.manual_rx.try_recv() {
-            Ok(plan) => { self.manual_in_flight = false; if plan.generation == self.nav_gen && self.manual_plan_matches(&plan) { self.pending_nav = Some(PendingNav::Planned(plan)); } },
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => { self.manual_in_flight = false; self.manual_pending = None; break },
-        }}
+        loop {
+            match self.manual_rx.try_recv() {
+                Ok(plan) => {
+                    self.manual_in_flight = false;
+                    if reply_is_current(
+                        plan.generation,
+                        self.nav_gen,
+                        self.manual_plan_matches(&plan),
+                    ) {
+                        self.pending_nav = Some(PendingNav::Planned(plan));
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.manual_in_flight = false;
+                    self.manual_pending = None;
+                    break;
+                }
+            }
+        }
         self.kick_manual_plan_if_idle();
     }
 
     fn tick_pending_nav(&mut self) {
-        let exact_ready = match (self.pending_nav.as_ref(), self.active.as_ref()) {
-            (Some(PendingNav::Planned(plan)), Some(active)) => plan.start == active.playhead
-                && plan.generation == self.nav_gen && self.manual_plan_matches(plan),
-            _ => false,
-        };
-        if let (Some(deadline), Some(action), Some(active)) = (self.manual_deadline, self.manual_action, self.active.as_ref()) {
-            if active.playhead >= deadline && !exact_ready {
+        let plan_fact = self.pending_nav.as_ref().map(|pending| match pending {
+            PendingNav::Planned(plan) => PlanFact {
+                generation: plan.generation,
+                start: plan.start,
+                identity_matches: self.manual_plan_matches(plan),
+            },
+        });
+        let plan_action = self.pending_nav.as_ref().map(|pending| match pending {
+            PendingNav::Planned(plan) => plan.key.action,
+        });
+        let active_playhead = self.active.as_ref().map(|active| active.playhead);
+        let deadline = self.manual_deadline.map(|frame| DeadlineFact {
+            frame,
+            fallback_available: self.manual_action.is_some(),
+        });
+
+        match tick_decision(self.nav_gen, active_playhead, plan_fact, deadline) {
+            TickDecision::Wait => {}
+            TickDecision::Drop => {
+                self.pending_nav = None;
+            }
+            TickDecision::Apply => {
+                let Some(PendingNav::Planned(plan)) = self.pending_nav.take() else {
+                    return;
+                };
+                self.manual_deadline = None;
+                self.manual_action = None;
+                self.commit_manual_plan(plan);
+            }
+            TickDecision::Replan => {
+                let Some(action) = plan_action else {
+                    return;
+                };
+                self.pending_nav = None;
+                self.manual_pending = Some(ManualDemand {
+                    generation: self.nav_gen,
+                    action,
+                });
+                self.kick_manual_plan_if_idle();
+            }
+            TickDecision::DeadlineFallback => {
+                let Some(action) = self.manual_action else {
+                    return;
+                };
                 self.manual_deadline = None;
                 self.manual_action = None;
                 self.manual_pending = None;
@@ -2348,44 +2300,18 @@ impl Engine {
                     plan.generation = accepted_generation;
                     self.commit_manual_plan(plan);
                 }
-                return;
             }
-        }
-        let Some(PendingNav::Planned(plan)) = self.pending_nav.as_ref() else {
-            return;
-        };
-        if plan.generation != self.nav_gen || !self.manual_plan_matches(plan) {
-            self.pending_nav = None;
-            return;
-        }
-        let start = plan.start;
-        let action = plan.key.action;
-        let playhead = match self.active.as_ref() {
-            Some(d) => d.playhead,
-            None => {
+            TickDecision::LateFallback => {
+                let Some(action) = plan_action else {
+                    return;
+                };
                 self.pending_nav = None;
-                return;
-            }
-        };
-        if playhead > start {
-            // Missing an exact frame never applies a late plan.  Rebuild from
-            // the live position; this also bounds a slow worker to useful work.
-            self.pending_nav = None;
-            if self.manual_deadline.is_some_and(|deadline| playhead < deadline) {
-                self.manual_pending = Some(ManualDemand { generation: self.nav_gen, action });
-                self.kick_manual_plan_if_idle();
-            } else {
                 self.manual_deadline = None;
                 self.manual_action = None;
                 if let Some(plan) = self.manual_simple_plan(action, "late preparation fallback") {
                     self.commit_manual_plan(plan);
                 }
             }
-        } else if playhead == start {
-            let Some(PendingNav::Planned(plan)) = self.pending_nav.take() else { return };
-            self.manual_deadline = None;
-            self.manual_action = None;
-            self.commit_manual_plan(plan);
         }
     }
 
@@ -2397,9 +2323,6 @@ impl Engine {
             NavAction::TransitionToNext => match self.next_track.as_ref() { Some(t) => t, None => return false },
             _ => return false,
         };
-        // This runs while waiting on every rendered frame. Compare borrowed
-        // identity fields; constructing a key here would allocate two paths
-        // per sample on the audio thread.
         let key = &plan.key;
         key.active_path == active.track.path
             && key.active_index == active.track.playlist_index
@@ -2417,37 +2340,59 @@ impl Engine {
     }
 
     fn kick_manual_plan_if_idle(&mut self) {
-        if self.manual_in_flight { return; }
-        let Some(demand) = self.manual_pending.take() else { return };
-        let Some(active) = self.active.as_ref() else { return };
+        if self.manual_in_flight {
+            return;
+        }
+        let Some(demand) = self.manual_pending.take() else {
+            return;
+        };
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
         let target = match demand.action {
             NavAction::RestartCurrent => &active.track,
-            NavAction::TransitionToPrev => match self.last_track.as_ref() { Some(t) => t, None => return },
-            NavAction::TransitionToNext => match self.next_track.as_ref() { Some(t) => t, None => return },
+            NavAction::TransitionToPrev => match self.last_track.as_ref() {
+                Some(t) => t,
+                None => return,
+            },
+            NavAction::TransitionToNext => match self.next_track.as_ref() {
+                Some(t) => t,
+                None => return,
+            },
             _ => return,
         };
-        let request = ManualRequest { generation: demand.generation,
+        if !reply_is_current(demand.generation, self.nav_gen, true) {
+            return;
+        }
+        let request = ManualRequest {
+            generation: demand.generation,
             key: manual_key(demand.action, &active.track, target),
-            // Reserve a scheduling quantum; a result whose start is already
-            // behind the current render frame is never committed.
             playhead: active.playhead.saturating_add(bar_to_frames(1, self.bar_frames)).min(active.track.frames),
             deadline: self.manual_deadline.unwrap_or(u64::MAX),
-            active: Arc::clone(&active.track.samples), target: Arc::clone(&target.samples),
-            bar_frames: self.bar_frames, sample_rate: self.options.output_sample_rate,
-            target_bpm: self.options.target_bpm(), fade_bars: self.options.fade_bars };
-        // Offline rendering uses the identical pure builder synchronously for
-        // deterministic output; realtime always hands it to the sole worker.
+            active: Arc::clone(&active.track.samples),
+            target: Arc::clone(&target.samples),
+            bar_frames: self.bar_frames,
+            sample_rate: self.options.output_sample_rate,
+            target_bpm: self.options.target_bpm(),
+            fade_bars: self.options.fade_bars,
+        };
         if self.block_on_preview_upgrade {
             let plan = build_manual_plan(request);
-            if plan.generation == self.nav_gen && self.manual_plan_matches(&plan) {
+            if reply_is_current(
+                plan.generation,
+                self.nav_gen,
+                self.manual_plan_matches(&plan),
+            ) {
                 self.pending_nav = Some(PendingNav::Planned(plan));
             }
             return;
         }
         match self.manual_tx.try_send(request) {
             Ok(()) => self.manual_in_flight = true,
-            Err(TrySendError::Full(_)) => { self.manual_pending = Some(demand); },
-            Err(TrySendError::Disconnected(_)) => {},
+            Err(TrySendError::Full(_)) => {
+                self.manual_pending = Some(demand);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -2473,7 +2418,10 @@ impl Engine {
                 plan.simple,
             )
         };
-        let Some(admission) = admission else { return };
+        let Some(admission) = admission else {
+            self.cancel_pending_nav();
+            return;
+        };
         let action = plan.key.action;
         let target = match action {
             NavAction::RestartCurrent => match self.active.as_ref() { Some(d) => d.track.clone(), None => return },
@@ -2522,8 +2470,6 @@ impl Engine {
         self.transition = None;
         self.awaiting_next_at_outro = false;
         if let Some(deck) = self.prev.take() {
-            // RestartCurrent shares active's permit. Aborting that overlap
-            // must not grant a nonexistent free loader slot on every tap.
             let shared = self.active.as_ref().is_some_and(|active| {
                 active.track.playlist_index == deck.track.playlist_index
                     && active.track.path == deck.track.path
@@ -2542,7 +2488,6 @@ impl Engine {
                 };
                 self.abort_active_transition();
                 if let Some(cur) = self.active.take() {
-                    // cur's permit moved into next_track (or the head queue).
                     self.push_front_next(deck_track_retiring_upgrade(cur));
                 }
                 self.start_first(prev);
@@ -2583,15 +2528,12 @@ impl Engine {
         }
     }
 
-    /// Commit an already validated manual plan. No analysis or planning runs here.
     fn begin_transition_to(&mut self, next: PreparedTrack, plan: ManualPlan, restart_same: bool,
         trace: Option<PendingNavigationTrace>) {
         self.abort_active_transition();
-        // Replacing the active deck invalidates every uncommitted local reply.
         self.cancel_pending_nav();
         let Some(active) = self.active.take() else {
             if !restart_same {
-                // Put next back where it came from if we can.
                 self.push_front_next(next);
             }
             return;
@@ -2673,8 +2615,6 @@ impl Engine {
             self.active_navigation_trace = Some(trace.active);
         }
 
-        // RestartCurrent: both decks share one permit; tag so drop_prev won't
-        // treat prev as an extra slot. push_history on drop still OK (replace).
         let _ = same_track;
     }
 
@@ -2694,10 +2634,6 @@ impl Engine {
         }
     }
 
-    /// Run kick/hat phase align on a worker so `begin_transition` stays RT-safe.
-    ///
-    /// On-time transitions use `prev_start = outro_start_out`. Delayed starts
-    /// fall back to an in-callback compute when the playhead disagrees.
     fn kick_phase_align_if_needed(&mut self) {
         if self.active.as_ref().is_some_and(|a| a.track.head_only)
             || self.next_track.as_ref().is_some_and(|t| t.head_only)
@@ -2785,14 +2721,8 @@ impl Engine {
                         self.next_track = Some(track);
                         self.kick_phase_align_if_needed();
                     } else if self.head_queue.len() < self.prefetch_depth() {
-                        // Labeling mode: park behind `next_track` until a
-                        // `take_next()` call (nav or natural advance) draws it
-                        // to the front.
                         self.head_queue.push_back(track);
                     } else {
-                        // Permit accounting bug: accepting this would bounce
-                        // prepares forever. Drop the buffer and keep the permit
-                        // consumed so the loader cannot spin.
                         warn!(
                             "dropping surplus prepared track '{}' (next already queued)",
                             track.path.display()
@@ -2803,11 +2733,18 @@ impl Engine {
                 Ok(LoaderMsg::Upgrade(track, provenance)) => {
                     self.apply_upgrade(track, provenance);
                 }
-                Ok(LoaderMsg::Failed { index, path, message }) => {
+                Ok(LoaderMsg::Failed { index, path, message, attempt }) => {
+                    let permit = attempt.permit();
+                    if let FailedAttempt::AfterPreview(preview) = attempt {
+                        if self.failed_preview.is_none() {
+                            self.failed_preview = Some(preview);
+                        }
+                    }
                     self.pending_events
                         .push(EngineEvent::TrackFailed { index, path, message });
-                    // Failed prep consumed a permit; allow another attempt.
-                    self.release_permit();
+                    if first_live::release_failed_permit(permit) {
+                        self.release_permit();
+                    }
                 }
                 Ok(LoaderMsg::Exhausted) => {
                     self.loader_exhausted = true;
@@ -2821,79 +2758,105 @@ impl Engine {
         }
     }
 
-    /// Swap preview samples/markers for the full first track without restarting.
+    fn target_failed(&self, samples: &Arc<Vec<f32>>) -> bool {
+        self.failed_preview
+            .as_ref()
+            .is_some_and(|failed| std::ptr::eq(failed.as_ptr(), Arc::as_ptr(samples)))
+    }
+
     fn apply_upgrade(&mut self, track: PreparedTrack, provenance: Option<FirstLiveProvenance>) {
-        if let Some(deck) = self.active.as_mut() {
-            if deck.track.path == track.path && deck.track.playlist_index == track.playlist_index {
-                // A second Upgrade is not normally emitted, but do not leave
-                // its already-retained preview to drop on this callback.
-                retire_upgrade_fade(deck.upgrade_fade.take());
-                let old_playhead = deck.playhead;
-                let preview_upgrade = deck.track.preview && !track.preview;
-                let preview_frames = deck.track.frames;
-                let playlist_index = deck.track.playlist_index;
-                let playhead = old_playhead.min(track.frames);
-                let old = std::mem::replace(&mut deck.track, track);
-                if preview_upgrade {
-                    self.render_diagnostics.preview_upgrades = self
-                        .render_diagnostics
-                        .preview_upgrades
-                        .saturating_add(1);
-                    self.render_diagnostics.last_preview_upgrade = Some(PreviewUpgrade {
-                        playlist_index,
-                        playhead: old_playhead,
-                        preview_frames,
-                        render_frame: self.render_frame,
-                        evidence: provenance.as_ref().map(|p| p.evidence),
-                    });
-                    if let Some(provenance) = provenance {
-                        self.first_live_evidence = Some(provenance.evidence);
-                        self.first_live_recipe = Some(provenance.recipe);
-                    }
-                    self.replay_upgrade_pending = false;
-                }
-                deck.playhead = playhead;
-                deck.upgrade_fade = Some(UpgradeFade { track: old, playhead: old_playhead,
-                    frames_into: 0, frames: declick_frames(self.options.output_sample_rate) });
-                // Markers / buffer changed — any in-flight align is stale.
-                self.clear_phase_align();
-                self.replan_pending_nav();
-                self.kick_phase_align_if_needed();
-                return;
+        let active_allowed = self.active.as_ref().is_some_and(|deck| {
+            first_live::upgrade_allowed(
+                deck.track.path == track.path && deck.track.playlist_index == track.playlist_index,
+                deck.track.preview,
+                deck.track.head_only,
+                self.target_failed(&deck.track.samples),
+                track.preview,
+            )
+        });
+        if active_allowed {
+            let deck = self.active.as_mut().expect("allowed active deck");
+            let old_playhead = deck.playhead;
+            let preview_frames = deck.track.frames;
+            let playlist_index = deck.track.playlist_index;
+            let playhead = old_playhead.min(track.frames);
+            let old = std::mem::replace(&mut deck.track, track);
+            self.render_diagnostics.preview_upgrades = self
+                .render_diagnostics
+                .preview_upgrades
+                .saturating_add(1);
+            self.render_diagnostics.last_preview_upgrade = Some(PreviewUpgrade {
+                playlist_index,
+                playhead: old_playhead,
+                preview_frames,
+                render_frame: self.render_frame,
+                evidence: provenance.as_ref().map(|p| p.evidence),
+            });
+            if let Some(provenance) = provenance {
+                self.first_live_evidence = Some(provenance.evidence);
+                self.first_live_recipe = Some(provenance.recipe);
             }
+            self.replay_upgrade_pending = false;
+            deck.playhead = playhead;
+            deck.upgrade_fade = Some(UpgradeFade {
+                track: old,
+                playhead: old_playhead,
+                frames_into: 0,
+                frames: declick_frames(self.options.output_sample_rate),
+            });
+            self.clear_phase_align();
+            self.replan_pending_nav();
+            self.kick_phase_align_if_needed();
+            return;
         }
-        if let Some(next) = self.next_track.as_mut() {
-            if next.path == track.path && next.playlist_index == track.playlist_index {
-                let queued_preview_upgrade = next.preview && !track.preview;
-                let old = std::mem::replace(next, track);
-                if queued_preview_upgrade {
-                    if let Some(provenance) = provenance {
-                        self.pending_first_live_provenance = Some(provenance);
-                        self.queued_first_live_upgrade_frame = Some(self.render_frame);
-                    }
-                    self.replay_upgrade_pending = false;
-                }
-                retire_prepared(old);
-                self.clear_phase_align();
-                self.replan_pending_nav();
-                self.kick_phase_align_if_needed();
-                return;
+
+        let next_allowed = self.next_track.as_ref().is_some_and(|next| {
+            first_live::upgrade_allowed(
+                next.path == track.path && next.playlist_index == track.playlist_index,
+                next.preview,
+                next.head_only,
+                self.target_failed(&next.samples),
+                track.preview,
+            )
+        });
+        if next_allowed {
+            let next = self.next_track.as_mut().expect("allowed queued track");
+            let old = std::mem::replace(next, track);
+            if let Some(provenance) = provenance {
+                self.pending_first_live_provenance = Some(provenance);
+                self.queued_first_live_upgrade_frame = Some(self.render_frame);
             }
+            self.replay_upgrade_pending = false;
+            retire_prepared(old);
+            self.clear_phase_align();
+            self.replan_pending_nav();
+            self.kick_phase_align_if_needed();
+            return;
         }
-        // Else: already left this track; drop upgrade (no permit — same slot).
+
         retire_prepared(track);
     }
 
-    fn apply_queued_first_live_upgrade(&mut self, track: PreparedTrack, provenance: FirstLiveProvenance) {
-        let Some(initial) = self.replay_initial_track.as_mut() else {
+    fn apply_queued_first_live_upgrade(
+        &mut self,
+        track: PreparedTrack,
+        provenance: FirstLiveProvenance,
+    ) {
+        let Some(initial) = self.replay_initial_track.as_ref() else {
             self.apply_upgrade(track, Some(provenance));
             return;
         };
-        if initial.path != track.path || initial.playlist_index != track.playlist_index
-            || !initial.preview || track.preview {
+        if !first_live::upgrade_allowed(
+            initial.path == track.path && initial.playlist_index == track.playlist_index,
+            initial.preview,
+            initial.head_only,
+            self.target_failed(&initial.samples),
+            track.preview,
+        ) {
             retire_prepared(track);
             return;
         }
+        let initial = self.replay_initial_track.as_mut().expect("replay initial");
         let old = std::mem::replace(initial, track);
         retire_prepared(old);
         self.pending_first_live_provenance = Some(provenance);
@@ -2901,7 +2864,6 @@ impl Engine {
         self.replay_upgrade_pending = false;
     }
 
-    /// True when the active deck has consumed its head preview and still needs Upgrade.
     fn preview_exhausted_awaiting_upgrade(&self) -> bool {
         self.active
             .as_ref()
@@ -2909,10 +2871,6 @@ impl Engine {
             .unwrap_or(false)
     }
 
-    /// Head-only labeling preview never gets an Upgrade. When its playhead
-    /// reaches the end of the (short) head window, loop back to the start
-    /// instead of falling into the Upgrade-wait or outro-transition paths,
-    /// which assume a full-length track is coming.
     fn tick_head_only(&mut self) {
         if self.future_fence.is_some() { return; }
         let Some(active) = self.active.as_ref() else {
@@ -2926,7 +2884,6 @@ impl Engine {
         }
 
         if self.loader_exhausted && self.ready_ahead() == 0 {
-            // Last track in the playlist: finish, same as a normal track running out.
             self.retire_active();
             self.drop_prev();
             self.mark_finished();
@@ -2934,9 +2891,6 @@ impl Engine {
         }
         if let Some(next) = self.next_track.as_ref() {
             if !next.head_only {
-                // Labeling mode was just turned off: hand off to the upcoming
-                // full-length track via the existing hard-jump path instead of
-                // looping a track that will never be replaced.
                 self.execute_jump(NavAction::JumpToNextIntro, None);
                 return;
             }
@@ -2949,47 +2903,54 @@ impl Engine {
         }
     }
 
-    /// Wait (or not) until Upgrade replaces an exhausted head preview.
-    ///
-    /// Realtime hosts (`set_realtime(true)`) must not sleep here — under CPU
-    /// load the full stretch can exceed the ~20s head and a sleep in the audio
-    /// callback causes underruns. They get silence until Upgrade arrives.
-    /// CPU-speed pullers (tests, offline render) keep the spin-wait so they do
-    /// not insert a gap into the rendered timeline.
+    fn end_failed_preview(&mut self) {
+        self.retire_active();
+        self.drop_prev();
+        if let Some(next) = self.take_next() {
+            self.start_first(next);
+        } else if self.loader_exhausted {
+            self.mark_finished();
+        }
+    }
+
     fn await_preview_upgrade(&mut self) {
-        if !self.preview_exhausted_awaiting_upgrade() {
-            return;
-        }
-        if !self.block_on_preview_upgrade || self.replay_upgrade_pending {
-            // Realtime: never sleep. If the loader already gave up, end the deck
-            // the same way the blocking path does; otherwise silence until Upgrade.
-            if self.loader_exhausted && !self.replay_upgrade_pending {
-                self.retire_active();
-                self.drop_prev();
-                if self.ready_ahead() == 0 {
-                    self.mark_finished();
-                }
-            }
-            return;
-        }
         loop {
-            if self.stopped || self.finished {
-                return;
-            }
-            self.drain_loader();
-            if !self.preview_exhausted_awaiting_upgrade() {
-                return;
-            }
-            // Full stretch failed or loader quit without Upgrade: end the deck.
-            if self.loader_exhausted {
-                self.retire_active();
-                self.drop_prev();
-                if self.ready_ahead() == 0 {
-                    self.mark_finished();
+            let awaiting = self.preview_exhausted_awaiting_upgrade();
+            let failed = self.active.as_ref().is_some_and(|deck| self.target_failed(&deck.track.samples));
+            match first_live::preview_wait(
+                awaiting,
+                self.stopped,
+                self.finished,
+                failed,
+                self.loader_exhausted,
+                self.replay_upgrade_pending,
+                self.block_on_preview_upgrade,
+            ) {
+                PreviewWait::Idle | PreviewWait::Yield => return,
+                PreviewWait::EndDeck => {
+                    self.end_failed_preview();
+                    return;
                 }
-                return;
+                PreviewWait::Poll => {
+                    self.drain_loader();
+                    let awaiting = self.preview_exhausted_awaiting_upgrade();
+                    let failed = self.active.as_ref().is_some_and(|deck| self.target_failed(&deck.track.samples));
+                    if matches!(
+                        first_live::preview_wait(
+                            awaiting,
+                            self.stopped,
+                            self.finished,
+                            failed,
+                            self.loader_exhausted,
+                            self.replay_upgrade_pending,
+                            self.block_on_preview_upgrade,
+                        ),
+                        PreviewWait::Poll
+                    ) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
             }
-            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -2998,6 +2959,9 @@ impl Engine {
             self.replacement_current_slot_reserved = false;
             self.release_permit();
         }
+        self.awaiting_next_at_outro = false;
+        self.outro_anchor = 0;
+        self.clear_phase_align();
         self.cancel_pending_nav();
         let path = track.path.clone();
         let index = track.playlist_index;
@@ -3046,7 +3010,6 @@ impl Engine {
         if self.next_track.is_some() {
             self.begin_transition(0);
         } else if self.loader_exhausted {
-            // Last track: play through to the buffer end.
         } else {
             self.awaiting_next_at_outro = true;
             self.outro_anchor = active.track.outro_start_out;
@@ -3064,7 +3027,6 @@ impl Engine {
         let frames_past = active.playhead.saturating_sub(self.outro_anchor);
         let bars_past = (frames_past as f64 / self.bar_frames).floor() as u32;
         let next_boundary = self.outro_anchor + bar_to_frames(bars_past + 1, self.bar_frames);
-        // Also allow starting exactly on a bar boundary.
         let this_boundary = self.outro_anchor + bar_to_frames(bars_past, self.bar_frames);
         if active.playhead != this_boundary && active.playhead < next_boundary {
             return;
@@ -3078,7 +3040,6 @@ impl Engine {
 
         let o_remaining = active.track.outro_bars.saturating_sub(bars_into);
         let next_intro = self.next_track.as_ref().map(|t| t.intro_bars).unwrap_or(0);
-        // Compact schedule needs 2·f_eff bars of outro; f_eff ≥ 1 → at least 2.
         let f_eff = {
             let from_intro = next_intro.saturating_sub(MAIN_GAP_BARS) / 2;
             let from_outro = o_remaining / 2;
@@ -3089,8 +3050,6 @@ impl Engine {
                 .max(1)
         };
         if o_remaining < 2 * f_eff {
-            // Let prev finish; start next solo when active ends.
-            self.awaiting_next_at_outro = false;
             return;
         }
 
@@ -3098,7 +3057,6 @@ impl Engine {
         self.begin_transition(bars_into);
     }
 
-    /// `bars_already_into_outro`: 0 for on-time start; >0 when delayed (O reduced).
     fn begin_transition(&mut self, bars_already_into_outro: u32) {
         self.cancel_pending_nav();
         self.poll_phase_align();
@@ -3110,11 +3068,6 @@ impl Engine {
         let plan = plan_transition(self.options.fade_bars, next.intro_bars, o);
         let nominal = next.first_downbeat_out.saturating_add(bar_to_frames(plan.skip, self.bar_frames));
         let beat_frames = self.bar_frames / f64::from(BEATS_PER_BAR);
-        // Prefer the background align when it matches this trigger playhead.
-        // Realtime hosts must not fall back to in-callback kick/hat search —
-        // that stalls the audio thread under load (noise / dropouts). Offline
-        // render keeps the sync compute for bit-stable WAVs.
-        // Manual navigation supplies its correction in a prepared plan instead.
         let (entry, prev_nudge) = match phase_align {
             Some((prev_start, entry, nudge)) if prev_start == active.playhead => (entry, nudge),
             _ if self.block_on_preview_upgrade => align_next_entry_with_phase_hypotheses(
@@ -3199,9 +3152,6 @@ impl Engine {
     }
 
     fn render_one_frame(&mut self) -> (f32, f32) {
-        // Invariant: `prev` exists only during an active transition and only
-        // while `frames_into < fade_out_end`. Any other state is stale and
-        // would replay the previous track at full gain (default envelope).
         let past_fade_out = self
             .transition
             .as_ref()
@@ -3242,9 +3192,6 @@ impl Engine {
 
         let mut mix_l = 0.0f32;
         let mut mix_r = 0.0f32;
-        // Move each deck onto its post-fade-in route over one target-tempo beat.
-        // The last handoff frame is already fully on that
-        // route, so the original `fade_in_end` boundary has no route step.
         let handoff_weight = if in_trans && !simple
             && frames_into >= handoff_start && frames_into < fade_in_end {
             Some(fade_in_gain(frames_into - handoff_start, fade_in_end - handoff_start))
@@ -3253,7 +3200,6 @@ impl Engine {
         };
 
         if let Some(deck) = self.prev.as_mut() {
-            // Prev is only reachable while in_trans && frames_into < fade_out_end.
             let gain_env = if frames_into >= fade_out_start {
                 let span = fade_out_end.saturating_sub(fade_out_start);
                 fade_out_gain(frames_into - fade_out_start, span)
@@ -3266,8 +3212,6 @@ impl Engine {
                 deck.highpass_enabled = false;
             }
 
-            // Skip the mix bus at bit-exact silence, but always drive the HPF so
-            // enabling mid-transition does not click from a cold filter state.
             if deck.playhead < deck.track.frames || deck.upgrade_fade.is_some() {
                 let (mut l, mut r) = read_deck_frame(deck);
                 let mut fl = l;
@@ -3303,12 +3247,9 @@ impl Engine {
                 let (mut l, mut r) = read_deck_frame(deck);
                 let raw_l = l;
                 let raw_r = r;
-                // Active HPF is on from transition start (incl. silent first
-                // fade-in frame), so drive it whenever enabled.
                 if deck.highpass_enabled {
                     deck.filter.process_frame(&mut l, &mut r);
                 }
-                // First fade-in frame is bit-exact 0: do not touch the mix bus.
                 if gain_env > 0.0 {
                     if let Some(w) = handoff_weight {
                         l = l * (1.0 - w) + raw_l * w;
@@ -3325,8 +3266,6 @@ impl Engine {
         if in_trans {
             let should_drop = if let Some(t) = self.transition.as_mut() {
                 t.frames_into += 1;
-                // After the final zero-gain fade-out frame (`frames_into` was
-                // `fade_out_end - 1`), drop `prev` and end the transition.
                 t.frames_into >= t.fade_out_end
             } else {
                 false
@@ -3349,7 +3288,6 @@ impl Engine {
             }
         }
 
-        // Apply to this frame before retiring its deck or clearing on Finished.
         if let Some((frame, span)) = self.resume_fade {
             let gain = fade_in_gain(frame, span);
             mix_l *= gain;
@@ -3366,7 +3304,6 @@ impl Engine {
             if self.active.is_some() {
                 self.retire_active();
             }
-            // Stale prev must never outlive the transition.
             self.drop_prev();
             self.drain_loader();
             if let Some(track) = self.take_next() {
@@ -3387,7 +3324,6 @@ impl Drop for Engine {
         let _ = self.permit_tx.try_send(());
         let _ = self.permit_tx.try_send(());
         while self.loader_rx.try_recv().is_ok() {}
-        // Same as stop(): never join on an uncancellable prepare_track.
         drop(self.loader_join.take());
     }
 }
@@ -3402,9 +3338,6 @@ fn read_track_frame(track: &PreparedTrack, playhead: u64) -> (f32, f32) {
     }
 }
 
-/// Read one deck frame. Normal decks use the exact old raw-read path. During
-/// first-live Upgrade, blend old/new pre-HPF samples and retain the old buffer
-/// until the fixed de-click span completes.
 fn read_deck_frame(deck: &mut Deck) -> (f32, f32) {
     let i = deck.playhead as usize * 2;
     if deck.upgrade_fade.is_none() {
@@ -3460,8 +3393,7 @@ fn prepared_loader_main(
 
 /// What to prepare next. `next` is polled once per loader iteration, so a
 /// host-owned queue (append/reorder/remove) can change between calls without
-/// restarting the engine. Returning `None` signals the playlist is exhausted
-/// (same effect as running out of tracks used to have: [`LoaderMsg::Exhausted`]).
+/// restarting the engine. Returning `None` signals the playlist is exhausted.
 pub trait TrackSource: Send {
     /// Next track to prepare, as `(playlist_index, path)`. `playlist_index` is
     /// surfaced verbatim in [`EngineEvent::TrackStarted`] / [`PreparedTrack`].
@@ -3469,9 +3401,6 @@ pub trait TrackSource: Send {
     fn next(&mut self) -> Option<(usize, PathBuf)>;
 }
 
-/// Default [`TrackSource`] backing [`Engine::new`]: a fixed `Vec<PathBuf>`,
-/// optionally Fisher-Yates shuffled per lap (`random`) and repeated forever
-/// (`loop_playlist`). Mirrors the old inline `loader_main` playlist loop.
 struct PlaylistSource {
     playlist: Vec<PathBuf>,
     random: bool,
@@ -3479,8 +3408,6 @@ struct PlaylistSource {
     rng: Rng,
     order: Vec<usize>,
     pos: usize,
-    /// Whether a lap has already completed (gates whether a fresh lap is
-    /// allowed when `!loop_playlist`).
     started: bool,
 }
 
@@ -3538,7 +3465,6 @@ fn loader_main_mode(
     shutdown: Arc<AtomicBool>,
     mut first_live: bool,
 ) {
-    // Fixed for the life of the loader (no live labeling switch): read once.
     let head_secs = options.head_only_secs;
 
     loop {
@@ -3546,13 +3472,6 @@ fn loader_main_mode(
             return;
         }
 
-        // Wait for a free slot (current + next bound) before decoding.
-        //
-        // Ask the source *after* the permit, not before: `wait_permit` blocks, so
-        // either order polls `next` exactly once, but polling late means a
-        // host-owned queue is read as close as possible to the moment the track is
-        // actually needed. Asking first would claim a track a whole slot early and
-        // make a reorder take one extra track (minutes) to take effect.
         if !wait_permit(&permit_rx, &shutdown) {
             return;
         }
@@ -3583,6 +3502,7 @@ fn loader_main_mode(
                         index: idx,
                         path: path.clone(),
                         message: e.to_string(),
+                        attempt: FailedAttempt::BeforeReady,
                     };
                     if !send_msg(&tx, msg, &shutdown) {
                         return;
@@ -3674,12 +3594,8 @@ pub fn prepare_track_head_only(
     Ok(track)
 }
 
-/// Seconds of *input* audio stretched before first live playback starts.
-/// Full-track Preserve stretch is ~8s on a 7–8 min FLAC; a 20s head is ~0.3s.
 const FIRST_LIVE_HEAD_SECS: f64 = 20.0;
 
-/// Decode + head stretch → Ready, then full stretch → Upgrade.
-/// Returns false if the loader should stop (shutdown / channel closed).
 fn prepare_first_live(
     options: &EngineOptions,
     path: &std::path::Path,
@@ -3696,6 +3612,7 @@ fn prepare_first_live(
                     index,
                     path: path.to_path_buf(),
                     message: e.to_string(),
+                    attempt: FailedAttempt::BeforeReady,
                 },
                 shutdown,
             );
@@ -3715,6 +3632,7 @@ fn prepare_first_live(
                         index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
+                        attempt: FailedAttempt::BeforeReady,
                     },
                     shutdown,
                 );
@@ -3722,13 +3640,12 @@ fn prepare_first_live(
         };
     let initial_analysis = FirstLivePreparation::from_analysis(&analysis);
 
-    // Head preview so audio starts before full Preserve stretch finishes.
-    // Preview holds outro at EOF so a provisional mix point cannot fire early.
     let head_frames = ((FIRST_LIVE_HEAD_SECS * f64::from(buffer.sample_rate)).round() as u64)
         .min(buffer.frames)
         .max(1);
     let has_preview = head_frames < buffer.frames;
     let mut preview_prepared_sha256 = None;
+    let mut post_preview_failure = None;
     if has_preview {
         let head = decode::AudioBuffer {
             sample_rate: buffer.sample_rate,
@@ -3738,9 +3655,11 @@ fn prepare_first_live(
         match finish_prepare(options, path, index, head, &initial_analysis, true, false) {
             Ok(preview) => {
                 preview_prepared_sha256 = Some(hash_track(&preview));
+                let failed_attempt = FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples));
                 if !send_msg(tx, LoaderMsg::Ready(preview, None), shutdown) {
                     return false;
                 }
+                post_preview_failure = Some(failed_attempt);
             }
             Err(e) => {
                 return send_msg(
@@ -3749,6 +3668,7 @@ fn prepare_first_live(
                         index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
+                        attempt: FailedAttempt::BeforeReady,
                     },
                     shutdown,
                 );
@@ -3756,10 +3676,6 @@ fn prepare_first_live(
         }
     }
 
-    // Full Upgrade must use real analysis markers. Provisional outro is often
-    // FALLBACK_BARS (64) on long tracks; real mix trigger may be 48 (e.g. IVY).
-    // Warming the cache in the background used to leave the deck on provisional
-    // markers while AnalysisPrinter already showed the correct outro_bars.
     let analysis = if used_provisional {
         match cache::get_or_analyze(path, &options.cache_dir, &buffer) {
             Ok(a) => a,
@@ -3770,6 +3686,7 @@ fn prepare_first_live(
                         index,
                         path: path.to_path_buf(),
                         message: e.to_string(),
+                        attempt: post_preview_failure.clone().unwrap_or(FailedAttempt::BeforeReady),
                     },
                     shutdown,
                 );
@@ -3779,8 +3696,6 @@ fn prepare_first_live(
         analysis
     };
 
-    // Read before `finish_prepare` moves `buffer`; used below to pick the
-    // final message variant.
     let total_frames = buffer.frames;
     let full_analysis = FirstLivePreparation::from_analysis(&analysis);
     let full = match finish_prepare(options, path, index, buffer, &full_analysis, false, false) {
@@ -3792,6 +3707,7 @@ fn prepare_first_live(
                     index,
                     path: path.to_path_buf(),
                     message: e.to_string(),
+                    attempt: post_preview_failure.clone().unwrap_or(FailedAttempt::BeforeReady),
                 },
                 shutdown,
             );
@@ -3806,7 +3722,6 @@ fn prepare_first_live(
         preparation_sha256: hash_recipe(&recipe), preview_used_provisional: used_provisional };
     let provenance = FirstLiveProvenance { evidence, recipe };
 
-    // Short file: only one Ready (no separate preview). Long file: Upgrade.
     let msg = if head_frames < total_frames {
         LoaderMsg::Upgrade(full, Some(provenance))
     } else {
@@ -3954,7 +3869,6 @@ fn finish_prepare(
     preview: bool,
     head_only: bool,
 ) -> Result<PreparedTrack> {
-    // Stretch so intro BPM lands on target_bpm. For Funkot, outro_bpm ≈ intro_bpm.
     let intro_bpm = if analysis.intro_bpm().is_finite() && analysis.intro_bpm() > 0.0 {
         analysis.intro_bpm()
     } else {
@@ -3962,10 +3876,6 @@ fn finish_prepare(
     };
     let speed = options.target_bpm() / intro_bpm;
 
-    // Take sample_rate/frames before moving `buffer.samples` so the decoded
-    // buffer can be dropped as soon as the stretch stage is done with it
-    // (see `stretch::render_track_owned`), instead of staying alive until the
-    // resample stage allocates its output.
     let sample_rate = buffer.sample_rate;
     let in_frames = buffer.frames;
 
@@ -3996,7 +3906,6 @@ fn finish_prepare(
     let mapped_outro = (analysis.outro_start as f64 * scale).round() as u64;
 
     let (first_downbeat_out, outro_start_out, outro_end_anchored_out) = if preview {
-        // Hold transitions until the full Upgrade arrives.
         let fd = mapped_fd.min(out_frames.saturating_sub(1));
         (fd, out_frames, out_frames)
     } else {
@@ -4042,8 +3951,6 @@ fn finish_prepare(
     })
 }
 
-/// Linearly fades the last `tail_frames` frames of an interleaved-stereo
-/// buffer to silence, in place. So a looped head-only preview has no seam click.
 fn fade_out_tail(samples: &mut [f32], tail_frames: usize) {
     let total_frames = samples.len() / 2;
     let tail_frames = tail_frames.min(total_frames);
@@ -4060,7 +3967,6 @@ fn declick_frames(sample_rate: u32) -> u64 {
     (HEAD_DECLICK_SECS * f64::from(sample_rate)).round().max(2.0) as u64
 }
 
-/// Start the cached one-beat raw/HPF handoff before the existing fade-in end.
 #[inline]
 fn hpf_handoff_start(fade_in_end: u64, bar_frames: f64) -> u64 {
     let beat = (bar_frames / f64::from(BEATS_PER_BAR)).round().max(1.0) as u64;
@@ -4138,8 +4044,6 @@ pub fn prepare_tracks_parallel(
         .collect()
 }
 
-/// Search radius for output-domain phase refine: stretch timing slack, but
-/// strictly less than half a beat so we never jump to the next beat.
 fn phase_search_radius_ms(beat_frames: f64, sample_rate: u32) -> f64 {
     if !(beat_frames.is_finite() && beat_frames > 0.0) || sample_rate == 0 {
         return 45.0;
@@ -4252,8 +4156,6 @@ pub fn derive_outro_start_out(
 
     let anchor_bars = OUTRO_TAIL_ANCHOR_BARS.min(outro_bars.max(1));
     let anchor_len = bar_to_frames(anchor_bars, bar_frames);
-    // Prefer the last few outro bars (sparse kick+hat). Keep the integer-bar
-    // relationship to `rough` so walking back lands on the outro start.
     let bars_to_anchor = outro_bars.saturating_sub(anchor_bars);
     let rough_tail = rough
         .saturating_add(bar_to_frames(bars_to_anchor, bar_frames))
@@ -4314,7 +4216,6 @@ fn snap_to_bar_grid(anchor: u64, target: u64, bar_frames: f64) -> u64 {
     anchor.saturating_add((bars * bar_frames).round() as u64)
 }
 
-/// Tiny xorshift64 PRNG (no extra deps), seeded from `SystemTime`.
 struct Rng {
     state: u64,
 }
@@ -4579,8 +4480,6 @@ mod tests {
         assert!(Engine::from_prepared(EngineOptions::default(), vec![mismatched]).is_err());
     }
 
-    // Private controlled decoder seam: production activation/channels/permits,
-    // synthetic PCM instead of filesystem decode.
     fn future_replacement(tracks: Vec<PreparedTrack>) -> PreparedSourceReplacement {
         let (activate, start) = mpsc::sync_channel::<EngineOptions>(1);
         let (tx, rx) = mpsc::sync_channel(1);
@@ -4628,7 +4527,6 @@ mod tests {
         let token = engine.begin_future_update().unwrap();
         drop(engine.commit_future_update(token, future_replacement(vec![future_track(2), future_track(3)])));
         wait_future(&mut engine);
-        // Polling while stopped must not consume and discard the second future.
         for _ in 0..10 {
             engine.poll_events();
             thread::sleep(Duration::from_millis(2));
@@ -4658,7 +4556,6 @@ mod tests {
             }).collect());
             let reference: Vec<_> = track.samples[6..].iter().map(|x| x * track.gain_linear).collect();
             let options = EngineOptions { output_sample_rate: sample_rate, ..EngineOptions::default() };
-            // Initial start and a redundant live resume retain the old PCM.
             let mut fresh = Engine::from_prepared(options.clone(), vec![track.clone()]).unwrap();
             assert!(fresh.resume());
             let mut first = [0.0; 2];
@@ -4671,7 +4568,6 @@ mod tests {
                 engine.render(&mut [0.0; 128]);
                 assert!(engine.finished);
                 engine.poll_events();
-                // Controlled Ready arrival: hold the channel open with no track.
                 let (ready, rx) = mpsc::sync_channel(1);
                 engine.loader_rx = rx;
                 engine.loader_exhausted = false;
@@ -4684,7 +4580,6 @@ mod tests {
                 ready.send(LoaderMsg::Ready(track.clone(), None)).unwrap();
                 let mut output = Vec::new();
                 while output.len() < reference.len() {
-                    // Repeated Play must not restart the ramp.
                     assert!(engine.resume());
                     let want = chunk.min((reference.len() - output.len()) / 2);
                     let mut audio = vec![0.0; want * 2];
@@ -4727,7 +4622,6 @@ mod tests {
         assert_eq!(engine.render(&mut first), 4);
         assert_eq!(first[0], 0.0);
         assert!(first[6] > 0.0 && first[6] < 0.5);
-        // No Ready next: actual zero output restarts the ramp, not half gain.
         let mut silence = [1.0; 4];
         assert_eq!(engine.render(&mut silence), 2);
         assert_eq!(silence, [0.0; 4]);
@@ -4747,7 +4641,7 @@ mod tests {
 
     #[test]
     fn future_commit_retires_prepared_preparing_and_old_messages_and_permits() {
-        for late in [LoaderMsg::Ready(future_track(3), None), LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "old failure".into() }, LoaderMsg::Exhausted] {
+        for late in [LoaderMsg::Ready(future_track(3), None), LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "old failure".into(), attempt: FailedAttempt::BeforeReady }, LoaderMsg::Exhausted] {
             let mut engine = future_engine(&[1, 2]);
             let (old_tx, old_rx) = mpsc::sync_channel(1);
             engine.loader_rx = old_rx;
@@ -4811,12 +4705,10 @@ mod tests {
         assert_eq!(engine.current_index(), Some(1));
         let (tx, rx) = mpsc::sync_channel(1);
         engine.loader_rx = rx;
-        tx.try_send(LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "bad".into() }).unwrap();
+        tx.try_send(LoaderMsg::Failed { index: 3, path: "same.wav".into(), message: "bad".into(), attempt: FailedAttempt::BeforeReady }).unwrap();
         engine.drain_loader();
         let token = engine.begin_future_update().unwrap();
         drop(engine.commit_future_update(token, future_replacement(vec![future_track(4)])));
-        // A failure already published before the fence remains identifiable
-        // as the old occurrence, even with the same path in the new source.
         assert!(engine.poll_events().iter().any(|e| matches!(e, EngineEvent::TrackFailed { index: 3, .. })));
     }
 
@@ -4839,7 +4731,6 @@ mod tests {
             let token = engine.begin_future_update().unwrap();
             nav.try_send(NavAction::JumpToNextIntro).unwrap();
             engine.request_nav(NavAction::JumpToNextIntro);
-            // Direct requests retain their action even with a full channel.
             for _ in 0..NAV_QUEUE_CAP { nav.try_send(NavAction::JumpToNextIntro).unwrap(); }
             engine.request_nav(NavAction::JumpToNextIntro);
             engine.render(&mut [0.0; 2]);
@@ -4939,8 +4830,6 @@ mod tests {
         .expect("prepared phase engine");
         engine.set_realtime(realtime);
         engine.active.as_mut().expect("active").playhead = 16;
-        // from_prepared schedules a phase worker. Each test controls its own
-        // receiver/result rather than racing that worker.
         engine.phase_align_ready = None;
         engine.phase_align_rx = None;
         engine
@@ -4974,8 +4863,6 @@ mod tests {
                 assert_eq!(w + (1.0 - w), 1.0);
             }
 
-            // A fade shorter than one beat uses every available frame and retains
-            // bit-exact 0/1 endpoints.
             let short_start = hpf_handoff_start(2, bar_frames);
             assert_eq!(short_start, 0);
             assert_eq!(fade_in_gain(0, 2), 0.0);
@@ -5007,6 +4894,409 @@ mod tests {
         assert_eq!((l, r), (expected, expected));
         assert!(!engine.prev.as_ref().unwrap().highpass_enabled);
         assert!(!engine.active.as_ref().unwrap().highpass_enabled);
+    }
+
+    #[test]
+    fn realtime_final_failure_of_first_preview_does_not_release_its_active_permit() {
+        let mut preview = upgrade_test_track("first-preview-permit.wav", 3, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(
+            EngineOptions::default(),
+            vec![preview.clone()],
+        ).unwrap();
+        engine.set_realtime(true);
+
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+        let (permits, permit_receiver) = mpsc::sync_channel(1);
+        engine.permit_tx = permits;
+
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+
+        assert!(permit_receiver.try_recv().is_err(),
+            "the failed full stretch shares the active preview permit");
+        assert!(engine.poll_events().iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackFailed { index, path, .. }
+                if *index == preview.playlist_index && path == &preview.path
+        )));
+    }
+
+    #[test]
+    fn realtime_final_failure_of_first_preview_advances_to_later_ready_head() {
+        let mut preview = upgrade_test_track("first-preview-eof.wav", 3, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut future = upgrade_test_track("later-ready.wav", 8, 0.5, 1.0, false);
+        future.playlist_index = 8;
+        let mut engine = Engine::from_prepared(
+            EngineOptions::default(),
+            vec![preview.clone()],
+        ).unwrap();
+        engine.set_realtime(true);
+
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+
+        let mut first = [0.0; 2];
+        assert_eq!(engine.render(&mut first), 1);
+        assert_eq!(first, [0.25; 2]);
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+
+        let mut middle = [0.0; 2];
+        assert_eq!(engine.render(&mut middle), 1);
+        assert_eq!(middle, [0.25; 2]);
+        messages.send(LoaderMsg::Ready(future.clone(), None)).unwrap();
+
+        let mut tail = [0.0; 2];
+        assert_eq!(engine.render(&mut tail), 1);
+        assert_eq!(tail, [0.25; 2],
+            "the admitted preview remains audible through EOF");
+
+        let mut after_preview = [0.0; 2];
+        assert_eq!(engine.render(&mut after_preview), 1);
+        assert_eq!(after_preview, [0.5; 2],
+            "preview EOF advances to the later Ready without waiting for a disconnected loader");
+        assert_eq!(engine.current_index(), Some(future.playlist_index));
+        assert!(!engine.loader_exhausted, "the later Ready leaves the loader connection live");
+        let events = engine.poll_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackFailed { index, path, .. }
+                if *index == preview.playlist_index && path == &preview.path
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackStarted { index, path, .. }
+                if *index == future.playlist_index && path == &future.path
+        )));
+    }
+
+    #[test]
+    fn revoked_queued_preview_then_final_failure_releases_only_one_permit() {
+        let mut preview = upgrade_test_track("revoked-preview.wav", 32, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+        let (permits, permit_receiver) = mpsc::sync_channel(2);
+        engine.permit_tx = permits;
+
+        messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
+        engine.poll_events();
+        assert_eq!(engine.ready_ahead(), 1);
+        assert_eq!(engine.revoke_next(), Some(preview.path.clone()));
+
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        engine.poll_events();
+
+        assert_eq!(permit_receiver.try_recv(), Ok(()));
+        assert!(permit_receiver.try_recv().is_err(),
+            "revoke_next already returned the preview attempt permit");
+    }
+
+    #[test]
+    fn duplicate_full_upgrade_keeps_the_first_full_pcm_and_preview_fade() {
+        let mut preview = upgrade_test_track("duplicate-upgrade.wav", 32, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut first_full = upgrade_test_track("duplicate-upgrade.wav", 32, 0.5, 1.0, false);
+        first_full.playlist_index = 7;
+        let mut duplicate_full = upgrade_test_track("duplicate-upgrade.wav", 32, 0.75, 1.0, false);
+        duplicate_full.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        messages.send(LoaderMsg::Upgrade(first_full.clone(), None)).unwrap();
+        engine.drain_loader();
+
+        let first_samples = engine.active.as_ref().unwrap().track.samples.clone();
+        let first_fade_samples = engine.active.as_ref().unwrap().upgrade_fade
+            .as_ref().expect("first upgrade creates a fade").track.samples.clone();
+        assert!(Arc::ptr_eq(&first_samples, &first_full.samples));
+        assert!(Arc::ptr_eq(&first_fade_samples, &preview.samples));
+
+        messages.send(LoaderMsg::Upgrade(duplicate_full.clone(), None)).unwrap();
+        engine.drain_loader();
+        let active = engine.active.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&active.track.samples, &first_full.samples),
+            "a duplicate full upgrade must not replace the adopted PCM");
+        assert!(Arc::ptr_eq(
+            &active.upgrade_fade.as_ref().expect("first fade remains active").track.samples,
+            &preview.samples,
+        ), "a duplicate full upgrade must not replace the retained preview fade");
+    }
+
+    #[test]
+    fn upgrade_rejects_head_only_and_preview_payloads() {
+        for (head_only, incoming_preview) in [(true, false), (false, true)] {
+            let mut preview = upgrade_test_track("guarded-upgrade.wav", 32, 0.25, 1.0, true);
+            preview.playlist_index = 7;
+            preview.head_only = head_only;
+            let mut incoming = upgrade_test_track("guarded-upgrade.wav", 32, 0.5, 1.0, incoming_preview);
+            incoming.playlist_index = 7;
+            let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+            let (messages, receiver) = mpsc::sync_channel(1);
+            engine.loader_rx = receiver;
+            messages.send(LoaderMsg::Upgrade(incoming, None)).unwrap();
+            engine.drain_loader();
+
+            let active = engine.active.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&active.track.samples, &preview.samples));
+            assert!(active.upgrade_fade.is_none());
+        }
+    }
+
+    #[test]
+    fn upgrade_ignores_wrong_occurrence_identity() {
+        for incoming in [
+            {
+                let mut track = upgrade_test_track("same-path.wav", 32, 0.5, 1.0, false);
+                track.playlist_index = 8;
+                track
+            },
+            {
+                let mut track = upgrade_test_track("other-path.wav", 32, 0.5, 1.0, false);
+                track.playlist_index = 7;
+                track
+            },
+        ] {
+            let mut preview = upgrade_test_track("same-path.wav", 32, 0.25, 1.0, true);
+            preview.playlist_index = 7;
+            let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+            let (messages, receiver) = mpsc::sync_channel(1);
+            engine.loader_rx = receiver;
+            messages.send(LoaderMsg::Upgrade(incoming, None)).unwrap();
+            engine.drain_loader();
+
+            let active = engine.active.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&active.track.samples, &preview.samples));
+            assert!(active.upgrade_fade.is_none());
+        }
+    }
+
+    #[test]
+    fn late_upgrade_after_final_preview_failure_does_not_revive_the_terminal_occurrence() {
+        let mut preview = upgrade_test_track("failed-upgrade.wav", 32, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut late_full = upgrade_test_track("failed-upgrade.wav", 32, 0.5, 1.0, false);
+        late_full.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+        let (messages, receiver) = mpsc::sync_channel(1);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        engine.drain_loader();
+        messages.send(LoaderMsg::Upgrade(late_full, None)).unwrap();
+        engine.drain_loader();
+
+        let active = engine.active.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&active.track.samples, &preview.samples),
+            "a final failure makes its preview terminal for later Upgrade messages");
+        assert!(active.upgrade_fade.is_none());
+    }
+
+    #[test]
+    fn queued_terminal_preview_retires_when_started_at_eof() {
+        let mut preview = upgrade_test_track("queued-terminal.wav", 2, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
+        engine.set_realtime(true);
+        let (messages, receiver) = mpsc::sync_channel(2);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+
+        messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
+        engine.drain_loader();
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        engine.drain_loader();
+
+        let queued = engine.take_next().expect("queued preview");
+        engine.start_first(queued);
+        let mut audible = [0.0; 4];
+        assert_eq!(engine.render(&mut audible), 2);
+        assert_eq!(audible, [0.25; 4]);
+        let mut after_eof = [1.0; 2];
+        assert_eq!(engine.render(&mut after_eof), 1);
+        assert_eq!(after_eof, [0.0; 2]);
+        assert!(!engine.is_finished());
+        assert!(engine.active.is_none());
+        assert!(Arc::ptr_eq(
+            &engine.last_track.as_ref().expect("terminal history").samples,
+            &preview.samples,
+        ));
+    }
+
+    #[test]
+    fn terminal_preview_eof_keeps_live_loader_render_contract_until_later_ready() {
+        for realtime in [false, true] {
+            for initial_frames in [2usize, 4] {
+                let mut preview = upgrade_test_track("terminal-gap-preview.wav", 2, 0.25, 1.0, true);
+                preview.playlist_index = 7;
+                let mut later = upgrade_test_track("terminal-gap-later.wav", 8, 0.5, 1.0, false);
+                later.playlist_index = 8;
+                let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
+                engine.set_realtime(realtime);
+                let (messages, receiver) = mpsc::sync_channel(2);
+                engine.loader_rx = receiver;
+                engine.loader_exhausted = false;
+
+                messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
+                messages.send(LoaderMsg::Failed {
+                    index: preview.playlist_index,
+                    path: preview.path.clone(),
+                    message: "final stretch failed".into(),
+                    attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+                })
+                    .unwrap();
+                assert!(engine.poll_events().iter().any(|event| matches!(
+                    event,
+                    EngineEvent::TrackFailed { index, path, .. }
+                        if *index == preview.playlist_index && path == &preview.path
+                )));
+
+                let before_initial_frame = engine.render_frame();
+                let mut initial = vec![1.0; initial_frames * 2];
+                assert_eq!(engine.render(&mut initial), initial_frames);
+                assert_eq!(&initial[..4], &[0.25; 4]);
+                assert!(initial[4..].iter().all(|sample| *sample == 0.0));
+                assert!(!engine.is_finished());
+                assert_eq!(engine.render_frame(), before_initial_frame + initial_frames as u64);
+
+                let before_gap_frame = engine.render_frame();
+                let mut gap = [1.0; 4];
+                assert_eq!(
+                    engine.render(&mut gap),
+                    2,
+                    "a live source must honor the full render request after terminal preview EOF (realtime={realtime}, initial_frames={initial_frames})",
+                );
+                assert_eq!(gap, [0.0; 4]);
+                assert!(!engine.is_finished());
+                assert_eq!(engine.render_frame(), before_gap_frame + 2);
+
+                messages.send(LoaderMsg::Ready(later.clone(), None)).unwrap();
+                let mut resumed = [0.0; 4];
+                assert_eq!(engine.render(&mut resumed), 2);
+                assert_eq!(engine.current_index(), Some(later.playlist_index));
+                assert!(resumed.iter().any(|sample| *sample != 0.0));
+
+                messages.send(LoaderMsg::Exhausted).unwrap();
+                let mut tail = [1.0; 32];
+                let tail_frames = engine.render(&mut tail);
+                assert!(tail_frames > 0 && tail_frames < 16);
+                assert!(engine.is_finished());
+                assert_eq!(engine.render(&mut [1.0; 2]), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_preview_survives_source_commit_and_previous_jump() {
+        let mut preview = upgrade_test_track("committed-terminal.wav", 2, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut late_full = upgrade_test_track("committed-terminal.wav", 16, 0.5, 1.0, false);
+        late_full.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![]).unwrap();
+        engine.set_realtime(true);
+        let (messages, receiver) = mpsc::sync_channel(2);
+        engine.loader_rx = receiver;
+        engine.loader_exhausted = false;
+
+        messages.send(LoaderMsg::Ready(preview.clone(), None)).unwrap();
+        engine.drain_loader();
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        engine.drain_loader();
+        let queued = engine.take_next().expect("queued preview");
+        engine.start_first(queued);
+        assert_eq!(engine.render(&mut [0.0; 4]), 2);
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        assert!(!engine.is_finished());
+        assert!(engine.active.is_none());
+
+        let token = engine.begin_future_update().expect("terminal preview no longer blocks source commit");
+        drop(engine.commit_future_update(token, future_replacement(vec![future_track(9)])));
+        wait_future(&mut engine);
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        assert_eq!(engine.current_index(), Some(9));
+
+        engine.request_nav(NavAction::JumpToPrevIntro);
+        assert_eq!(engine.current_index(), Some(preview.playlist_index));
+        engine.apply_upgrade(late_full, None);
+        let active = engine.active.as_ref().expect("previous preview restarted");
+        assert!(Arc::ptr_eq(&active.track.samples, &preview.samples));
+        assert!(active.upgrade_fade.is_none());
+    }
+
+    #[test]
+    fn ordinary_same_occurrence_failure_releases_its_own_permit_after_preview_terminal() {
+        let mut preview = upgrade_test_track("reused-occurrence.wav", 8, 0.25, 1.0, true);
+        preview.playlist_index = 7;
+        let mut engine = Engine::from_prepared(EngineOptions::default(), vec![preview.clone()]).unwrap();
+        let (messages, receiver) = mpsc::sync_channel(2);
+        engine.loader_rx = receiver;
+        let (permits, permit_receiver) = mpsc::sync_channel(1);
+        engine.permit_tx = permits;
+
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "final stretch failed".into(),
+            attempt: FailedAttempt::AfterPreview(Arc::downgrade(&preview.samples)),
+        })
+            .unwrap();
+        engine.drain_loader();
+        assert!(permit_receiver.try_recv().is_err());
+
+        messages.send(LoaderMsg::Failed {
+            index: preview.playlist_index,
+            path: preview.path.clone(),
+            message: "later ordinary prepare failed".into(),
+            attempt: FailedAttempt::BeforeReady,
+        })
+            .unwrap();
+        engine.drain_loader();
+        assert_eq!(permit_receiver.try_recv(), Ok(()));
+        assert!(permit_receiver.try_recv().is_err());
     }
 
     #[test]
@@ -5248,6 +5538,44 @@ mod tests {
     }
 
     #[test]
+    fn prepare_first_live_reports_preview_permit_transfer_only_after_ready() {
+        for (name, bars, transferred) in [("before-ready", 1, false), ("after-preview", 8, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{name}.wav"));
+            let buffer = crate::testutil::synth_track(180.0, bars, bars, bars, 8_000);
+            crate::testutil::write_wav(&path, &buffer).unwrap();
+            let cache_file = directory.path().join("cache-is-a-file");
+            std::fs::write(&cache_file, b"not a directory").unwrap();
+            let options = EngineOptions {
+                output_sample_rate: 8_000,
+                rate: 1.0,
+                cache_dir: cache_file,
+                loop_playlist: false,
+                ..EngineOptions::default()
+            };
+            let (sender, receiver) = mpsc::sync_channel(2);
+            assert!(prepare_first_live(&options, &path, 0, &sender, &AtomicBool::new(false)));
+
+            let messages: Vec<_> = receiver.try_iter().collect();
+            match (transferred, messages.as_slice()) {
+                (false, [LoaderMsg::Failed { attempt: FailedAttempt::BeforeReady, .. }]) => {}
+                (true, [
+                    LoaderMsg::Ready(preview, None),
+                    LoaderMsg::Failed {
+                        attempt: FailedAttempt::AfterPreview(failed_preview),
+                        ..
+                    },
+                ]) => {
+                    assert!(preview.preview);
+                    let failed_preview = failed_preview.upgrade().expect("sent preview remains alive");
+                    assert!(Arc::ptr_eq(&failed_preview, &preview.samples));
+                }
+                (_, other) => panic!("unexpected first-live producer messages for {name}: {}", other.len()),
+            }
+        }
+    }
+
+    #[test]
     fn recorded_first_live_recreates_the_actual_production_buffers() {
         for (name, bars, has_preview) in [("staged", 8, true), ("cached-single", 4, false)] {
             let directory = tempfile::tempdir().unwrap();
@@ -5371,8 +5699,6 @@ mod tests {
             };
             let first = read_deck_frame(&mut deck).0;
             assert_eq!(first, if old_playhead == 0 { 0.75 } else { 0.0 });
-            // Advance in deliberately irregular chunks; the fixed 10ms span,
-            // not old remaining material, controls completion.
             for chunk in [7u64, 19, span - 1 - 26] {
                 for _ in 0..chunk { let _ = read_deck_frame(&mut deck); }
             }
@@ -5513,7 +5839,6 @@ mod tests {
 
     #[test]
     fn plan_worked_examples_f4_main_gap8() {
-        // Default fade=4, MAIN_GAP_BARS=8 → compact m=16.
         let p = plan_transition(4, 64, 64);
         assert_eq!(
             p,
@@ -5550,7 +5875,6 @@ mod tests {
             }
         );
 
-        // I=O=8: fade shrinks; no room for MAIN_GAP after a real fade.
         let p = plan_transition(4, 8, 8);
         assert_eq!(
             p,
@@ -5563,7 +5887,6 @@ mod tests {
             }
         );
 
-        // Outro shorter than 2·F shrinks fade.
         let p = plan_transition(4, 64, 4);
         assert_eq!(
             p,
@@ -5588,12 +5911,10 @@ mod tests {
                     assert!(p.m <= i);
                     assert!(p.fadeout_start <= p.fadeout_end);
                     assert!(p.fadeout_end - p.fadeout_start <= p.f_eff);
-                    // Compact: never longer than 2·f_eff + MAIN_GAP.
                     assert!(
                         p.m <= 2 * p.f_eff + MAIN_GAP_BARS,
                         "m stretched I={i} O={o} F={f}: {p:?}"
                     );
-                    // Audible overlap is the fade pair only (≤ 2·f_eff).
                     assert!(p.fadeout_end <= 2 * p.f_eff);
                 }
             }
@@ -5602,7 +5923,6 @@ mod tests {
 
     #[test]
     fn fade_gains_linear_at_quarters_and_endpoints() {
-        // n-1 = 400 so quarter indices land on exact 0/0.25/0.5/0.75/1.
         let n = 401u64;
         let points = [
             (0u64, 0.0f32, 1.0f32),
@@ -5623,21 +5943,16 @@ mod tests {
                 "fade-out i={i}: got {gout} expect {expect_out}"
             );
         }
-        // Bit-exact endpoints (not merely near).
         assert_eq!(fade_in_gain(0, n), 0.0);
         assert_eq!(fade_in_gain(n - 1, n), 1.0);
         assert_eq!(fade_out_gain(0, n), 1.0);
         assert_eq!(fade_out_gain(n - 1, n), 0.0);
-        // n=0 / n=1: safe instant complete.
         assert_eq!(fade_in_gain(0, 0), 1.0);
         assert_eq!(fade_in_gain(0, 1), 1.0);
         assert_eq!(fade_out_gain(0, 0), 0.0);
         assert_eq!(fade_out_gain(0, 1), 0.0);
     }
 
-    /// Build interleaved stereo with intro kicks, a silence gap that shifts phase,
-    /// then outro kicks. Outro downbeats are deliberately off the intro bar grid.
-    /// Optional once-per-bar offbeat accent (does not change kick phase).
     fn synth_phase_shifted_middle(
         sr: u32,
         bpm: f64,
@@ -5674,7 +5989,6 @@ mod tests {
                 buf[frame] += 0.8 * env * (2.0 * PI * 60.0 * t as f32).sin();
             }
         };
-        // Once-per-bar mid accent on beat index 2 (off the downbeat).
         let add_accent = |buf: &mut [f32], start: usize| {
             let end = (start + kick_len / 2).min(buf.len());
             let tau = 0.012f64;
@@ -5775,7 +6089,6 @@ mod tests {
         );
         let prep_err =
             (prep_outro as i64 - true_outro as i64).unsigned_abs() as f64 * 1000.0 / f64::from(sr);
-        // Outro follows intro bar grid; sub-beat error vs file-end anchor can be larger.
         assert!(
             prep_err < 120.0,
             "prepare_output_markers failed: err {prep_err:.2}ms"
@@ -5871,8 +6184,6 @@ mod tests {
             assert_eq!(head_one_shot.0, 0, "{sr}Hz head entry must stay at zero");
             assert!(head_one_shot.2 > 0, "{sr}Hz head clamp must nudge prev");
 
-            // The window reduction near the next head must use the same
-            // cached causal reference prefix as a fresh one-shot filter.
             let short_frames = ((2.8 * beat).round() as usize) * 2;
             let short = &shifted[..short_frames];
             assert_eq!(
@@ -5929,7 +6240,6 @@ mod tests {
         let entry = (4.0 * beat).round() as u64;
         let prev_start = entry;
 
-        // Sub-beat late → micro-correct (~+23 ms), never a whole beat.
         let late_frames = (0.023 * f64::from(sr)).round() as i64;
         let next_late = make(late_frames);
         let aligned = align_next_entry_to_prev(&prev, prev_start, &next_late, entry, sr, beat);
@@ -5939,7 +6249,6 @@ mod tests {
             "expected ~+23ms entry shift, got {delta_ms:.2}ms (aligned={aligned} entry={entry})"
         );
 
-        // Whole-beat early: markers own bar identity — must NOT jump ±1 beat.
         let early = make(-(beat.round() as i64));
         let aligned2 = align_next_entry_to_prev(&prev, prev_start, &early, entry, sr, beat);
         let delta_beats = (aligned2 as i64 - entry as i64) as f64 / beat;
@@ -5948,14 +6257,11 @@ mod tests {
             "must not steal bar identity with ±1 beat jump, got {delta_beats:.3} beats"
         );
 
-        // Near-start nominal must not slam to 0.
         let near_start = 1_500u64;
         let aligned0 =
             align_next_entry_to_prev(&prev, near_start, &next_late, near_start, sr, beat);
         assert!(aligned0 > 0, "must not clamp entry to 0 (got {aligned0})");
 
-        // Intro-grid vs end-anchored disagreement on kick-only audio: ambiguous
-        // mod-4 must not steal a bar (SCORE_EPS keeps grid+0).
         let phase_delta = (0.08 * f64::from(sr)).round() as u64;
         let (chosen, _nudge) = align_next_entry_with_phase_hypotheses(
             &prev,
@@ -5984,8 +6290,6 @@ mod tests {
         let kick_len = ((0.06 * f64::from(sr)) as usize).max(1);
         let hat_len = ((0.025 * f64::from(sr)) as usize).max(1);
 
-        // Bar-unique groove: strong kick on beat 0, off-beat hat on beats 1+3.
-        // Plain 4-on-floor cannot resolve mod-4; this pattern can.
         let make = |phase_frames: i64| {
             let mut mono = vec![0.0f32; n];
             for b in 0..n_beats {
@@ -6029,7 +6333,6 @@ mod tests {
         let next = make(0);
         let true_entry = (8.0 * beat).round() as u64;
         let prev_start = true_entry;
-        // Markers claim an entry two beats early (wrong bar identity, downbeats OK).
         let wrong_entry = true_entry.saturating_sub((2.0 * beat).round() as u64);
         let (chosen, _) = align_next_entry_with_phase_hypotheses(
             &prev,
@@ -6057,8 +6360,6 @@ mod tests {
         let n = (f64::from(n_beats) * beat).round() as usize;
         let kick_len = ((0.06 * f64::from(sr)) as usize).max(1);
 
-        // Accent beat 0 of each bar so a ~¾-beat / wrong-beat lock scores worse
-        // than plain 4-on-the-floor (which is ambiguous under kick xcorr).
         let make = |phase_frames: i64| {
             let mut mono = vec![0.0f32; n];
             for b in 0..n_beats {
@@ -6091,8 +6392,6 @@ mod tests {
         let next = make(0);
         let entry = (8.0 * beat).round() as u64;
         let prev_start = entry;
-        // ~0.73 beat grid-later disagreement (KazuyaP-style), but both hyps see
-        // the same bar accents → scores nearly equal → must keep intro-grid.
         let delta = (0.73 * beat).round() as u64;
         let (chosen_tie, _) = align_next_entry_with_phase_hypotheses(
             &prev,
@@ -6110,7 +6409,6 @@ mod tests {
             "near-tie must keep intro-grid (not jump ~0.73 beat), got {tie_beats:.3} beats"
         );
 
-        // Next bar accents sit on the end-anchored phase: end score must win.
         let next_end = make(delta as i64);
         let (chosen_end, _) = align_next_entry_with_phase_hypotheses(
             &prev,
@@ -6134,7 +6432,6 @@ mod tests {
         let sr = 44_100u32;
         let bpm = 198.0;
         let (stereo, fd, true_outro, _bar, beat) = synth_phase_shifted_middle(sr, bpm, 4, 8, 0.0);
-        // Use outro section (steady kicks) with a deliberate 20–100 ms error.
         for &err_ms in &[20.0f64, 45.0, 80.0, 100.0] {
             let err_frames = ((err_ms / 1000.0) * f64::from(sr)).round() as i64;
             let wrong = (true_outro as i64 + err_frames).max(0) as u64;
@@ -6161,8 +6458,6 @@ mod tests {
 
     #[test]
     fn transition_trigger_not_before_analysis_outro() {
-        // Intro-grid / end-anchored phase candidates must not pull the mix
-        // trigger earlier than end − outro_bars (analysis outro start).
         let sr = 44_100u32;
         let bpm = 180.0;
         let outro_bars = 48u32;
@@ -6203,7 +6498,6 @@ mod tests {
             end_anchored >= earliest,
             "end-anchored before analysis outro: end={end_anchored} earliest={earliest}"
         );
-        // Trigger must not sit far ahead of the end-based outro either.
         let ahead = expect.saturating_sub(trigger) as f64 / bar;
         assert!(
             ahead < 1.5,
@@ -6246,7 +6540,6 @@ mod tests {
             bar,
         );
 
-        // Intro near start; outro near end − outro_bars.
         let fd_ms = fd_out as f64 * 1000.0 / f64::from(sr);
         assert!(fd_ms < 30.0, "first downbeat too late: {fd_ms:.1}ms");
         let expect_outro = out_frames.saturating_sub((f64::from(outro_bars) * bar).round() as u64);
@@ -6263,8 +6556,6 @@ mod tests {
             "end-anchored should match on fixed tempo: err={end_err_ms:.1}ms"
         );
 
-        // Outro should also be near an integer number of bars after fd at target tempo
-        // for this fixed-tempo fixture (coincidence that is correct here).
         let bars = ((outro_out - fd_out) as f64 / bar).round();
         let grid = fd_out + (bars * bar).round() as u64;
         let grid_err =
@@ -6275,9 +6566,6 @@ mod tests {
         );
     }
 
-    /// Cold-cache first-live Upgrade must not keep provisional FALLBACK outro (64)
-    /// when real analysis yields a shorter mix trigger (48). Regression for IVY:
-    /// AnalysisPrinter showed 48 while the deck still mixed at end−64.
     #[test]
     fn prepare_first_live_upgrade_uses_analyzed_outro() {
         use crate::cache::{self, provisional};
@@ -6298,7 +6586,6 @@ mod tests {
         let path = dir.join("ivy_like.wav");
 
         let sr = 44_100u32;
-        // total_bars ≥ 192 → provisional section_bars = FALLBACK (64).
         let buf = synth_track_with_options(SynthOptions {
             bpm: 180.0,
             intro_bars: 16,
@@ -6352,7 +6639,6 @@ mod tests {
                     break;
                 }
                 Ok(LoaderMsg::Ready(t, _)) => {
-                    // Short-file path (no preview): still must be analyzed.
                     upgrade_outro = Some(t.outro_bars);
                     break;
                 }
@@ -6372,7 +6658,6 @@ mod tests {
             "Upgrade must use analyzed outro, not provisional {}",
             prov.outro_bars
         );
-        // Cache must have been written by the blocking analyze before Upgrade.
         let hash = cache::content_hash(&path).expect("hash");
         assert!(cache_dir.join(format!("{hash}.json")).is_file());
 
@@ -6563,14 +6848,153 @@ mod tests {
     }
 
     #[test]
+    fn history_rollover_cancels_an_accepted_previous_navigation() {
+        let mut options = EngineOptions::default();
+        options.output_sample_rate = 44_100;
+        options.loop_playlist = false;
+        let mut engine = Engine::from_prepared(options, vec![
+            phase_test_track(0, 8, 16),
+            phase_test_track(1, 8, 16),
+            phase_test_track(2, 8, 16),
+        ]).expect("prepared history engine");
+        engine.set_realtime(true);
+        engine.bar_frames = 2.0;
+        engine.active.as_mut().expect("active").playhead = 16;
+        engine.clear_phase_align();
+        let (work_tx, work_rx) = mpsc::sync_channel(2);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(2);
+        engine.manual_tx = work_tx;
+        engine.manual_rx = reply_rx;
+
+        engine.begin_nav(NavAction::TransitionToNext);
+        let _to_b = work_rx.try_recv().expect("A to B request");
+        let start = engine.active.as_ref().expect("A active").playhead;
+        reply_tx.send(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, start, 0,
+        )).expect("B reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), Some(1));
+        engine.render(&mut [0.0; 2]);
+        assert_eq!(engine.last_track.as_ref().map(|track| track.playlist_index), Some(0));
+
+        wait_future(&mut engine);
+        assert_eq!(engine.next_track.as_ref().map(|track| track.playlist_index), Some(2));
+
+        engine.begin_nav(NavAction::TransitionToNext);
+        let _to_c = work_rx.try_recv().expect("B to C request");
+        let start = engine.active.as_ref().expect("B active").playhead;
+        reply_tx.send(controlled_manual_plan(
+            &engine, NavAction::TransitionToNext, start, 0,
+        )).expect("C reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), Some(2));
+        assert_eq!(engine.prev.as_ref().map(|deck| deck.track.playlist_index), Some(1));
+
+        let trace_rx = engine.enable_navigation_trace(8);
+        engine.begin_nav(NavAction::TransitionToPrev);
+        let previous_request = work_rx.try_recv().expect("C to A request");
+        let accepted_generation = engine.nav_gen;
+        let deadline = engine.manual_deadline.expect("accepted rewind deadline");
+        assert_eq!(previous_request.key.target_index, 0);
+
+        engine.render(&mut [0.0; 2]);
+        assert_eq!(engine.last_track.as_ref().map(|track| track.playlist_index), Some(1));
+        reply_tx.send(build_manual_plan(previous_request)).expect("stale A reply");
+        engine.poll_nav_tempo();
+        assert!(engine.pending_nav.is_none(), "the A reply must not match replacement history");
+
+        let now = engine.active.as_ref().expect("C active").playhead;
+        for _ in 0..=deadline.saturating_sub(now) {
+            engine.render(&mut [0.0; 2]);
+            if engine.transition.is_some() {
+                break;
+            }
+        }
+
+        assert!(engine.transition.is_none(), "history replacement must cancel the accepted rewind");
+        assert_eq!(engine.current_index(), Some(2));
+        assert_eq!(engine.last_track.as_ref().map(|track| track.playlist_index), Some(1));
+        let trace: Vec<_> = trace_rx.try_iter().collect();
+        assert!(trace.iter().any(|event| matches!(event,
+            NavigationTrace::Accepted { generation, action: NavAction::TransitionToPrev, target_index: 0, .. }
+                if *generation == accepted_generation
+        )));
+        assert!(!trace.iter().any(|event| matches!(event,
+            NavigationTrace::PlanApplied { generation, .. } if *generation == accepted_generation
+        )));
+    }
+
+    #[test]
+    fn history_rollover_preserves_pending_next_and_restart() {
+        for action in [NavAction::TransitionToNext, NavAction::RestartCurrent] {
+            let mut engine = phase_test_engine(true, 8, 44_100);
+            engine.push_history(phase_test_track(2, 8, 16));
+            let (tx, _rx) = mpsc::sync_channel(1);
+            engine.manual_tx = tx;
+            engine.begin_nav(action);
+            let generation = engine.nav_gen;
+            let deadline = engine.manual_deadline;
+            engine.push_history(phase_test_track(3, 8, 16));
+            assert_eq!(engine.nav_gen, generation);
+            assert_eq!(engine.manual_action, Some(action));
+            assert_eq!(engine.manual_deadline, deadline);
+        }
+    }
+
+    #[test]
+    fn rejected_manual_reply_invalidates_a_delayed_duplicate() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let active = engine.active.as_mut().expect("active");
+        active.track.outro_start_out = active.track.frames - 1;
+        let (work_tx, _work_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(2);
+        engine.manual_tx = work_tx;
+        engine.manual_rx = reply_rx;
+        let trace_rx = engine.enable_navigation_trace(8);
+        engine.begin_nav(NavAction::TransitionToNext);
+        let now = engine.active.as_ref().expect("active").playhead;
+        engine.manual_deadline = Some(now + 1);
+        let generation = engine.nav_gen;
+        let mut invalid = controlled_manual_plan(&engine, NavAction::TransitionToNext, now, 7);
+        invalid.simple = false;
+        invalid.fade_out_end = u64::MAX;
+        let before_index = engine.current_index();
+        let before_next = engine.next_track_path().map(Path::to_path_buf);
+
+        reply_tx.send(invalid.clone()).expect("first invalid reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), before_index);
+        assert_eq!(engine.next_track_path().map(Path::to_path_buf), before_next);
+
+        engine.render(&mut [0.0; 2]);
+        assert!(engine.transition.is_none(), "fixture must remain before automatic transition");
+        assert_eq!(engine.current_index(), before_index);
+        reply_tx.send(invalid).expect("delayed duplicate");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), before_index, "a rejected operation must not acquire a late fallback");
+        assert_eq!(engine.next_track_path().map(Path::to_path_buf), before_next);
+        assert!(!trace_rx.try_iter().any(|event| matches!(event,
+            NavigationTrace::PlanApplied { generation: applied, .. } if applied == generation
+        )));
+    }
+
+    #[test]
     fn active_upgrade_keeps_the_requested_next_with_a_fresh_plan() {
         let mut engine = phase_test_engine(true, 8, 44_100);
+        engine.active.as_mut().unwrap().track.preview = true;
         engine.request_nav(NavAction::TransitionToNext);
         let accepted = engine.nav_gen;
         assert_eq!(engine.manual_action, Some(NavAction::TransitionToNext));
         let mut replacement = engine.active.as_ref().unwrap().track.clone();
         replacement.samples = Arc::new(vec![0.1; replacement.samples.len()]);
+        replacement.preview = false;
+        let replacement_pcm = replacement.samples.clone();
         engine.apply_upgrade(replacement, None);
+        assert!(Arc::ptr_eq(&engine.active.as_ref().unwrap().track.samples, &replacement_pcm));
         assert_eq!(engine.manual_action, Some(NavAction::TransitionToNext));
         assert_ne!(engine.nav_gen, accepted, "a reply for the old samples stays stale");
         assert!(engine.pending_nav.is_none());
@@ -6582,11 +7006,15 @@ mod tests {
     #[test]
     fn next_upgrade_keeps_the_requested_next_with_a_fresh_plan() {
         let mut engine = phase_test_engine(true, 8, 44_100);
+        engine.next_track.as_mut().unwrap().preview = true;
         engine.request_nav(NavAction::TransitionToNext);
         let accepted = engine.nav_gen;
         let mut replacement = engine.next_track.as_ref().unwrap().clone();
         replacement.samples = Arc::new(vec![0.1; replacement.samples.len()]);
+        replacement.preview = false;
+        let replacement_pcm = replacement.samples.clone();
         engine.apply_upgrade(replacement, None);
+        assert!(Arc::ptr_eq(&engine.next_track.as_ref().unwrap().samples, &replacement_pcm));
         assert_eq!(engine.manual_action, Some(NavAction::TransitionToNext));
         assert_ne!(engine.nav_gen, accepted);
         assert!(engine.pending_nav.is_none());
@@ -6595,13 +7023,17 @@ mod tests {
     #[test]
     fn target_replacement_revocation_and_stop_invalidate_accepted_plan() {
         let mut engine = phase_test_engine(true, 8, 44_100);
+        engine.next_track.as_mut().unwrap().preview = true;
         let now = engine.active.as_ref().unwrap().playhead;
         engine.pending_nav = Some(PendingNav::Planned(controlled_manual_plan(
             &engine, NavAction::TransitionToNext, now + 4, 7)));
         let before = engine.nav_gen;
         let mut replacement = engine.next_track.as_ref().unwrap().clone();
         replacement.samples = Arc::new(vec![0.1; replacement.samples.len()]);
+        replacement.preview = false;
+        let replacement_pcm = replacement.samples.clone();
         engine.apply_upgrade(replacement, None);
+        assert!(Arc::ptr_eq(&engine.next_track.as_ref().unwrap().samples, &replacement_pcm));
         assert!(engine.pending_nav.is_none());
         assert_ne!(engine.nav_gen, before);
 
@@ -6631,6 +7063,136 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_restarts_drop_a_delayed_reply_before_the_current_reply() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let (work_tx, work_rx) = mpsc::sync_channel(2);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(2);
+        engine.manual_tx = work_tx;
+        engine.manual_rx = reply_rx;
+        let trace_rx = engine.enable_navigation_trace(8);
+
+        engine.begin_nav(NavAction::RestartCurrent);
+        let _first_request = work_rx.try_recv().expect("first restart request");
+        let now = engine.active.as_ref().expect("active").playhead;
+        let delayed = controlled_manual_plan(&engine, NavAction::RestartCurrent, now, 7);
+        let first_generation = engine.nav_gen;
+
+        engine.begin_nav(NavAction::RestartCurrent);
+        let current_generation = engine.nav_gen;
+        assert_ne!(current_generation, first_generation);
+        reply_tx.send(delayed).expect("delayed first reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        assert_eq!(engine.current_index(), Some(0));
+
+        let _second_request = work_rx.try_recv().expect("second restart request");
+        let current = controlled_manual_plan(
+            &engine,
+            NavAction::RestartCurrent,
+            engine.active.as_ref().expect("active").playhead,
+            11,
+        );
+        reply_tx.send(current).expect("current restart reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+
+        let trace: Vec<_> = trace_rx.try_iter().collect();
+        assert!(!trace.iter().any(|event| matches!(
+            event,
+            NavigationTrace::PlanApplied { generation, .. } if *generation == first_generation
+        )));
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            NavigationTrace::PlanApplied { generation, .. } if *generation == current_generation
+        )));
+    }
+
+    #[test]
+    fn manual_reply_identity_guard_rejects_replaced_pcm_without_cancellation() {
+        for replace_active in [false, true] {
+            let mut engine = phase_test_engine(true, 8, 44_100);
+            let (work_tx, work_rx) = mpsc::sync_channel(1);
+            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+            engine.manual_tx = work_tx;
+            engine.manual_rx = reply_rx;
+            let trace_rx = engine.enable_navigation_trace(8);
+
+            engine.begin_nav(NavAction::TransitionToNext);
+            let _request = work_rx.try_recv().expect("navigation request");
+            let now = engine.active.as_ref().expect("active").playhead;
+            let reply = controlled_manual_plan(&engine, NavAction::TransitionToNext, now, 7);
+            let generation = engine.nav_gen;
+            engine.manual_deadline = Some(now + 1);
+            if replace_active {
+                let active = engine.active.as_mut().expect("active");
+                active.track.samples = Arc::new(vec![0.0; active.track.samples.len()]);
+            } else {
+                let target = engine.next_track.as_mut().expect("next");
+                target.samples = Arc::new(vec![0.0; target.samples.len()]);
+            }
+
+            assert_eq!(engine.nav_gen, generation, "replacement did not cancel navigation");
+            reply_tx.send(reply).expect("identity-mismatched reply");
+            engine.poll_nav_tempo();
+            engine.tick_pending_nav();
+
+            assert_eq!(engine.current_index(), Some(0));
+            assert!(engine.next_track_path().is_some());
+            let trace: Vec<_> = trace_rx.try_iter().collect();
+            assert!(!trace.iter().any(|event| matches!(
+                event,
+                NavigationTrace::PlanApplied { generation: applied, .. } if *applied == generation
+            )));
+        }
+    }
+
+    #[test]
+    fn deadline_fallback_drops_a_stale_reply_without_a_second_transition() {
+        let mut engine = phase_test_engine(true, 8, 44_100);
+        let (work_tx, work_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        engine.manual_tx = work_tx;
+        engine.manual_rx = reply_rx;
+        let trace_rx = engine.enable_navigation_trace(8);
+
+        engine.begin_nav(NavAction::TransitionToNext);
+        let _request = work_rx.try_recv().expect("navigation request");
+        let now = engine.active.as_ref().expect("active").playhead;
+        let stale = controlled_manual_plan(&engine, NavAction::TransitionToNext, now + 8, 7);
+        let accepted_generation = engine.nav_gen;
+        engine.manual_deadline = Some(now);
+        engine.tick_pending_nav();
+        let index_after_fallback = engine.current_index();
+        let queued_after_fallback = engine.next_track_path().map(Path::to_path_buf);
+
+        reply_tx.send(stale).expect("stale reply");
+        engine.poll_nav_tempo();
+        engine.tick_pending_nav();
+        engine.render(&mut [0.0; 2]);
+
+        assert_eq!(engine.current_index(), index_after_fallback);
+        assert_eq!(
+            engine.next_track_path().map(Path::to_path_buf),
+            queued_after_fallback,
+        );
+        let trace: Vec<_> = trace_rx.try_iter().collect();
+        assert_eq!(
+            trace.iter().filter(|event| matches!(
+                event,
+                NavigationTrace::PlanApplied { generation, .. } if *generation == accepted_generation
+            )).count(),
+            1,
+        );
+        assert_eq!(
+            trace.iter().filter(|event| matches!(
+                event,
+                NavigationTrace::TransitionStarted { generation, .. } if *generation == accepted_generation
+            )).count(),
+            1,
+        );
+    }
+
+    #[test]
     fn realtime_controlled_reply_uses_corrected_entry_in_output() {
         let mut engine = phase_test_engine(true, 8, 44_100);
         let mut target = vec![0.0; 1024 * 2];
@@ -6645,5 +7207,325 @@ mod tests {
         engine.tick_pending_nav();
         assert_eq!(engine.active.as_ref().unwrap().playhead, 19);
         assert_eq!(engine.render_one_frame(), (0.25, -0.5));
+    }
+}
+
+#[cfg(test)]
+mod natural_handoff_tests {
+    use super::*;
+
+    const BAR: u64 = 4_000;
+
+    fn handoff_options() -> EngineOptions {
+        let mut options = EngineOptions::default();
+        options.output_sample_rate = 3_000;
+        options.rate = 1.0;
+        options.loop_playlist = false;
+        assert_eq!(options.bar_frames(), BAR as f64);
+        options
+    }
+
+    fn handoff_track(index: usize, body_bars: u64, outro_bars: u32) -> PreparedTrack {
+        let frames = (body_bars + u64::from(outro_bars)) * BAR;
+        PreparedTrack {
+            path: PathBuf::from(format!("natural-handoff-{index}.wav")),
+            playlist_index: index,
+            samples: Arc::new(
+                (0..frames * 2)
+                    .map(|frame| ((frame / 2 % 97) as f32 / 400.0) + 0.05)
+                    .collect(),
+            ),
+            frames,
+            first_downbeat_out: 0,
+            outro_start_out: body_bars * BAR,
+            outro_end_anchored_out: frames,
+            intro_bars: 16,
+            outro_bars,
+            gain_linear: 1.0,
+            preview: false,
+            head_only: false,
+        }
+    }
+
+    fn controlled_replacement() -> (PreparedSourceReplacement, SyncSender<LoaderMsg>) {
+        let (activate, start) = mpsc::sync_channel::<EngineOptions>(1);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (permit_tx, _permit_rx) = mpsc::sync_channel(3 + HEAD_ONLY_PREFETCH);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = thread::spawn(move || {
+            let _ = start.recv();
+        });
+        (
+            PreparedSourceReplacement {
+                activate,
+                shutdown,
+                rx,
+                permit_tx,
+                join,
+            },
+            tx,
+        )
+    }
+
+    fn engine_with_controlled_future(first: PreparedTrack) -> (Engine, SyncSender<LoaderMsg>) {
+        let mut engine = Engine::from_prepared(handoff_options(), vec![first]).unwrap();
+        engine.poll_events();
+        engine.set_realtime(true);
+        let token = engine.begin_future_update().expect("future update in track body");
+        let (replacement, messages) = controlled_replacement();
+        drop(engine.commit_future_update(token, replacement));
+        (engine, messages)
+    }
+
+    fn render_frames(engine: &mut Engine, frames: u64) {
+        let mut out = vec![0.0; 2_000];
+        let mut remaining = frames;
+        while remaining > 0 {
+            let frames_now = remaining.min(1_000) as usize;
+            assert_eq!(engine.render(&mut out[..frames_now * 2]), frames_now);
+            remaining -= frames_now as u64;
+        }
+    }
+
+    fn render_until_event(engine: &mut Engine, limit: u64) -> (u64, Vec<EngineEvent>) {
+        let mut out = [0.0; 2];
+        for frame in 1..=limit {
+            assert_eq!(engine.render(&mut out), 1);
+            let events = engine.poll_events();
+            if !events.is_empty() {
+                return (frame, events);
+            }
+        }
+        panic!("no engine event within {limit} frames");
+    }
+
+    #[test]
+    fn future_update_after_outro_starts_on_a_bar_with_remaining_material() {
+        for (release_at, expected_start, expected_fade_end) in [
+            (8 * BAR + BAR / 2, 9 * BAR, 8 * BAR),
+            (18 * BAR + BAR / 2, 19 * BAR, 4 * BAR),
+        ] {
+            for resolution in ["abort", "commit", "append"] {
+                let tracks = if resolution == "append" {
+                    vec![handoff_track(0, 8, 16)]
+                } else {
+                    vec![handoff_track(0, 8, 16), handoff_track(1, 24, 16)]
+                };
+                let mut engine = Engine::from_prepared(handoff_options(), tracks).unwrap();
+                engine.set_realtime(true);
+                engine.poll_events();
+                if resolution == "append" {
+                    render_frames(&mut engine, release_at);
+                }
+                let token = engine.begin_future_update().expect("future update accepted");
+                if resolution != "append" {
+                    render_frames(&mut engine, release_at);
+                }
+                engine.poll_events();
+                let messages = if resolution == "abort" {
+                    engine.abort_future_update(token);
+                    None
+                } else {
+                    let (replacement, messages) = controlled_replacement();
+                    drop(engine.commit_future_update(token, replacement));
+                    messages.send(LoaderMsg::Ready(handoff_track(1, 24, 16), None)).unwrap();
+                    Some(messages)
+                };
+                engine.poll_events();
+                assert_eq!(engine.ready_ahead(), 1, "{resolution}: successor ready");
+                let (frames, events) = render_until_event(&mut engine, BAR);
+                let playhead = release_at + frames - 1;
+                assert!(events.iter().any(|event| matches!(event, EngineEvent::TransitionStarted { .. })),
+                    "{resolution}: missing transition: {events:?}");
+                assert_eq!(playhead, expected_start,
+                    "{resolution}: crossfade must wait for the next outro bar line");
+                let transition = engine.transition.as_ref().expect("crossfade active");
+                assert!(!transition.simple, "{resolution}: remaining bars support the full plan");
+                assert_eq!(transition.fade_out_end, expected_fade_end,
+                    "{resolution}: plan must retain the full fade pair within the remaining outro");
+                drop(messages);
+            }
+        }
+    }
+
+    #[test]
+    fn future_update_after_outro_too_late_starts_successor_solo() {
+        for resolution in ["abort", "commit", "append"] {
+            let tracks = if resolution == "append" {
+                vec![handoff_track(0, 8, 16)]
+            } else {
+                vec![handoff_track(0, 8, 16), handoff_track(1, 24, 16)]
+            };
+            let mut engine = Engine::from_prepared(handoff_options(), tracks).unwrap();
+            engine.set_realtime(true);
+            engine.poll_events();
+            let release_at = 22 * BAR + BAR / 2;
+            if resolution == "append" {
+                render_frames(&mut engine, release_at);
+            }
+            let token = engine.begin_future_update().expect("future update accepted");
+            if resolution != "append" {
+                render_frames(&mut engine, release_at);
+            }
+            engine.poll_events();
+            let messages = if resolution == "abort" {
+                engine.abort_future_update(token);
+                None
+            } else {
+                let (replacement, messages) = controlled_replacement();
+                drop(engine.commit_future_update(token, replacement));
+                messages.send(LoaderMsg::Ready(handoff_track(1, 24, 16), None)).unwrap();
+                Some(messages)
+            };
+            engine.poll_events();
+            assert_eq!(engine.ready_ahead(), 1, "{resolution}: successor ready");
+            let (frames, events) = render_until_event(&mut engine, 2 * BAR);
+            assert_eq!(release_at + frames, 24 * BAR, "{resolution}: solo handoff at EOF");
+            assert!(events.iter().any(|event| matches!(event, EngineEvent::TrackStarted { index: 1, .. })),
+                "{resolution}: missing solo start: {events:?}");
+            assert!(!events.iter().any(|event| matches!(event, EngineEvent::TransitionStarted { .. })),
+                "{resolution}: unexpected transition: {events:?}");
+            drop(messages);
+        }
+    }
+
+    #[test]
+    fn natural_handoff_waits_for_b_own_outro_and_reports_remaining_frames() {
+        for (name, release_at, expected_remaining) in [
+            ("gap", 24 * BAR, 24 * BAR - 1),
+            ("last A frame", 24 * BAR - 1, 24 * BAR),
+        ] {
+            let (mut engine, messages) =
+                engine_with_controlled_future(handoff_track(0, 8, 16));
+
+            render_frames(&mut engine, release_at);
+            assert_eq!(
+                engine.current_index(),
+                (release_at < 24 * BAR).then_some(0),
+                "{name} release point"
+            );
+
+            messages
+                .send(LoaderMsg::Ready(handoff_track(1, 24, 16), None))
+                .expect("supply B");
+            engine.poll_events();
+            let (_, started) = render_until_event(&mut engine, 10);
+            assert!(started.iter().any(|event| matches!(
+                event,
+                EngineEvent::TrackStarted {
+                    index: 1,
+                    entry_frame_out: 0,
+                    ..
+                }
+            )), "{name}: {started:?}");
+
+            let readout = engine.frames_until_transition();
+            let b_playhead_start = engine.active.as_ref().expect("B active").playhead;
+
+            messages
+                .send(LoaderMsg::Ready(handoff_track(2, 24, 16), None))
+                .expect("supply C");
+            engine.poll_events();
+            let (frames, events) = render_until_event(&mut engine, 40 * BAR);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, EngineEvent::TransitionStarted { .. })),
+                "{name}: expected B-to-C transition, got {events:?}"
+            );
+            let b_transition_playhead = b_playhead_start + frames - 1;
+            assert_eq!(
+                b_transition_playhead,
+                24 * BAR,
+                "{name}: B-to-C transition began at B frame {b_transition_playhead}, before B's outro at {}; host readout was {readout:?}",
+                24 * BAR
+            );
+            assert_eq!(
+                readout,
+                Some(expected_remaining),
+                "{name}: the host readout is B's own remaining body"
+            );
+        }
+    }
+
+    fn engine_finishing_a_with_b_and_c() -> Engine {
+        let mut engine = Engine::from_prepared(
+            handoff_options(),
+            vec![handoff_track(0, 24, 16), handoff_track(1, 24, 16)],
+        )
+        .unwrap();
+        engine.poll_events();
+        engine.set_realtime(true);
+        engine.head_queue.push_back(handoff_track(1, 24, 16));
+        let active = engine.active.as_mut().expect("A active");
+        active.playhead = active.track.frames.saturating_sub(1);
+        engine.awaiting_next_at_outro = true;
+        engine.outro_anchor = active.track.outro_start_out;
+        engine
+    }
+
+    fn assert_new_pair_phase_result(
+        engine: &mut Engine,
+        old_phase_sender: Option<SyncSender<(u64, u64, u64)>>,
+    ) {
+        assert_eq!(engine.current_index(), Some(1));
+        assert_eq!(engine.next_track.as_ref().map(|track| track.playlist_index), Some(1));
+        if let Some(sender) = old_phase_sender {
+            assert!(
+                matches!(sender.try_send((0, 7, 0)), Err(TrySendError::Disconnected(_))),
+                "A-to-B receiver survived B start"
+            );
+        }
+
+        assert!(engine.phase_align_ready.is_none(), "old phase result survived B start");
+        assert!(engine.phase_align_rx.is_some(), "B-to-C phase worker was not scheduled");
+        let b_outro = engine.active.as_ref().expect("B active").track.outro_start_out;
+        let result = loop {
+            engine.poll_phase_align();
+            if let Some(result) = engine.phase_align_ready {
+                break result;
+            }
+            assert!(engine.phase_align_rx.is_some(), "B-to-C phase worker disconnected");
+            thread::yield_now();
+        };
+        assert_eq!(result.0, b_outro, "B-to-C worker must use B's outro");
+        assert_ne!(result.1, 7, "old A-to-B correction must not be reused");
+
+        engine.active.as_mut().expect("B active").playhead = b_outro;
+        engine.begin_transition(0);
+
+        assert_eq!(engine.current_index(), Some(1));
+        assert_eq!(
+            engine.active.as_ref().expect("C active").playhead,
+            result.1,
+            "B-to-C adopted its worker correction"
+        );
+        assert!(engine.poll_events().iter().any(|event| matches!(
+            event,
+            EngineEvent::TransitionStarted {
+                entry_frame_out,
+                ..
+            } if *entry_frame_out == result.1
+        )));
+    }
+
+    #[test]
+    fn natural_handoff_discards_a_ready_phase_result_before_starting_b_to_c() {
+        let mut engine = engine_finishing_a_with_b_and_c();
+        let b_outro = engine.next_track.as_ref().expect("B queued").outro_start_out;
+        engine.phase_align_ready = Some((b_outro, 7, 0));
+
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        assert_new_pair_phase_result(&mut engine, None);
+    }
+
+    #[test]
+    fn natural_handoff_discards_an_in_flight_phase_receiver_before_starting_b_to_c() {
+        let mut engine = engine_finishing_a_with_b_and_c();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        engine.phase_align_rx = Some(receiver);
+
+        assert_eq!(engine.render(&mut [0.0; 2]), 1);
+        assert_new_pair_phase_result(&mut engine, Some(sender));
     }
 }

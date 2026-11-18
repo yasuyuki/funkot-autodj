@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
-# Prep unsupported audio into testdata/, then run funkot-cli.
-# Usage: ./work.sh [-w|--wsl] <music-dir> [funkot-autodj args...]
-#        ./work.sh --self-check
-# If -l/--list is omitted, builds testdata/work_playlist.txt (basename sort)
-# from supported files in music-dir plus converted FLAC in testdata/.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 TESTDATA="$ROOT/testdata"
 WSL=0
 
-# Supported by symphonia (see README). Exts lowercased.
 is_supported() {
   case "$1" in
     mp3|m4a|aac|flac|ogg|oga|wav) return 0 ;;
@@ -17,7 +11,6 @@ is_supported() {
   esac
 }
 
-# Known audio exts we might convert. Anything else is ignored.
 is_audio() {
   case "$1" in
     mp3|m4a|aac|flac|ogg|oga|wav|wma|aiff|aif|aifc|opus|ape|wv|mpc|caf|ac3|dts|tak|tta)
@@ -26,8 +19,6 @@ is_audio() {
   esac
 }
 
-# C:\Users\... or C:/Users/... → /mnt/c/Users/...
-# Prefer wslpath when present; else pure bash.
 win_to_wsl() {
   local p="$1"
   if command -v wslpath >/dev/null 2>&1; then
@@ -45,7 +36,6 @@ win_to_wsl() {
   fi
 }
 
-# Bash-only transform (for --self-check; ignores wslpath).
 _win_to_wsl_bash() {
   local p="$1" drive rest
   [[ "$p" =~ ^[A-Za-z]: ]] || { printf '%s\n' "$p"; return; }
@@ -74,7 +64,6 @@ if [[ "${1:-}" == --self-check ]]; then
   has_list_arg --render out.wav && { echo "fail: false positive list"; exit 1; }
   has_list_arg -l x.txt --render out.wav || { echo "fail: missed -l"; exit 1; }
   has_list_arg --list=x.txt || { echo "fail: missed --list="; exit 1; }
-  # to_cli_path is defined below; source-style check inline:
   _p="$ROOT/testdata/x.txt"
   [[ "${_p#"$ROOT"/}" == "testdata/x.txt" ]] || { echo "fail: root strip"; exit 1; }
   echo ok
@@ -124,7 +113,6 @@ for f in "$DIR"/*; do
   TRACKS+=("$out")
 done
 
-# Paths the CLI sees inside Docker (/work = repo). Host $ROOT/... → relative.
 to_cli_path() {
   local p="$1"
   if [[ "$p" == "$ROOT"/* ]]; then
@@ -134,8 +122,6 @@ to_cli_path() {
   fi
 }
 
-# Optional: rewrite Windows-looking remaining args when -w is on.
-# Also strip $ROOT/ so -l/--cache-dir/etc. work under Docker /work.
 ARGS=()
 for a in "$@"; do
   if [[ "$WSL" -eq 1 && "$a" =~ ^[A-Za-z]: ]]; then
@@ -145,7 +131,6 @@ for a in "$@"; do
 done
 
 if ! has_list_arg "${ARGS[@]}"; then
-  # Repo-relative: container WORKDIR is /work (see real_playlist.txt).
   PL_REL="testdata/work_playlist.txt"
   PL="$ROOT/$PL_REL"
   : > "$PL"
@@ -158,8 +143,6 @@ if ! has_list_arg "${ARGS[@]}"; then
   ARGS=("-l" "$PL_REL" "${ARGS[@]}")
 fi
 
-# Music dir is outside the repo mount; bind it at the same path for absolute
-# playlist entries (e.g. /mnt/c/Users/.../*.m4a).
 export DEV_BIND_SRC="$DIR"
 export DEV_BIND_DST="$DIR"
 exec "$ROOT/dev.sh" cargo run -p funkot-cli --release -- "${ARGS[@]}"

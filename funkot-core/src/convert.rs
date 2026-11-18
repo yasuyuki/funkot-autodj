@@ -79,19 +79,12 @@ pub fn to_flac_cached(source: &Path) -> Result<PathBuf> {
             .unwrap_or("convert"),
         std::process::id()
     ));
-    // Clear any stale leftover from a previous crashed/killed run.
     let _ = std::fs::remove_file(&tmp);
 
-    // -map 0:a:0: audio track only. Some files (e.g. FLAC/APE with an
-    // embedded cover image) carry an attached-picture video stream; letting
-    // ffmpeg mux that into the FLAC output breaks the conversion (observed:
-    // "Could not find tag for codec h264" on a FLAC with an h264 cover
-    // image). We don't need the art, so it's dropped deliberately.
-    // -map_metadata 0: keep the source's tags on the converted file.
-    // -f flac: the tmp file's name ends in `.tmp<pid>`, not `.flac` (so a
-    // stale one is unambiguously a leftover and not a real converted file);
-    // ffmpeg can't infer the container from that extension, so it's forced
-    // explicitly.
+    // -map 0:a:0: an attached cover-picture stream (e.g. h264) cannot be
+    // muxed into FLAC ("Could not find tag for codec h264"), so map audio only.
+    // -f flac: ffmpeg guesses the output container from the extension, and
+    // the `.tmp<pid>` name has none it recognizes.
     let run = Command::new("ffmpeg")
         .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(source)
@@ -129,9 +122,6 @@ pub fn to_flac_cached(source: &Path) -> Result<PathBuf> {
         )));
     }
 
-    // Write-then-rename inside the same directory: a crash or a concurrent
-    // conversion of the same file must never leave a partial FLAC sitting at
-    // `target`, or a later run would silently decode a broken file.
     std::fs::rename(&tmp, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         Error::Decode(format!(
@@ -143,7 +133,6 @@ pub fn to_flac_cached(source: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
-/// `true` if `ffmpeg` can be spawned on PATH.
 #[cfg(test)]
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
@@ -244,8 +233,6 @@ mod tests {
         let result = to_flac_cached(&source).expect("reuse existing conversion");
         assert_eq!(result, expected_target);
 
-        // Untouched: if ffmpeg had actually run, it would have overwritten
-        // (or failed to overwrite and errored) this placeholder.
         let contents = std::fs::read(&expected_target).expect("read target");
         assert_eq!(contents, placeholder);
 
@@ -362,8 +349,6 @@ mod tests {
 
         let converted = to_flac_cached(&wma).expect("convert to flac");
 
-        // Read tags with symphonia, not ffprobe (this environment's ffmpeg
-        // is a static build without ffprobe).
         let file = std::fs::File::open(&converted).expect("open converted flac");
         let mss = symphonia::core::io::MediaSourceStream::new(
             Box::new(file),
@@ -386,8 +371,6 @@ mod tests {
                     return Some(v.to_string());
                 }
             }
-            // Fall back to the raw key in case the FLAC reader doesn't map
-            // this vorbis comment to a standard tag.
             for tag in &rev.media.tags {
                 if tag.raw.key.eq_ignore_ascii_case("title") {
                     return Some(tag.raw.value.to_string());

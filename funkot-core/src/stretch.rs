@@ -224,17 +224,10 @@ fn render_preserve(
     speed: f64,
     stretch_config: Option<StretchConfig>,
 ) -> Result<Vec<f32>> {
-    // Tempo change at the input rate (pitch preserved), then rate convert.
     let stretched = if (speed - 1.0).abs() < 1e-12 {
         samples.into_owned()
     } else {
         let stretched = time_stretch(&samples, in_rate, speed, stretch_config)?;
-        // Release the pre-stretch buffer now that `time_stretch` has produced
-        // its own (separately allocated) output, instead of holding it alive
-        // until `resample_fixed_rates` below allocates its output. When
-        // `samples` owns the decoded track (Cow::Owned), this is what keeps
-        // peak memory to two live whole-track buffers instead of three; for a
-        // borrowed slice this only drops the reference.
         drop(samples);
         stretched
     };
@@ -252,13 +245,10 @@ fn render_shift(
     out_rate: u32,
     speed: f64,
 ) -> Result<Vec<f32>> {
-    // Combined ratio: out_rate / (in_rate * speed).
     let ratio = f64::from(out_rate) / (f64::from(in_rate) * speed);
     resample_ratio(samples, ratio)
 }
 
-/// Pitch-preserving tempo change via signalsmith-stretch `exact`.
-/// Output length in frames is `round(input_frames / speed)`.
 fn time_stretch(
     samples: &[f32],
     in_rate: u32,
@@ -280,7 +270,6 @@ fn time_stretch(
         }
     };
 
-    // Transpose factor 1.0 (default): tempo changes, pitch stays.
     let ok = stretch.exact(samples, &mut output);
     if !ok {
         return Err(Error::Stretch(
@@ -295,7 +284,6 @@ fn time_stretch(
     Ok(output)
 }
 
-/// High-quality fixed-ratio resample between integer sample rates (rubato FFT).
 fn resample_fixed_rates(samples: &[f32], in_rate: u32, out_rate: u32) -> Result<Vec<f32>> {
     let in_frames = samples.len() / 2;
     let mut resampler = Fft::<f32>::new(
@@ -315,7 +303,6 @@ fn resample_fixed_rates(samples: &[f32], in_rate: u32, out_rate: u32) -> Result<
     Ok(output.take_data())
 }
 
-/// Arbitrary-ratio resample (used for [`PitchMode::Shift`] combined speed+rate).
 fn resample_ratio(samples: Cow<'_, [f32]>, ratio: f64) -> Result<Vec<f32>> {
     if !(ratio.is_finite() && ratio > 0.0) {
         return Err(Error::Stretch(format!("invalid resample ratio: {ratio}")));
@@ -410,7 +397,6 @@ mod tests {
         let (block, interval) = StretchConfig::official_default()
             .to_samples(44_100)
             .expect("samples");
-        // C++: (int)(44100 * 0.12), (int)(44100 * 0.03)
         assert_eq!(block, 5292);
         assert_eq!(interval, 1323);
     }

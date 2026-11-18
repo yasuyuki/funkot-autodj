@@ -34,7 +34,6 @@ pub fn plan_transition(fade_bars: u32, intro_bars: u32, outro_bars: u32) -> Tran
     let i = intro_bars;
     let o = outro_bars;
 
-    // Need 2·F bars of outro (fade-in+out) and F+(F)+MAIN_GAP of intro.
     let f_eff = {
         let from_intro = i.saturating_sub(MAIN_GAP_BARS) / 2;
         let from_outro = o / 2;
@@ -44,8 +43,6 @@ pub fn plan_transition(fade_bars: u32, intro_bars: u32, outro_bars: u32) -> Tran
     let m = (2 * f_eff + MAIN_GAP_BARS).min(i);
     let skip = i.saturating_sub(m);
 
-    // Ideal: fade-out occupies [f_eff, 2·f_eff]. Clamp when m is short so
-    // MAIN_GAP still remains after fade-out (may yield a zero-length fade).
     let fadeout_end = (2 * f_eff).min(m.saturating_sub(MAIN_GAP_BARS)).min(o);
     let fadeout_start = fadeout_end
         .saturating_sub(f_eff)
@@ -60,29 +57,8 @@ pub fn plan_transition(fade_bars: u32, intro_bars: u32, outro_bars: u32) -> Tran
     }
 }
 
-/// Bars before the structural outro boundary that the mix trigger sits at.
-///
-/// With the default four-bar fade pair and eight-bar solo gap, the nominal
-/// transition occupies this lead. Shortened or differently configured fades
-/// need not finish at the structural boundary.
 pub(crate) const OUTRO_LEAD_BARS: u32 = 16;
 
-/// Where the transition starts, given the structural boundary: one fixed
-/// rule, applied to every track.
-///
-/// It used to be conditional — the lead was dropped when the outro analysis
-/// window was too short to also cover it, and the result was clamped to
-/// [`crate::FALLBACK_BARS`]. Both conditions fired on real material: a track whose
-/// outro starts 64 bars from the end got trigger == boundary, so the whole
-/// transition ran *inside* the outro, which is the one place it must not
-/// (measured: 3 of the 34 masters in the working cache). Neither condition
-/// was about the trigger being right — the lead is arithmetic on the
-/// boundary, not something the analysis window has to cover.
-///
-/// Positions are measured in bars from the end. A larger trigger is earlier
-/// in playback. With a valid structural boundary, the trigger leads it by up
-/// to 16 bars without cutting into the intro. If that boundary is outside the
-/// available track body, the trigger is clipped to the intro end instead.
 pub(crate) fn outro_trigger_bars(structure_bars: u32, intro_bars: u32, track_bars: u32) -> u32 {
     let room = track_bars.saturating_sub(intro_bars);
     structure_bars
@@ -90,10 +66,6 @@ pub(crate) fn outro_trigger_bars(structure_bars: u32, intro_bars: u32, track_bar
         .min(room)
 }
 
-/// Frame ranges admitted together when one deck hands off to another.
-///
-/// A full plan must fit both the corrected overlap and its target horizon.
-/// A simple fallback instead shrinks its one shared fade to the available PCM.
 #[derive(Clone, Copy)]
 pub(crate) struct FrameAdmission {
     pub(crate) prev_start: u64,

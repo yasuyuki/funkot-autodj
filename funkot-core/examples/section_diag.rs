@@ -182,8 +182,6 @@ fn print_side(label: &str, rows: &[BarDiag], new_features: bool) {
     }
 }
 
-/// Leading `covered` bars' Stage 2 features, in the same order `structure::compute`
-/// consumed them.
 fn covered_features(rows: &[BarDiag], covered: usize) -> Vec<BarFeatures> {
     rows.iter()
         .take(covered)
@@ -191,14 +189,6 @@ fn covered_features(rows: &[BarDiag], covered: usize) -> Vec<BarFeatures> {
         .collect()
 }
 
-/// Per-dimension breakdown of the [`structure::mahalanobis_from_prefix`] model
-/// over `combined` (same 21-dim vectors, same prefix bars, same variance
-/// floor). `prefix_mean`/`prefix_var` are the population mean/variance over
-/// the first `DEFAULT_PREFIX_BARS` bars; `floored` marks dimensions where the
-/// raw variance was below the `1e-6` floor `mahalanobis_from_prefix` applies;
-/// `mean_share` is each dimension's average share of `diff^2/var` across all
-/// covered bars (each bar's 21 shares sum to 1, then averaged over bars — so
-/// the printed column also sums to ~1.0). Sorted by `mean_share` descending.
 fn print_dim_breakdown(label: &str, combined: &[Vec<f64>]) {
     const DIM_NAMES: [&str; 21] = [
         "band_db[0]",
@@ -253,9 +243,6 @@ fn print_dim_breakdown(label: &str, combined: &[Vec<f64>]) {
     }
     let var: Vec<f64> = raw_var.iter().map(|v| v.max(1e-6)).collect();
 
-    // mean_share: per-bar diff^2/var normalized to sum 1 across dims, then
-    // averaged over all covered bars — same `s = diff^2 / var` term
-    // `mahalanobis_from_prefix` sums before its final `/dim` + `sqrt`.
     let mut share_sum = vec![0.0f64; dim];
     for f in combined {
         let mut terms = vec![0.0f64; dim];

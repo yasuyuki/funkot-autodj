@@ -104,10 +104,10 @@ pub fn checkerboard_novelty(ssm: &[Vec<f64>], half_width: usize) -> Vec<f64> {
         let mut score = 0.0f64;
         for di in 0..half_width {
             for dj in 0..half_width {
-                score += ssm[i - 1 - di][i - 1 - dj]; // before-before
-                score += ssm[i + di][i + dj]; // after-after
-                score -= ssm[i - 1 - di][i + dj]; // before-after
-                score -= ssm[i + di][i - 1 - dj]; // after-before
+                score += ssm[i - 1 - di][i - 1 - dj];
+                score += ssm[i + di][i + dj];
+                score -= ssm[i - 1 - di][i + dj];
+                score -= ssm[i + di][i - 1 - dj];
             }
         }
         novelty[i] = score / (half_width * half_width) as f64;
@@ -163,8 +163,6 @@ pub fn mahalanobis_from_prefix(feats: &[Vec<f64>], prefix_len: usize) -> Vec<f64
         }
     }
     for v in &mut var {
-        // Floor variance so a constant prefix dimension does not produce a
-        // divide-by-near-zero blowup on the first bar that differs at all.
         *v = (*v / p as f64).max(1e-6);
     }
 
@@ -201,10 +199,7 @@ fn rhythm_vectors(feats: &[BarFeatures]) -> Vec<Vec<f64>> {
 }
 
 /// The exact 21-dim vector (7-band log energy + 12-bin chroma + tonality +
-/// voiced_frac) [`compute`] hands to [`mahalanobis_from_prefix`]. `pub` only
-/// so diagnostics (`examples/section_diag.rs`) can report a per-dimension
-/// breakdown of the prefix model without duplicating this layout; `compute`
-/// and `mahalanobis_from_prefix` themselves are unaffected by this being `pub`.
+/// voiced_frac) [`compute`] hands to [`mahalanobis_from_prefix`].
 pub fn combined_vectors(feats: &[BarFeatures]) -> Vec<Vec<f64>> {
     feats
         .iter()
@@ -275,9 +270,6 @@ mod tests {
         assert_eq!(cosine(&a, &b), 0.0);
     }
 
-    /// 32 bars: first half is one repeated feature vector, second half is a
-    /// different repeated feature vector. Novelty must peak at the boundary
-    /// (index 16), not just be "large in the second half" or similar.
     #[test]
     fn checkerboard_novelty_peaks_at_content_boundary() {
         let n = 32;
@@ -302,8 +294,6 @@ mod tests {
             (peak_idx as i64 - boundary as i64).abs() <= 1,
             "novelty peak at {peak_idx}, expected near {boundary}"
         );
-        // Comfortably above the flat interior (which should be ~0: no
-        // change within either half).
         assert!(peak_val > 1.0, "peak novelty {peak_val} too weak");
         assert!(
             novelty[4].abs() < 1e-9,
@@ -312,14 +302,6 @@ mod tests {
         );
     }
 
-    /// End-to-end (audio -> [`crate::features::bar_features`] -> chroma SSM
-    /// novelty) check that a within-band pitch change is actually caught.
-    /// The Stage-2 handoff report noted the `testutil` synth fixture's
-    /// "melody" sits at 2500 Hz, above the chroma band's 2000 Hz ceiling, so
-    /// nothing in the existing test suite exercised chroma across a real
-    /// boundary. This builds its own two-tone buffer (A4=440Hz, both bars,
-    /// pitch class 9, then E5=659.25Hz, pitch class 4 — both comfortably
-    /// inside 100-2000Hz) without touching `testutil`.
     #[test]
     fn chroma_novelty_catches_a_within_band_pitch_boundary() {
         use crate::decode::AudioBuffer;
@@ -328,10 +310,10 @@ mod tests {
 
         const SR: u32 = 44_100;
         const BARS_EACH: usize = 12;
-        const FREQ_A: f32 = 440.0; // A4 -> pitch class 9
-        const FREQ_B: f32 = 659.25; // E5 -> pitch class 4
+        const FREQ_A: f32 = 440.0;
+        const FREQ_B: f32 = 659.25;
 
-        let bar_frames = SR as usize; // 1s "bars", plenty of STFT frames each
+        let bar_frames = SR as usize;
         let total_bars = BARS_EACH * 2;
         let n = bar_frames * total_bars;
         let mut mono = Vec::with_capacity(n);
@@ -383,11 +365,6 @@ mod tests {
         );
     }
 
-    /// Novelty must NOT depend on the sequence getting "bigger" or
-    /// "smaller" overall — only on content changing. A boundary where the
-    /// second half is simply a scaled-down copy of the same direction
-    /// should show near-zero cosine-SSM novelty (same content, different
-    /// level), unlike a level-based detector.
     #[test]
     fn checkerboard_novelty_is_level_invariant() {
         let n = 32;
@@ -409,7 +386,6 @@ mod tests {
     #[test]
     fn loop_similarity_high_for_repeating_pattern_low_for_changing() {
         let n = 16;
-        // Same 1-bar rhythm pattern every bar (period 1) -> lag-1 similarity ~1.
         let repeating: Vec<Vec<f64>> = (0..n).map(|_| vec![0.3, 1.0]).collect();
         let changing: Vec<Vec<f64>> = (0..n)
             .map(|i| vec![(i as f64 * 0.37).sin(), (i as f64 * 1.91).cos()])

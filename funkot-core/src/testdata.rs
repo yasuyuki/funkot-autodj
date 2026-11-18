@@ -19,12 +19,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Container extensions probed by [`track`], in order.
 const EXTENSIONS: [&str; 3] = ["flac", "m4a", "alac"];
 
-/// Depth limit for the recursive scan. The library nests one or two levels
-/// (label / album / track); this is slack, not a real constraint. It exists so
-/// pointing `FUNKOT_TESTDATA_DIR` at a wrong, huge root fails fast.
 const MAX_SCAN_DEPTH: usize = 4;
 
 /// Directory holding the real-audio test set. May not exist.
@@ -66,11 +62,6 @@ pub fn track(name: &str) -> Option<PathBuf> {
         .cloned()
 }
 
-/// File name → path for every audio file under [`dir`], built on first use.
-///
-/// Later duplicates lose: with two copies of a master in the library, the one
-/// found first wins and stays the answer for the whole process, so a run cannot
-/// silently key half its work to one copy and half to the other.
 fn index() -> &'static HashMap<String, PathBuf> {
     static INDEX: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
     INDEX.get_or_init(|| {
@@ -119,10 +110,6 @@ pub fn local_dir() -> PathBuf {
         .join("testdata")
 }
 
-/// Drop a trailing container extension, and only that.
-///
-/// Track names carry dots of their own ("03. KazuyaP - Monitoring Db"), so
-/// splitting on the last dot unconditionally would eat part of the title.
 fn strip_container_extension(name: &str) -> &str {
     match name.rsplit_once('.') {
         Some((stem, ext)) if EXTENSIONS.contains(&ext) => stem,
@@ -139,7 +126,6 @@ mod tests {
         assert_eq!(strip_container_extension("IVY.flac"), "IVY");
         assert_eq!(strip_container_extension("IVY.m4a"), "IVY");
         assert_eq!(strip_container_extension("IVY"), "IVY");
-        // A dotted title must survive intact, both with and without a container.
         assert_eq!(
             strip_container_extension("03. KazuyaP - Monitoring Db"),
             "03. KazuyaP - Monitoring Db"
@@ -148,7 +134,6 @@ mod tests {
             strip_container_extension("03. KazuyaP - Monitoring Db.flac"),
             "03. KazuyaP - Monitoring Db"
         );
-        // Not a container we probe: leave it alone rather than guess.
         assert_eq!(strip_container_extension("labels.tsv"), "labels.tsv");
     }
 
@@ -164,7 +149,6 @@ mod tests {
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("03. Artist - Title.m4a"), b"").unwrap();
         std::fs::write(album.join("cover.jpg"), b"").unwrap();
-        // Deeper than MAX_SCAN_DEPTH: must not be indexed.
         let deep = root.join("a").join("b").join("c").join("d").join("e");
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("Too Deep.m4a"), b"").unwrap();

@@ -1,6 +1,4 @@
 #!/bin/sh
-# click_phase_diag over every track in testdata/file_list.txt (absolute paths
-# pass through, bare names are testdata/-relative). Companion to _survey.sh.
 set -eu
 cd /work
 IFS='

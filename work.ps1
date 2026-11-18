@@ -1,10 +1,3 @@
-# Prep unsupported audio into testdata/, then run funkot-autodj.exe.
-# Usage: .\work.ps1 <music-dir> [funkot-autodj args...]
-#        .\work.ps1 --self-check
-# If -l/--list is omitted, builds testdata/work_playlist.txt (basename sort)
-# from supported files in music-dir plus converted FLAC in testdata/.
-# Requires: dist/windows-x64/funkot-autodj.exe + MinGW DLLs from ./cross-build.sh
-#           (and ffmpeg on PATH for conversion).
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Testdata = Join-Path $Root 'testdata'

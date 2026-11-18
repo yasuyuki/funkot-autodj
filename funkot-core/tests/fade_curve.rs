@@ -1,6 +1,3 @@
-//! Engine-level proof that fade envelopes are linear across the full span
-//! (bit-exact 0 / 1 endpoints), and that the previous deck cannot residual-
-//! play after `fade_out_end`.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +23,6 @@ fn temp_dir(label: &str) -> PathBuf {
     p
 }
 
-/// Constant-amplitude HF tone (plus soft kicks so marker refine can lock).
 fn constant_tone_track(
     sr: u32,
     bars: u32,
@@ -70,9 +66,6 @@ fn constant_tone_track(
     }
 }
 
-/// Stereo constant tone fixture with an independently chosen frequency per
-/// channel.  This keeps the known low (196/247 Hz) and high (784/988 Hz)
-/// transition inputs distinct while avoiding marker kicks in the boundary probe.
 fn stereo_tone_track(
     sr: u32,
     bars: u32,
@@ -93,8 +86,6 @@ fn stereo_tone_track(
     funkot_core::decode::AudioBuffer { sample_rate: sr, frames: frames as u64, samples }
 }
 
-/// Stereo fixture with tone (+ soft kicks) on exactly one channel.
-/// `left_only = true` → L has content, R is silence; otherwise the reverse.
 fn channel_tone_track(
     sr: u32,
     bars: u32,
@@ -215,16 +206,6 @@ fn window_rms(mono: &[f32], center: usize, radius: usize) -> f32 {
     (e / (hi - lo) as f64).sqrt() as f32
 }
 
-/// Record every frame after the first track starts (including digital silence)
-/// so TransitionStarted aligns even when the previous track is near-silent.
-///
-/// Transition start is sample-accurate: when `TransitionStarted` appears after a
-/// multi-frame `render`, [`Engine::transition_frames_into`] recovers the offset
-/// within that chunk.
-///
-/// Callers must feed [`Engine::from_prepared`] (after `prepare_tracks_parallel`)
-/// so both decks are ready before render — same pattern as `engine.rs` tests;
-/// avoids CI flake from background-loader timing without changing mix math.
 fn render_with_transition_mark(engine: &mut Engine, chunk_frames: usize) -> (Vec<f32>, usize) {
     let mut out = Vec::new();
     let mut buf = vec![0.0f32; chunk_frames * 2];
@@ -238,8 +219,6 @@ fn render_with_transition_mark(engine: &mut Engine, chunk_frames: usize) -> (Vec
                     recording = true;
                 }
                 EngineEvent::TransitionStarted { .. } if transition_at.is_none() => {
-                    // Should have been attributed during the render below; keep
-                    // as a fallback at current write position.
                     transition_at = Some(out.len() / 2);
                 }
                 _ => {}
@@ -257,8 +236,6 @@ fn render_with_transition_mark(engine: &mut Engine, chunk_frames: usize) -> (Vec
                     recording = true;
                 }
                 EngineEvent::TransitionStarted { .. } if transition_at.is_none() => {
-                    // `frames_into` has already been advanced once per mixed
-                    // transition frame in this chunk.
                     let into = engine.transition_frames_into().unwrap_or(n as u64);
                     let into = into.min(n as u64);
                     transition_at = Some(before + n - into as usize);
@@ -301,7 +278,6 @@ fn linear_fade_full_span_constant_signal() {
 
     let sr = 44_100u32;
     let bpm = 180.0;
-    // Compact schedule: fade-out starts when fade-in / HPF switch completes.
     let intro = 32u32;
     let main = 16u32;
     let outro = 32u32;
@@ -339,13 +315,11 @@ fn linear_fade_full_span_constant_signal() {
 
     let quarters = [0.0f64, 0.25, 0.5, 0.75, 1.0];
 
-    // --- Fade-in: kick-only prev + tone next (prev RMS << next tone) ---
     write_wav(&path_a, &silent_a).expect("write a");
     write_wav(&path_b, &tone_b).expect("write b");
     seed_constant_analysis(&path_a, &cache, &silent_a, intro, main, outro, bpm);
     seed_constant_analysis(&path_b, &cache, &tone_b, intro, main, outro, bpm);
 
-    // Pre-prepare so this asserts fade math, not loader timing (see engine.rs).
     let options = EngineOptions {
         cache_dir: cache.clone(),
         ..options_base.clone()
@@ -385,7 +359,6 @@ fn linear_fade_full_span_constant_signal() {
             assert!(got > 0.82, "fade-in must reach ~1 by last frame, got {got}");
         }
         if (0.4..0.6).contains(&q) {
-            // Linear midpoint is 0.5.
             assert!(
                 got > 0.35 && got < 0.65,
                 "fade-in midpoint must be ~0.5, got {got}"
@@ -394,7 +367,6 @@ fn linear_fade_full_span_constant_signal() {
     }
     engine.stop();
 
-    // --- Fade-out: tone prev + kick-only next ---
     let cache2 = dir.join("cache2");
     write_wav(&path_a, &tone_a).expect("write a tone");
     write_wav(&path_b, &silent_b).expect("write b silent");
@@ -409,7 +381,6 @@ fn linear_fade_full_span_constant_signal() {
     let mut engine2 = Engine::from_prepared(options2, tracks2).expect("engine2");
     let (mixed2_raw, t2) = render_with_transition_mark(&mut engine2, 4096);
     let mono2 = mono_mix(&mixed2_raw);
-    // Reference after HPF has switched to prev (past fade-in) but before fade-out.
     let ref_out = window_rms(
         &mono2,
         t2 + (((plan.f_eff + plan.fadeout_start) / 2) as f64 * bar_frames).round() as usize,
@@ -444,9 +415,6 @@ fn linear_fade_full_span_constant_signal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Previous deck = L-only unique tone; next deck = R-only different tone.
-/// Proves linear fade-out shape on L, zero next contribution at first
-/// transition frame on R, and hard stop of prev after `fade_out_end`.
 #[test]
 fn prev_deck_hard_stop_no_residual_after_fade_out() {
     let dir = temp_dir("residual");
@@ -461,7 +429,6 @@ fn prev_deck_hard_stop_no_residual_after_fade_out() {
     let outro = 32u32;
     let total_bars = intro + main + outro;
 
-    // Distinguishable sources: prev L @ 2 kHz, next R @ 3.5 kHz (both above HPF).
     let prev = channel_tone_track(sr, total_bars, bpm, 2000.0, 0.55, true);
     let next = channel_tone_track(sr, total_bars, bpm, 3500.0, 0.55, false);
 
@@ -497,14 +464,12 @@ fn prev_deck_hard_stop_no_residual_after_fade_out() {
     let left = channel(&mixed, false);
     let right = channel(&mixed, true);
 
-    // At transition first frame: next-only (R) must be ~0 (fade-in gain bit-exact 0).
     let r0 = right[t_frame].abs();
     assert!(
         r0 <= 1e-6,
         "next-only channel at first transition frame must be ~0, got {r0}"
     );
 
-    // Fade-out reference: L after HPF switch, before fade-out.
     let ref_l = window_rms(
         &left,
         t_frame + (((plan.f_eff + plan.fadeout_start) / 2) as f64 * bar_frames).round() as usize,
@@ -553,7 +518,6 @@ fn prev_deck_hard_stop_no_residual_after_fade_out() {
         "next-only R must continue after fade_out_end, max|R|={max_r}"
     );
 
-    // Final fade-out frame itself must be silent on prev channel (gain bit-exact 0).
     let last_fo = t_frame + fo_end as usize - 1;
     assert!(
         left[last_fo].abs() <= RESIDUAL_EPS,
@@ -607,10 +571,6 @@ fn handoff_metrics(samples: &[f32], center: usize, span: usize) -> (f32, f32, f3
     (start, central, end, handoff_max, p99, normal_max, finite && over == 0)
 }
 
-/// The complex transition used the HPF on the opposite routes immediately on
-/// either side of `fade_in_end`.  A one-beat complementary handoff must keep
-/// its central, start, and end adjacent deltas within ordinary waveform deltas for
-/// both bass-to-treble and treble-to-bass source orders.
 #[test]
 fn hpf_route_handoff_has_no_central_step_and_is_chunk_independent() {
     let dir = temp_dir("hpf-handoff");
@@ -621,7 +581,7 @@ fn hpf_route_handoff_has_no_central_step_and_is_chunk_independent() {
     let outro = 48u32;
     let total_bars = 90u32;
     let main = total_bars - intro - outro;
-    let amp = 0.15f32; // two decks together remain below full scale.
+    let amp = 0.15f32;
     let low = stereo_tone_track(sr, total_bars, bpm, 196.0, 247.0, amp);
     let high = stereo_tone_track(sr, total_bars, bpm, 784.0, 988.0, amp);
     let low_path = dir.join("low-196.wav");
@@ -663,10 +623,6 @@ fn hpf_route_handoff_has_no_central_step_and_is_chunk_independent() {
         assert!(center > handoff_span && center + 2 < one_raw.len() / 2, "{name}: boundary in output");
         let (start, central, end, handoff_max, p99, normal_max, healthy) =
             handoff_metrics(&one_raw, center, handoff_span);
-        // Each settled Butterworth HPF component has no greater sine amplitude
-        // than its raw input.  A channel therefore changes by at most the low
-        // and high tone slopes, 2*amp/(span-1) for each blended deck, and the
-        // linear fade-in envelope change across the same frame.
         let tone_slope_bound = sine_adjacent_delta_bound(247.0, sr, amp)
             + sine_adjacent_delta_bound(988.0, sr, amp);
         let blend_slope_allowance = 4.0 * amp / (handoff_span - 1) as f32;

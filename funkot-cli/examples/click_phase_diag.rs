@@ -56,8 +56,6 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
         analysis.outro_bars,
         analysis.outro_structure_bars,
     );
-    // How far the file end sits from the intro downbeat grid: the phase the
-    // outro candidates inherit when nothing corrects them.
     let beat_i = bar_frames_for(&analysis, Side::Intro) / 4.0;
     let end_phase =
         (analysis.total_frames - analysis.first_downbeat) as f64 / beat_i % 1.0;
@@ -69,9 +67,6 @@ fn report(path: &Path, cache_dir: &Path) -> Result<(), Box<dyn std::error::Error
     println!("  file end vs intro beat grid: {end_phase:+.4} beat");
 
     for side in [Side::Intro, Side::Outro] {
-        // The grid the clicks are actually built on: for the outro that is
-        // the refined period, so `shift` keeps meaning "how far off the
-        // music's beats was the position we were about to click on".
         let grid = click_grid(&buf, &analysis, side);
         let beat = grid.bar_frames / 4.0;
         if side == Side::Outro {

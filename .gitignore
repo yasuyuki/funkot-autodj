@@ -1,27 +1,19 @@
-# Rust build artifacts
 /target/
-# Host builds need their own dir: /target is the dev container's named-volume
-# mount point and is root-owned, so host cargo cannot write there.
 /target-host/
 /target-cross/
 /dist/
 
-# Local cache and large generated audio
 /funkot-cache/
 /testdata/*
-# Format sample for funkot_core::labels; no real audio/labels, safe to commit.
 !/testdata/labels.tsv.example
 *.wav
 !funkot-core/tests/data/*.wav
-# Optional listen/debug WAVs under fixtures/ (golden.json + README are committed)
 funkot-core/tests/fixtures/*.wav
 funkot-core/tests/fixtures/.*.wav.owned
 
-# Session handoff / deferred issues (local, not for publication)
 /HANDOFF.md
 /ISSUES.md
 
-# OS / editor noise
 .DS_Store
 Thumbs.db
 .idea/

@@ -28,8 +28,6 @@ tempfile = { version = "3", default-features = false }
 
 [features]
 default = []
-## Expose [`crate::testutil`] for engine / integration tests in other crates.
-## In-crate unit tests already see it via `cfg(test)`.
 testutil = []
 
 [dev-dependencies]

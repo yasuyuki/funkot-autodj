@@ -11,7 +11,6 @@ updates:
       general-patches:
         patterns: ["*"]
         exclude-patterns: ["symphonia*", "cpal", "rubato", "signalsmith-stretch", "rustfft", "cc", "bindgen", "clang-sys", "cmake"]
-        # In particular, 0.x minor updates need their own review.
         update-types: [patch]
   - package-ecosystem: github-actions
     directory: /

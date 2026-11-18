@@ -1,12 +1,8 @@
-//! Playlist file loading (m3u-compatible: one path per line).
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-/// Load a playlist file: one path per line; blank lines and `#` comments ignored.
-/// Relative paths are resolved against the playlist file's directory.
 pub fn load_playlist_file(path: &Path) -> Result<Vec<PathBuf>> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read playlist file {}", path.display()))?;
@@ -17,7 +13,6 @@ pub fn load_playlist_file(path: &Path) -> Result<Vec<PathBuf>> {
     parse_playlist_lines(&contents, base)
 }
 
-/// Parse playlist text with relative paths resolved against `base_dir`.
 pub fn parse_playlist_lines(contents: &str, base_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = Vec::new();
     for line in contents.lines() {
@@ -37,7 +32,6 @@ pub fn parse_playlist_lines(contents: &str, base_dir: &Path) -> Result<Vec<PathB
     Ok(entries)
 }
 
-/// Fail fast if any path is missing; message lists all missing files.
 pub fn validate_paths_exist(paths: &[PathBuf]) -> Result<()> {
     let missing: Vec<&PathBuf> = paths.iter().filter(|p| !p.exists()).collect();
     if missing.is_empty() {

@@ -1,5 +1,3 @@
-//! Integration tests for the funkot-autodj CLI (container-safe: no live audio).
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,7 +38,6 @@ fn playlist_comments_blanks_and_relative_paths() {
 
     let entries = load_playlist_file(&list).expect("load");
     assert_eq!(entries.len(), 1);
-    // Relative paths are joined against the playlist directory (not canonicalized).
     assert_eq!(entries[0], sub.join("../track.wav"));
     assert!(entries[0].exists());
     assert_eq!(
@@ -90,8 +87,6 @@ fn render_two_tracks_end_to_end() {
     let out = dir.join("out.wav");
 
     let sr = 44_100u32;
-    // Keep total bars roughly constant, but shorten intro+main so that
-    // the engine reaches `outro_start` early enough for `TransitionStarted`.
     write_wav(&a, &synth_track(180.0, 8, 8, 48, sr)).expect("a");
     write_wav(&b, &synth_track(178.0, 8, 8, 48, sr)).expect("b");
     fs::write(&list, "a.wav\nb.wav\n").expect("list");
@@ -119,10 +114,6 @@ fn render_two_tracks_end_to_end() {
     assert!(out.is_file(), "out.wav missing");
     assert_held_receipt(&out);
 
-    // Prepare both tracks before CPU-speed rendering: this tests clip output,
-    // not whether a background decoder wins a wall-clock race. Streaming loader
-    // behavior is covered by the engine tests.
-    // Transition clips should be emitted automatically for `--render`.
     let transitions_dir = dir.join("out_transitions");
     let entries: Vec<_> = fs::read_dir(&transitions_dir)
         .expect("read transitions dir")
@@ -154,7 +145,6 @@ fn render_two_tracks_end_to_end() {
     let spec = reader.spec();
     assert_eq!(spec.channels, 2);
     assert_eq!(spec.sample_rate, 44_100);
-    // Default offline format is 32-bit IEEE float.
     assert_eq!(spec.bits_per_sample, 32);
     assert_eq!(spec.sample_format, hound::SampleFormat::Float);
 
@@ -411,7 +401,6 @@ fn label_sections_render_clips_writes_expected_clip_lengths() {
         .expect("spawn");
     assert!(status.success(), "exit status {status}");
 
-    // --render-clips never writes labels; it's a verification-only path.
     assert!(!labels.exists(), "render-clips must not write labels.tsv");
 
     let entries: Vec<_> = fs::read_dir(&clips_dir)
@@ -425,12 +414,6 @@ fn label_sections_render_clips_writes_expected_clip_lengths() {
         "expected one clip per intro/outro candidate"
     );
 
-    // A clip is the ±8-bar window plus however much of the track follows it,
-    // capped at `CONTINUE_AFTER_WINDOW_BARS` and truncated at the file end
-    // (label_session::render_click_clip). The fixture is 64 bars at 180 BPM,
-    // so every candidate hits the file end well before the cap: intro clips
-    // get shorter the deeper the candidate sits (less track left after it) and
-    // outro clips get longer (they start further back and all run to the end).
     let bar_secs = 60.0 / 180.0 * 4.0;
     let window_secs = 16.0 * bar_secs;
     let max_secs = f64::from(16 + CONTINUE_AFTER_WINDOW_BARS) * bar_secs;
@@ -460,8 +443,6 @@ fn label_sections_render_clips_writes_expected_clip_lengths() {
                 "{side:?} {bars} bars: {secs:.3}s runs past the {max_secs:.3}s cap"
             );
             if let Some(prev) = previous {
-                // One bar of slack: which frame the boundary lands on moves
-                // with the analyzer, the ordering does not.
                 match side {
                     Side::Intro => assert!(
                         secs <= prev + bar_secs,
@@ -479,8 +460,6 @@ fn label_sections_render_clips_writes_expected_clip_lengths() {
         }
     }
 
-    // The shallowest candidate on each side has most of the track after its
-    // window, so it is the one that proves playback really continues.
     assert!(
         duration(Side::Intro, 8) > window_secs + bar_secs,
         "intro 8 bars: clip stops at the window instead of playing on"
@@ -552,7 +531,6 @@ fn label_sections_render_clips_skips_already_labeled_tracks() {
 }
 
 fn write_minimal_wav(path: &Path) {
-    // Tiny valid WAV so path existence checks pass; render tests use synth tracks.
     write_wav(path, &synth_track(180.0, 1, 1, 1, 8_000)).expect("minimal wav");
 }
 

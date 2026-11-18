@@ -1,6 +1,7 @@
 # 開発指針と確認手順
 
-遷移計画、marker、補正entry、手動・自動採用、または `verification/` を変更するときは、
+遷移計画、marker、補正entry、手動・自動採用、loader・先頭プレビュー、または
+`verification/` を変更するときは、
 [形式検証skill](verification/SKILL.md)を読み、製品ソースとの同期と負例検出を確認する。
 
 この文書を、変更時に必要な開発上の判断と検証の入口にする。製品仕様と利用方法は

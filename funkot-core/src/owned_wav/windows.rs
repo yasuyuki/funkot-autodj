@@ -114,8 +114,6 @@ fn relative_options(parent: &File, name: &str, access: u32, sharing: u32, dispos
 fn chain(path: &Path) -> io::Result<Vec<File>> {
     let path = normal_path(path)?; let mut parts = path.components();
     let mut root = PathBuf::from(parts.next().unwrap().as_os_str()); root.push(parts.next().unwrap().as_os_str());
-    // The only absolute open is a validated local drive root, without user path
-    // components. Every descendant is opened using the preceding handle.
     let mut files = vec![OpenOptions::new().read(true).share_mode(3).custom_flags(0x02200000).open(root)?];
     id(&files[0])?;
     for part in parts {
@@ -379,7 +377,7 @@ mod tests {
         let mut c = claim(&receipt); c.state = "pending".into(); c.accepted_proof = Some("accepted".into()); c.released_proof = Some("released".into());
         c.result = Some(DELETE_INTENT.into()); fs::write(&receipt, serde_json::to_vec(&c).unwrap()).unwrap();
         let file = OpenOptions::new().access_mode(0x80010000).share_mode(1).open(&output).unwrap();
-        delete(&file).unwrap(); drop(file); // Crash boundary: no reclaimed receipt saved.
+        delete(&file).unwrap(); drop(file);
         co.open(SystemTime::now()); assert_eq!(claim(&receipt).state, "reclaimed");
         assert_eq!(claim(&receipt).identity, c.identity);
         fs::write(&output, b"new generation").unwrap();
@@ -442,7 +440,6 @@ mod tests {
             .arg(dir.to_string_lossy().replace('/', "\\")).output().unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         assert!(Directory::open(&link, &co.repo).is_err());
-        // Remove only the junction itself; never recurse into its target.
         fs::remove_dir(link).unwrap();
     }
     #[test]
@@ -634,7 +631,7 @@ assert str(pathlib.Path(args['--receipt']).resolve())==args['--receipt']
             let busy = OpenOptions::new().write(true).open(&output).unwrap();
             assert!(complete(&output, &generation, Some(&receipt), "accepted", "released").is_err());
             assert_eq!(claim(&receipt).state, "pending"); drop(busy);
-            co.open(SystemTime::now()); // Context startup retry uses receipt role too.
+            co.open(SystemTime::now());
             assert_eq!(claim(&receipt).state, "reclaimed"); assert!(!output.exists());
             assert!(!dir.join(".Long Owned Output.wav.owned").exists());
             complete(&output, &generation, Some(&receipt), "accepted", "released").unwrap(); return;

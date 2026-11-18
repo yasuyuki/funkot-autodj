@@ -1,37 +1,14 @@
-//! Stage 2 spectral feature frontend (diagnostic only — not read by [`crate::analysis::analyze`]).
-//!
-//! `analysis.rs`'s current `BarFeat` (RMS / mid-band energy / HF energy /
-//! mid-high ratio / a ZCR-based centroid proxy) is entirely broadband-energy:
-//! it can tell "quiet vs loud" and "dull vs bright", but nothing here
-//! measures the property that actually defines a Funkot intro/outro —
-//! *machine rhythm repeating with no melody/vocal on top*, independent of
-//! how loud or bright it is. This module adds that: per-bar chroma
-//! (pitch-class content), tonality (spectral peakiness vs noise-likeness —
-//! separates "melodic content present" from "kit only"), a voiced-frame
-//! rate (stable pitched content vs percussive-only), 7-band log energy, a
-//! 16-slot low/high onset rhythm pattern (for loop-similarity), and
-//! bar-aggregated onset density (reusing [`crate::analysis::onset_envelope`]).
+//! Per-bar spectral features (diagnostic only — not read by [`crate::analysis::analyze`]).
 //!
 //! [`crate::structure`] turns a sequence of [`BarFeatures`] into
-//! change-point / repetition signals (SSM novelty, loopiness, distance from
-//! an intro-prefix model). None of this is consumed by `analyze()` yet —
-//! that is Stage 3's job.
+//! change-point / repetition signals.
 //!
 //! # Bar grid
 //!
 //! Callers must pass the *same* `bar_starts` / `bar_len_frames` that
 //! [`crate::analysis`]'s section detector scores (see
 //! `analysis::section_bar_starts`), so the two feature frontends describe
-//! literally the same bars and can be compared side by side (see
-//! `examples/section_diag.rs --new-features`).
-//!
-//! # STFT cost
-//!
-//! [`bar_features`] runs one STFT pass (Hann, [`N_FFT`]/[`STFT_HOP`]) plus one
-//! inverse-FFT-based autocorrelation per frame over the *whole* window
-//! (head or tail, ~110 s), not per bar — bars just aggregate frames that
-//! fall inside their span. See `AGENTS.md` / the Stage 2 handoff report for
-//! measured per-track timing.
+//! literally the same bars.
 
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
@@ -55,37 +32,15 @@ pub const N_CHROMA: usize = 12;
 /// Number of 16th-note rhythm-grid slots per bar.
 pub const N_RHYTHM_SLOTS: usize = 16;
 
-/// Chroma is folded from spectral content in this band.
 const CHROMA_LO_HZ: f64 = 100.0;
 const CHROMA_HI_HZ: f64 = 2000.0;
-/// Tonality (spectral flatness) is measured in this band.
 const TONAL_LO_HZ: f64 = 200.0;
 const TONAL_HI_HZ: f64 = 2000.0;
-/// Voiced-frame f0 search range.
 const VOICED_LO_HZ: f64 = 150.0;
 const VOICED_HI_HZ: f64 = 1000.0;
-/// Normalized-autocorrelation peak (in the voiced f0 range) needed to call a
-/// frame voiced. Chosen so a pure tone (~0.9+) clears it comfortably and
-/// filtered white noise (~0.05-0.15) does not; see `tests` below.
 const VOICED_PEAK_THRESHOLD: f64 = 0.35;
-/// Frames whose total energy is below this floor (relative-silence, using
-/// the same epsilon convention as `analysis.rs`) are never counted voiced.
 const SILENCE_EPS: f64 = 1e-12;
-/// A frame's tonal-band (200-2000Hz) magnitude spectrum is dominated by
-/// numerical noise floor / windowing leakage rather than real spectral
-/// shape once its in-band energy drops far below the bar's loudest frame —
-/// pooling such a frame's flatness into the bar average would let temporal
-/// sparsity (silence between kick/hat hits) masquerade as tonality, which is
-/// exactly the confound this floor exists to reject (see
-/// `sparse_noise_bursts_score_like_continuous_noise_not_tonal`). 1/1000 of
-/// the bar's peak in-band frame energy is well below any real hit's decay
-/// tail but above the numerical floor.
 const TONAL_FRAME_REL_ENERGY_FLOOR: f64 = 1e-3;
-/// Absolute in-band energy floor per frame, in the same units as
-/// [`FrameSummary::tonal_energy`] (summed power). Needed in addition to
-/// [`TONAL_FRAME_REL_ENERGY_FLOOR`] because a bar that is silent throughout
-/// has a peak of ~0 too, so the relative floor alone would divide out to
-/// nothing and admit pure noise-floor frames.
 const TONAL_FRAME_ABS_ENERGY_FLOOR: f64 = 1e-9;
 
 /// Per-bar Stage 2 feature vector. All fields are diagnostic; `analyze()`
@@ -149,7 +104,6 @@ fn band_index(freq_hz: f64) -> usize {
     N_BANDS - 1
 }
 
-/// MIDI-style pitch class of `freq_hz` (A4=440Hz -> 9), independent of octave.
 fn pitch_class(freq_hz: f64) -> usize {
     if freq_hz <= 0.0 || !freq_hz.is_finite() {
         return 0;
@@ -170,27 +124,12 @@ fn hann_window(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Compact per-STFT-frame summary; a whole window (~110 s) worth of these
-/// (~9.5k at 44.1kHz) is a few MB, unlike storing full complex spectra.
 struct FrameSummary {
-    /// Frame center, in samples from the start of the analyzed window.
     center: i64,
     band_power: [f64; N_BANDS],
     chroma_mag: [f64; N_CHROMA],
-    /// This frame's own reciprocal spectral flatness (arith/geo of
-    /// magnitude) over the tonal band — *not* pooled with other frames yet;
-    /// bar aggregation energy-weight-averages these, excluding near-silent
-    /// frames (see [`TONAL_FRAME_REL_ENERGY_FLOOR`]).
     tonal_flatness_recip: f64,
-    /// This frame's summed power over the tonal band (200-2000Hz); used both
-    /// as the aggregation weight and to decide whether the frame is loud
-    /// enough in-band to trust its flatness at all.
     tonal_energy: f64,
-    /// Max normalized autocorrelation in the voiced f0 range. `0.0` on a
-    /// near-silent frame (`r0` too small to trust any lag ratio) — such
-    /// frames are still counted in `voiced_frac`'s denominator (silence
-    /// genuinely contains no detectable pitch, unlike the tonality case
-    /// above; see the Stage-2 handoff report for the reasoning).
     periodicity: f64,
     low_energy: f64,
     high_energy: f64,
@@ -226,11 +165,6 @@ fn frame_summaries(window_mono: &[f32], sample_rate: u32) -> Vec<FrameSummary> {
 
         let mut band_power = [0.0f64; N_BANDS];
         let mut chroma_mag = [0.0f64; N_CHROMA];
-        // Per-*this-frame* flatness inputs; folded into a single
-        // arith/geo ratio below, before this frame is ever mixed with any
-        // other frame's data (that ordering is the fix — see
-        // `TONAL_FRAME_REL_ENERGY_FLOOR`'s doc comment for what pooling
-        // raw sums across frames first used to get wrong).
         let mut tonal_sum_log_mag = 0.0f64;
         let mut tonal_sum_mag = 0.0f64;
         let mut tonal_energy = 0.0f64;
@@ -262,8 +196,6 @@ fn frame_summaries(window_mono: &[f32], sample_rate: u32) -> Vec<FrameSummary> {
         let low_energy = band_power[0] + band_power[1];
         let high_energy = band_power[4] + band_power[5] + band_power[6];
 
-        // Autocorrelation via Wiener-Khinchin: IFFT(|FFT(x)|^2). Reuse the
-        // full (not just half) complex spectrum already computed above.
         for k in 0..N_FFT {
             autocorr[k] = Complex32::new(buf[k].norm_sqr(), 0.0);
         }
@@ -338,17 +270,10 @@ fn aggregate_bar(
 ) -> BarFeatures {
     let mut band_power_sum = [0.0f64; N_BANDS];
     let mut chroma_sum = [0.0f64; N_CHROMA];
-    // (energy, per-frame flatness-reciprocal) for every in-bar frame; the
-    // energy floor that decides which of these actually count needs the
-    // bar's own peak, so it can only be applied after this loop collects
-    // them all (see the weighted-average block below).
     let mut tonal_frame_pairs: Vec<(f64, f64)> = Vec::new();
     let mut voiced_count = 0usize;
     let mut n = 0usize;
 
-    // Rhythm grid uses positive-diff novelty of low/high band energy
-    // between *consecutive* STFT frames (bar-local, so the first in-bar
-    // frame's novelty is measured against the frame just before it).
     let mut rhythm_low = [0.0f64; N_RHYTHM_SLOTS];
     let mut rhythm_high = [0.0f64; N_RHYTHM_SLOTS];
     let bar_len = (local_end - local_start).max(1) as f64;
@@ -398,14 +323,6 @@ fn aggregate_bar(
         }
     }
 
-    // Energy-weighted average of each frame's *own* flatness-reciprocal,
-    // dropping frames whose in-band energy is too far below this bar's
-    // loudest in-band frame to trust (or below an absolute silence floor
-    // for bars that are quiet throughout). This is what stops a bar's
-    // silence-between-hits from pulling tonality toward "tonal" — each
-    // included frame's flatness was already computed from its own spectrum
-    // only, so a near-silent frame's noise-floor leakage can no longer drag
-    // the geometric mean of some *other* frame's real content down with it.
     let tonality = {
         let peak_energy = tonal_frame_pairs
             .iter()
@@ -506,9 +423,6 @@ mod tests {
         stereo_from_mono(mono)
     }
 
-    /// Like [`sine_buffer`], but only sounding for `burst_secs` out of every
-    /// `period_secs` (silence otherwise) — models a kick/hat hit with gaps,
-    /// not a sustained tone.
     fn sparse_tone_buffer(freq: f32, secs: f64, amp: f32, burst_secs: f64, period_secs: f64) -> AudioBuffer {
         let n = (secs * f64::from(SR)) as usize;
         let mut mono = Vec::with_capacity(n);
@@ -525,10 +439,6 @@ mod tests {
         stereo_from_mono(mono)
     }
 
-    /// Like [`white_noise_buffer`], but only sounding for `burst_secs` out of
-    /// every `period_secs` — models a noise-based hat/kick hit with gaps,
-    /// e.g. a Funkot intro's machine rhythm (short transients, mostly silence
-    /// in between), as opposed to sustained broadband noise.
     fn sparse_noise_buffer(secs: f64, amp: f32, burst_secs: f64, period_secs: f64) -> AudioBuffer {
         let n = (secs * f64::from(SR)) as usize;
         let mut state = 0xC0FFEEu32;
@@ -559,7 +469,6 @@ mod tests {
         }
     }
 
-    /// One "bar" spanning the whole buffer, for single-shot feature tests.
     fn single_bar_features(buffer: &AudioBuffer) -> BarFeatures {
         let mono = buffer.mono();
         let starts = [0u64];
@@ -581,18 +490,10 @@ mod tests {
         );
     }
 
-    /// Regression for the Stage-2-review confound: pooling raw log-magnitude
-    /// across *all* frames in a bar (including near-silent gap frames)
-    /// before taking geometric/arithmetic means made temporal sparsity read
-    /// as "tonal", even for pure noise bursts. A Funkot intro (kick/hat with
-    /// gaps) must not score anywhere near as tonal as a real melodic/vocal
-    /// section just because it has silence between hits — it should score
-    /// about like *continuous* noise (flat spectrum during the hits, no
-    /// signal to average during the gaps).
     #[test]
     fn sparse_noise_bursts_score_like_continuous_noise_not_tonal() {
         let continuous = white_noise_buffer(2.0, 0.5);
-        let sparse = sparse_noise_buffer(2.0, 0.5, 0.02, 0.2); // 10% duty cycle
+        let sparse = sparse_noise_buffer(2.0, 0.5, 0.02, 0.2);
         let cont_feat = single_bar_features(&continuous);
         let sparse_feat = single_bar_features(&sparse);
         assert!(
@@ -608,11 +509,6 @@ mod tests {
         );
     }
 
-    /// Companion to the sparse-noise regression above: once sparsity itself
-    /// is no longer a confound, a genuinely tonal sparse signal (e.g. a
-    /// pitched stab) must still score clearly higher than a sparse noise
-    /// burst with the same duty cycle — i.e. tonality separates by timbre,
-    /// not by how much silence surrounds the hits.
     #[test]
     fn sparse_tone_bursts_score_higher_than_sparse_noise_bursts() {
         let sparse_tone = sparse_tone_buffer(440.0, 2.0, 0.5, 0.05, 0.25);
@@ -629,7 +525,6 @@ mod tests {
 
     #[test]
     fn chroma_peaks_at_known_pitch_class() {
-        // A4 = 440 Hz -> pitch class 9 (A).
         let tone = sine_buffer(440.0, 1.0, 0.5);
         let feat = single_bar_features(&tone);
         let (max_idx, &max_val) = feat
@@ -644,7 +539,6 @@ mod tests {
 
     #[test]
     fn chroma_peaks_at_different_known_pitch_class() {
-        // C5 ~= 523.25 Hz -> pitch class 0 (C).
         let tone = sine_buffer(523.25, 1.0, 0.5);
         let feat = single_bar_features(&tone);
         let (max_idx, _) = feat
@@ -658,7 +552,6 @@ mod tests {
 
     #[test]
     fn band_energy_concentrates_in_expected_band() {
-        // 5 kHz -> band index 5 (4k-10k Hz).
         let tone = sine_buffer(5000.0, 1.0, 0.5);
         let feat = single_bar_features(&tone);
         let (max_idx, _) = feat
@@ -669,7 +562,6 @@ mod tests {
             .unwrap();
         assert_eq!(max_idx, 5, "loudest band {max_idx}, expected index 5 (4k-10k Hz)");
 
-        // 60 Hz -> band index 0 (<100 Hz).
         let bass = sine_buffer(60.0, 1.0, 0.5);
         let bass_feat = single_bar_features(&bass);
         let (bass_max_idx, _) = bass_feat
@@ -683,7 +575,6 @@ mod tests {
 
     #[test]
     fn voiced_frac_high_for_tone_low_for_noise() {
-        // 300 Hz is inside the voiced search range (150-1000 Hz).
         let tone = sine_buffer(300.0, 1.0, 0.5);
         let noise = white_noise_buffer(1.0, 0.5);
         let tone_feat = single_bar_features(&tone);
@@ -718,22 +609,10 @@ mod tests {
         assert_eq!(feats[0].tonality, 0.0);
     }
 
-    /// Answers the Stage-2-review question of whether `voiced_frac` has the
-    /// same "silence between hits gets pooled in and drags the average"
-    /// confound `tonality` had. It does not: unlike tonality (which averaged
-    /// a *spectral shape* across frames, letting silent frames corrupt the
-    /// shape estimate itself), `voiced_frac` is a fraction of *time*, and a
-    /// silent frame genuinely contains no detectable pitch — counting it in
-    /// the denominator is the correct semantics, not a bug. This asserts
-    /// that on a 20%-duty sparse tone the fraction tracks the true duty
-    /// cycle (not near 0, not near 1, roughly proportional to it, wider
-    /// bounds account for edge frames straddling burst boundaries), while
-    /// both noise cases (which never have detectable periodicity) stay ~0
-    /// regardless of sparsity.
     #[test]
     fn voiced_frac_tracks_duty_cycle_not_silence_pooled_into_noise() {
         let cont_tone = sine_buffer(300.0, 2.0, 0.5);
-        let sparse_tone = sparse_tone_buffer(300.0, 2.0, 0.5, 0.05, 0.25); // 20% duty
+        let sparse_tone = sparse_tone_buffer(300.0, 2.0, 0.5, 0.05, 0.25);
         let cont_noise = white_noise_buffer(2.0, 0.5);
         let sparse_noise = sparse_noise_buffer(2.0, 0.5, 0.05, 0.25);
 

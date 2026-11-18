@@ -41,17 +41,11 @@ use crate::{
     TARGET_RMS_DBFS,
 };
 
-/// Head/tail analysis window for BPM/downbeat only (section scan uses the full buffer).
 const SEGMENT_SECS: f64 = 110.0;
-/// Reject tracks shorter than this (need enough steady rhythm).
 const MIN_DURATION_SECS: f64 = 30.0;
 const BPM_MIN: f64 = 172.0;
 const BPM_MAX: f64 = 188.0;
-/// Step of every BPM comb sweep, before parabolic refinement. Shared so the
-/// grid search and `is_funkot`'s wide reference sweep stay commensurable.
 const BPM_SEARCH_STEP: f64 = 0.05;
-/// Wide band swept for the reference peak `is_funkot` measures the grid
-/// against. Grid BPM itself still uses [`BPM_MIN`]–[`BPM_MAX`].
 const CLASSIFY_BPM_MIN: f64 = 100.0;
 const CLASSIFY_BPM_MAX: f64 = 200.0;
 /// How hard the low-band onsets must lock onto the grid period, in standard
@@ -83,60 +77,30 @@ const CLASSIFY_MAX_HALF_RATIO: f64 = 1.43;
 pub(crate) const HOP: usize = 256;
 const LOWPASS_HZ: f64 = 150.0;
 const HIGHPASS_HZ: f64 = 1500.0;
-/// Onset must exceed this fraction of the segment peak to count as a beat.
 const ONSET_REL_THRESH: f64 = 0.20;
-/// Bars scanned for intro→main (covers 96 + after-window).
 const MAX_SCAN_BARS_INTRO: usize = 112;
-/// Bars scanned for main→outro (keep prior 80-bar window; longer scans
-/// shift the full-drop hit and inflate outro_bars).
 const MAX_SCAN_BARS_OUTRO: usize = 80;
-/// Plausible Funkot outro lengths (bars). Intro snapping uses
-/// [`INTRO_SNAP_CANDIDATES`] (adds 48).
 const SNAP_CANDIDATES: [u32; 3] = [16, 32, 64];
-/// Intro snap grid including mid-length 48-bar machine intros.
 const INTRO_SNAP_CANDIDATES: [u32; 4] = [16, 32, 48, 64];
-/// Long intro lengths using fill/shout/tension cues (earliest hit).
-/// Includes 64: energy-rise scoring misses tension-drop main entries, and a
-/// later 80 rebuild must not win. A 48-bar tension drop is checked first in
-/// [`pick_long_intro_bars`]; non-drop 48 cues stay on the stricter medium path.
 const LONG_INTRO_CANDIDATES: [u32; 3] = [64, 80, 96];
-/// Bars of "main body" sampled after a candidate boundary for contrast checks.
 const AFTER_WIN_BARS: usize = 8;
-/// Absolute snap slack (bars) when relative tolerance alone is too tight
-/// (e.g. raw outro drop at 21 → 16).
 const SNAP_ABS_TOLERANCE: u32 = 6;
-/// Absolute mainness floor (dB-equivalent vs early baseline) to enter the main.
 const MAINNESS_ENTER: f64 = 2.0;
-/// Require this many consecutive bars above a soft mainness floor.
 const MAINNESS_SUSTAIN: usize = 6;
-/// Onset mainness must reach this fraction of the scan-window peak.
 const MAINNESS_PEAK_FRAC: f64 = 0.70;
-/// Smoothing window (bars) on the mainness curve.
 const MAINNESS_SMOOTH: usize = 2;
-/// Max relative distance from nearest snap candidate before falling back.
 const SNAP_TOLERANCE: f64 = 0.25;
-/// Minimum boundary contrast at the snapped length for confidence.
 const MIN_BOUNDARY_SCORE: f64 = 1.8;
-/// Minimum score margin for a unique candidate winner.
 const MIN_SCORE_MARGIN: f64 = 0.45;
-/// Minimum edge sharpness for 16/32 when the before-window is not a gradual ramp.
 const MIN_SHARP_SHORT: f64 = 2.2;
-/// Stricter sharpness when the before-window already ramps (layering).
 const MIN_SHARP_SHORT_GRADUAL: f64 = 3.6;
-/// Before-window RMS spread (dB) treated as a gradual layering ramp.
 const GRADUAL_SPREAD_DB: f64 = 2.5;
 pub(crate) use crate::transition_geometry::outro_trigger_bars;
 use crate::transition_geometry::OUTRO_LEAD_BARS;
 
-/// Short full-drop snaps (≤16) whose after-window sits in this fraction of the
-/// far-body mid/high median are mid-outro plateaus (recovered vs floor, but not
-/// yet full main). Below the band = still sparse (Sakura); at/above ~1.0 = main
-/// already (classic 16-bar collapse). Reject only the mid band.
 const OUTRO_MID_PLATEAU_FRAC_LO: f64 = 0.75;
 const OUTRO_MID_PLATEAU_FRAC_HI: f64 = 0.98;
-/// Default search radius for sample-accurate kick refinement (ms).
 const KICK_REFINE_RADIUS_MS: f64 = 40.0;
-/// Fine hop for kick envelope inside the refine window.
 const KICK_REFINE_HOP: usize = 32;
 const GAIN_CLAMP_DB: f64 = 12.0;
 const SILENCE_EPS: f64 = 1e-12;
@@ -194,7 +158,6 @@ fn analyze_local_tempo_inner(
     if sample_rate == 0 || !target_bpm.is_finite() || target_bpm <= 0.0 {
         return None;
     }
-    // A beat needs enough envelope samples to distinguish phase and coverage.
     if 60.0 * sample_rate as f64 / target_bpm < (HOP * 8) as f64 {
         return None;
     }
@@ -247,9 +210,6 @@ fn analyze_local_tempo_inner(
     let in_transition_range = (bpm_lo..=bpm_hi).contains(&bpm)
         && local_period_support(&onset.novelty, bpm, sample_rate, target_bpm, context)
             == PeriodSupport::Strong
-        // An overlap validates one reference across the full span
-        // after collecting all tempo tiles. Do not invent another reference
-        // at each arbitrary eight-second seam.
         && (context == PeriodContext::Overlap || local_grid_continuous(&interleaved[start as usize * 2..end as usize * 2],
             0, end - start, sample_rate, bpm));
     Some(LocalTempo {
@@ -259,10 +219,6 @@ fn analyze_local_tempo_inner(
     })
 }
 
-/// Local evidence is stricter than whole-track genre classification: both
-/// metrical aliases and unrelated tempi compete with the proposed pulse.
-/// The short-window limits are exercised by the local-tempo regressions;
-/// they are deliberately independent of the intro/outro classifier cutoffs.
 #[derive(Clone, Copy, PartialEq)]
 enum PeriodContext { Unanchored, Overlap }
 
@@ -272,9 +228,6 @@ enum PeriodSupport { Strong, HalfTie, Reject }
 fn local_period_support(
     novelty: &[f64], bpm: f64, sr: u32, target: f64, context: PeriodContext,
 ) -> PeriodSupport {
-    // Integrate the onset over its neighboring hops before comparing metrical
-    // levels. At 48 kHz/180 BPM a beat is 62.5 hops: point sampling alternates
-    // between a peak and an interpolated valley, spuriously favoring half time.
     let integrated: Vec<f64> = (0..novelty.len()).map(|i| {
         let a = i.saturating_sub(1);
         let b = (i + 2).min(novelty.len());
@@ -284,8 +237,6 @@ fn local_period_support(
     let Some((mean, sd)) = novelty_stats(novelty) else { return PeriodSupport::Reject };
     let period = bpm_to_period_hops(bpm, HOP as f64, sr as f64);
     let z = comb_z(novelty, period, mean, sd);
-    // At least eight observed pulses, and a peak three standard errors above
-    // the envelope mean. Sparse hits cannot establish a mixable pulse train.
     if novelty.len() as f64 / period < 8.0 || z < 3.0 { return PeriodSupport::Reject; }
     let mut best = z;
     let mut best_period = period;
@@ -297,28 +248,12 @@ fn local_period_support(
         candidate += BPM_SEARCH_STEP;
     }
     let half = comb_z(novelty, period * 2.0, mean, sd);
-    // The candidate may differ slightly from the wide sweep's sampling of the
-    // same peak. A half-time peak must be clearly weaker, not merely in-band.
     if z >= best * 0.95 && half < z * 0.9 { return PeriodSupport::Strong; }
     if context == PeriodContext::Overlap && z >= best * 0.80 && half < z * 0.9 {
         return PeriodSupport::Strong;
     }
     if context == PeriodContext::Unanchored { return PeriodSupport::Reject; }
-    // A one-phase comb can prefer subdivisions or alternating accents in a
-    // syncopated groove. Full-span fixed-reference phase validation permits
-    // a second witness: all onset pairs at the proposed beat must correlate
-    // more strongly than the winning comb period and half time. Sub-beat
-    // subdivisions alone do not invalidate an independently preserved beat.
-    // Use the same samples for all lags. A local tie remains unknown; only
-    // `local_sync_span` may resolve one bounded tie with whole-overlap evidence.
-    // A whole-overlap witness may resolve a narrow half-time tie caused by one
-    // tile's accents. It is intentionally not local evidence: callers must
-    // still prove fixed-grid continuity across the whole overlap.
     let tie = z >= best * 0.65 && half <= z * 0.97;
-    // Refinement and the coarse sweep can sample the same peak at slightly
-    // different tempi. They are not independent evidence when their phase
-    // separation over the observed span is inside the existing 1/8-beat
-    // tolerance, so only the full overlap may decide a bounded tie.
     if (1.0 / period - 1.0 / best_period).abs() * novelty.len() as f64 <= 0.125 {
         return if tie { PeriodSupport::HalfTie } else { PeriodSupport::Reject };
     }
@@ -354,9 +289,6 @@ fn period_correlation(values: &[f64], lag: f64, overlap: usize) -> f64 {
     if norm > SILENCE_EPS { dot / norm } else { 0.0 }
 }
 
-/// Inspect every part of an intended overlap, including future material.
-/// Returns the observed tempo envelope, not just an average over the request
-/// position. Callers use the extremes to bound fixed-speed deck drift.
 pub(crate) fn local_sync_span(
     samples: &[f32], start: u64, end: u64, sr: u32, target: f64,
 ) -> Option<(f64, f64)> {
@@ -391,9 +323,6 @@ pub(crate) fn local_sync_span(
         if b == end { break; }
         offset = (offset + window / 2).min(span.saturating_sub(window));
     }
-    // Every overlap retains the fixed grid check. A near half-time tie may
-    // be an accent alias only when independent normalized onset evidence also
-    // covers the same fixed-tempo overlap.
     let grid_bpm = (lo + hi) / 2.0;
     let grid = local_grid_continuous(samples, start, end, sr, grid_bpm);
     let witness = half_ties == 0 || overlap_onset_witness(samples, start, end, sr, grid_bpm);
@@ -421,9 +350,6 @@ pub(crate) fn first_overlap_tile_is_half_tie_for_test(
         == PeriodSupport::HalfTie
 }
 
-/// Confirm continuous onset presence across a bounded accent change. Per-bar
-/// normalization and capping remove level changes; non-maximum suppression
-/// keeps one drum attack from counting as its decay.
 fn overlap_onset_witness(samples: &[f32], start: u64, end: u64, sr: u32, bpm: f64) -> bool {
     let beat = 60.0 * sr as f64 / bpm;
     let beat_hops = beat / HOP as f64;
@@ -478,14 +404,9 @@ fn overlap_onset_witness(samples: &[f32], start: u64, end: u64, sr: u32, bpm: f6
     }
     let Some(last) = last else { return false; };
     let end_gap = onset.novelty.len() as f64 - last + 2.0;
-    // A slow island can keep every onset gap under two target beats, but
-    // cannot provide one capped attack per target beat across each bar.
     observed >= full_bars * BEATS_PER_BAR as usize && end_gap < half_time
 }
 
-/// Preserve an existing count only across continuous rhythmic evidence.
-/// A fixed multi-bar groove reference permits syncopation without promoting
-/// weak subdivisions of a slower pulse train into a new bar/phrase origin.
 pub(crate) fn local_grid_continuous(
     samples: &[f32], anchor: u64, end: u64, sr: u32, target: f64,
 ) -> bool {
@@ -493,8 +414,6 @@ pub(crate) fn local_grid_continuous(
         || end > (samples.len() / 2) as u64 { return false; }
     let beat = 60.0 * sr as f64 / target;
     if beat < (HOP * 8) as f64 || beat * 8.0 > (end - anchor) as f64 { return false; }
-    // Keep the marker attack out of the envelope's forced-zero first hop.
-    // Real preceding samples warm the filter; only pre-file time is silence.
     let padding_hops = (beat / HOP as f64).ceil() as usize;
     let padding = padding_hops * HOP;
     let from = anchor.saturating_sub(padding as u64);
@@ -509,27 +428,16 @@ pub(crate) fn local_grid_continuous(
     let bars = (extent / bar_hops).ceil() as usize;
     let mut last = None;
     let mut reference_peaks = Vec::new();
-    // Counting needs an observed attack before a whole half-time period can
-    // pass without evidence. Require the upper bound of each observed gap
-    // (including endpoint uncertainty) to stay below that competing period.
-    // This is independent of the density of any earlier bar or fill.
     let half_time_period = beat * 2.0 / HOP as f64;
-    // These are observed times, not predicted marker phases: one hop per
-    // endpoint covers localization. The separate 1/8-beat phase allowance
-    // must not be counted again as uncertainty in a measured onset interval.
     let gap_slack = 2.0;
     for bar_index in 0..bars {
         let a = (bar_index as f64 * bar_hops).round() as usize;
         let b = (((bar_index + 1) as f64 * bar_hops).round() as usize).min(onset.novelty.len());
-        if b <= a { break; } // below envelope resolution; end-gap check still applies
+        if b <= a { break; }
         let mean = onset.novelty[a..b].iter().sum::<f64>() / (b - a) as f64;
         let mut candidates: Vec<usize> = (a..b).filter(|&i| onset.novelty[i] > SILENCE_EPS
             && onset.novelty[i] >= mean * 2.0).collect();
         candidates.sort_by(|&a, &b| onset.novelty[b].total_cmp(&onset.novelty[a]));
-        // Count attack peaks, not every hop across one drum's decay. Peaks
-        // inside the phase resolution are one observation;
-        // otherwise a broad reference kick makes later narrow kicks look
-        // like missing beats merely because their tails are shorter.
         let resolution = 2.0 * beat * 0.125 / HOP as f64;
         let mut peaks = Vec::<f64>::new();
         for i in candidates {
@@ -539,8 +447,6 @@ pub(crate) fn local_grid_continuous(
         let offset = bar_index as f64 * bar_hops;
         let partial = extent - offset < bar_hops - 1.0;
         if partial && extent - offset < 2.0 * beat / HOP as f64 {
-            // A short final fraction cannot supply the scorer's two-beat window.
-            // Validate its attacks against the fixed reference instead.
             let tolerance = beat * 0.125 / HOP as f64 + 1.0;
             if peaks.iter().any(|p| !reference_peaks.iter().any(|r: &f64|
                 (p - offset - r).abs() <= tolerance)) {
@@ -559,17 +465,12 @@ pub(crate) fn local_grid_continuous(
         if bar_index == 0 { reference_peaks = peaks.clone(); }
         let max_gap = peaks.windows(2).map(|p| p[1] - p[0]).fold(
             last.map_or(first, |previous| first - previous), f64::max);
-        // Require positive evidence before half time, including one hop of
-        // localization error per measured endpoint.
         if max_gap + gap_slack >= half_time_period {
             return false;
         }
         last = Some(final_peak);
     }
     if last.is_none_or(|last| extent - last + gap_slack >= half_time_period) { return false; }
-    // Keep the existing scorer's multi-bar context: one fill must not become
-    // a half-beat phase change. Every window uses the same fixed reference;
-    // these observations never move the structural marker or the audio.
     let bar = beat * 4.0;
     let span = ((bar * crate::engine::PHASE_ALIGN_BARS as f64 + beat * 0.5).ceil() as u64)
         .min(end - anchor);
@@ -669,28 +570,19 @@ pub fn analyze(buffer: &AudioBuffer, file_name: &str) -> Result<TrackAnalysis> {
         SectionDir::Backward,
     )?;
 
-    // Rounded, not floored: these are nominal bar counts, and flooring
-    // would shave a bar off the room every time the division came out just
-    // under a whole number.
     let track_bars = ((last_bar_end.saturating_sub(first_downbeat)) as f64
         / (outro_bar_len.max(1) as f64))
         .round()
         .max(0.0) as u32;
 
-    // Both sides now carry structural boundaries, so reconcile compares like
-    // with like. The only ambiguous case that depends on track duration is
-    // both-low fallback: it must leave room for both sections and the lead.
     let (intro_bars, outro_structure_bars, intro_low_conf, outro_low_conf) =
         reconcile_intro_outro_for_track_bars(intro_est, outro_est, track_bars);
 
-    // A valid structural boundary gets up to OUTRO_LEAD_BARS of lead without
-    // crossing the intro end. Contradictory markers clip to the available body.
     let outro_bars = outro_trigger_bars(outro_structure_bars, intro_bars, track_bars);
 
     let bars_estimated_low_confidence = intro_low_conf || outro_low_conf;
     let outro_start = last_bar_end.saturating_sub(u64::from(outro_bars) * outro_bar_len);
 
-    // Loudness: full-track mono RMS (documented).
     let (rms_dbfs, gain_db) = measure_loudness(buffer);
 
     let intro_bpm = finite_or_err(intro_bpm, "intro_bpm")?;
@@ -745,11 +637,6 @@ pub fn reconcile_intro_outro(
     reconcile_intro_outro_for_track_bars(intro, outro, u32::MAX)
 }
 
-/// Reconcile section estimates when the analyzed track duration is known.
-///
-/// Its both-low fallback is the largest [`SNAP_CANDIDATES`] section that
-/// leaves room for both sections and [`OUTRO_LEAD_BARS`]. The public
-/// two-argument compatibility API has no duration and retains 64 instead.
 pub(crate) fn reconcile_intro_outro_for_track_bars(
     mut intro: SectionEstimate,
     mut outro: SectionEstimate,
@@ -781,7 +668,6 @@ pub(crate) fn reconcile_intro_outro_for_track_bars(
         return (intro.bars, outro_bars, false, true);
     }
 
-    // Both confident: trust each side (including intro < outro).
     (intro.bars, outro.bars, false, false)
 }
 
@@ -820,9 +706,7 @@ pub fn refine_kick_marker(
     (lo as u64).saturating_add(local).min(frames as u64 - 1)
 }
 
-/// Bars of sparse intro-head / outro-tail audio used by [`refine_groove_phase`].
 const GROOVE_REFINE_BARS: u32 = 4;
-/// Relative weight of hi-hat band vs kick when scoring Funkot bar phase.
 const GROOVE_HAT_WEIGHT: f64 = 0.40;
 
 /// Refine a downbeat by scoring kick + hi-hat placement over the first few bars.
@@ -899,11 +783,9 @@ pub fn refine_groove_phase(
         let mut hat_sum = 0.0f64;
         for k in 0..n_beats {
             let pos = approx_local + delta as f64 + f64::from(k) * beat_frames;
-            // Downbeat (every bar) weighs more; other on-beats still count.
             let w = if k % BEATS_PER_BAR == 0 { 2.0 } else { 1.0 };
             kick_sum += w * band_peak(&kick, pos);
             hat_sum += w * band_peak(&hat, pos);
-            // Off-beat hats are common in Funkot; add a lighter bonus.
             let off = pos + 0.5 * beat_frames;
             hat_sum += 0.55 * w * band_peak(&hat, off);
         }
@@ -937,7 +819,6 @@ pub fn refine_groove_phase(
     }
 
     let coarse = (approx as i64 + best_delta).max(0) as u64;
-    // Snap to the nearest kick transient for sample accuracy.
     let refine_lo = (coarse as i64 - hop as i64).max(lo as i64) as usize;
     let refine_hi = ((coarse as i64 + hop as i64) as usize).min(hi);
     let mut best_frame = coarse.min(frames as u64 - 1);
@@ -959,28 +840,10 @@ pub fn refine_groove_phase(
     best_frame.min(frames as u64 - 1)
 }
 
-/// STFT window and hop for [`broadband_onset_flux`]. Short window on purpose:
-/// what matters is localizing transients in time, not frequency detail.
 const FLUX_WIN: usize = 512;
 const FLUX_HOP: usize = 128;
-/// How much better than "don't move" a candidate phase must score before
-/// [`lock_beat_phase`] adopts it.
 const LOCK_CLEAR_WIN_RATIO: f64 = 1.05;
 
-/// Broadband spectral-flux onset envelope: half-wave-rectified magnitude
-/// difference summed over the whole spectrum, one value per [`FLUX_HOP`]
-/// frames (value `i` is centred on frame `i * FLUX_HOP + FLUX_WIN / 2`), with
-/// its median subtracted so a steady bed does not count as onsets.
-///
-/// Distinct from [`onset_envelope`], which low-passes to ~150 Hz first
-/// because it is looking for *kicks* specifically (BPM comb, first-downbeat
-/// anchor). That is the wrong signal for deciding beat phase in dense
-/// mid-track Funkot: measured on the real masters in `testdata/`, a
-/// full-period comb over the low band reports mutually inconsistent phases
-/// for different windows of the same track, while the same comb over
-/// broadband flux — which sees the hats and percussion that actually mark the
-/// grid there — agrees with the analyzer's own intro downbeat to within a
-/// few hundredths of a beat.
 fn broadband_onset_flux(mono: &[f32]) -> Vec<f64> {
     let mut out = onset_flux_envelope(mono);
     if out.is_empty() {
@@ -1042,18 +905,6 @@ pub fn onset_flux_envelope(mono: &[f32]) -> Vec<f64> {
     out
 }
 
-/// Score every phase candidate the [`lock_beat_phase`] comb considers: for
-/// each `delta` in `-steps..=steps` (`step` = [`FLUX_HOP`], `steps =
-/// radius / step`), the sum over `n_beats` beats of the `flux` value
-/// nearest `approx_local + delta + k * beat_frames` (±1 hop of slack, taking
-/// the max, to absorb quantization — same as [`lock_beat_phase`] always did
-/// inline here before this was pulled out). `delta == 0` is always one of
-/// the `k` steps, so callers can rely on it being present without a special
-/// case.
-///
-/// Pulled out of [`lock_beat_phase`] so [`beat_phase_comb_scores`] can expose
-/// the exact same scores as a diagnostic, instead of a reimplementation that
-/// could quietly drift from what `lock_beat_phase` actually does.
 fn score_beat_phase_candidates(
     flux: &[f64],
     approx_local: f64,
@@ -1144,9 +995,6 @@ pub fn lock_beat_phase(
 
     let approx_local = (approx as i64 - lo as i64) as f64;
     let candidates = score_beat_phase_candidates(&flux, approx_local, beat_frames, n_beats, radius);
-    // `delta == 0` is always among `candidates` (see the doc on
-    // `score_beat_phase_candidates`), so the "don't move" option is always in
-    // the comparison set exactly.
     let zero_score = candidates
         .iter()
         .find(|&&(delta, _)| delta == 0)
@@ -1163,12 +1011,6 @@ pub fn lock_beat_phase(
     if !best_score.is_finite() || best_score <= 0.0 {
         return approx;
     }
-    // Only move on a clear win. A comb over a window whose rhythm is
-    // ambiguous (half-time breakdown, sparse pad) can prefer a wrong phase by
-    // a hair; keeping the analysis marker in that case is the same
-    // clear-margin-only rule `align_next_entry_scored` uses for bar identity,
-    // and it is what stops this from *introducing* phase errors on windows
-    // the markers already had right.
     if zero_score.is_finite()
         && zero_score > 0.0
         && best_score < zero_score * LOCK_CLEAR_WIN_RATIO
@@ -1252,21 +1094,9 @@ pub fn beat_phase_comb_scores(
     let candidates =
         score_beat_phase_candidates(&flux, approx_local, beat_frames, n_beats, radius);
 
-    // Low-band novelty for the same window, at the same hop as the broadband
-    // flux so the two combs line up in time. Unlike `broadband_onset_flux`,
-    // `onset_envelope` can fail on a window with too little signal below the
-    // LPF cutoff to find onsets in (or that is simply too short); when it
-    // does, `kick` reports 0.0 for every delta rather than propagating the
-    // error, since this is a diagnostic and "no low-band onsets here" is
-    // itself a valid (if uninteresting) answer to "does the low band break
-    // the tie".
     let kick_novelty = onset_envelope(&mono, sample_rate, FLUX_HOP)
         .ok()
         .map(|d| d.novelty);
-    // `onset_envelope`'s hop `i` covers samples `[i*hop, (i+1)*hop)`, unlike
-    // `broadband_onset_flux`'s FFT-windowed value `i` (centred on
-    // `i*hop + FLUX_WIN/2`), so the nearest-hop lookup below uses its own
-    // centre rather than reusing `score_beat_phase_candidates`'s.
     let kick_centre = FLUX_HOP as f64 / 2.0;
     let kick_hop = FLUX_HOP as i64;
     let at_kick = |novelty: &[f64], pos: f64| -> f64 {
@@ -1349,7 +1179,6 @@ pub fn refine_periodic_phase(
         return refine_kick_marker(interleaved_stereo, sample_rate, approx, radius_ms);
     }
 
-    // Per-hop low-band energy + positive novelty (onset strength).
     let mut energy = Vec::with_capacity(n_hops);
     for i in 0..n_hops {
         let start = i * hop;
@@ -1371,7 +1200,6 @@ pub fn refine_periodic_phase(
         return refine_kick_marker(interleaved_stereo, sample_rate, approx, radius_ms);
     }
 
-    // Sample low-band |amplitude| at a frame (local max in ±hop/2).
     let local_peak = |pos_f: f64| -> f64 {
         if pos_f < 0.0 {
             return 0.0;
@@ -1404,8 +1232,6 @@ pub fn refine_periodic_phase(
         0.0
     };
 
-    // Score candidate phases: multi-beat onset + energy, with a strong Gaussian
-    // prior so we stay near the expected boundary (not an arbitrary louder hit).
     let approx_local = (approx as i64 - lo as i64) as f64;
     let sigma = (radius as f64 / 2.5).max(1.0);
     let mut best_delta = 0i64;
@@ -1436,7 +1262,6 @@ pub fn refine_periodic_phase(
     if !best_score.is_finite() || best_score <= 0.0 {
         return refine_kick_marker(interleaved_stereo, sample_rate, approx, radius_ms);
     }
-    // Reject a far jump that is only marginally better than staying put.
     if best_delta.abs() > radius / 3
         && center_score.is_finite()
         && center_score > 0.0
@@ -1446,7 +1271,6 @@ pub fn refine_periodic_phase(
     }
 
     let coarse = (approx as i64 + best_delta).max(0) as u64;
-    // Sample-accurate peak of |LPF| near the chosen phase (first beat only).
     let refine_lo = (coarse as i64 - hop as i64).max(lo as i64) as usize;
     let refine_hi = ((coarse as i64 + hop as i64) as usize).min(hi);
     let mut best_frame = coarse.min(frames as u64 - 1);
@@ -1525,7 +1349,6 @@ pub fn refine_kick_marker_mono(
         return refine_by_abs_peak(&filtered, lo, approx);
     }
 
-    // Prefer the novelty peak nearest the approximate marker (weighted by strength).
     let approx_local = approx.saturating_sub(lo as u64) as f64;
     let mut best_i = 0usize;
     let mut best_val = f64::NEG_INFINITY;
@@ -1547,7 +1370,6 @@ pub fn refine_kick_marker_mono(
     let refine_hi = (coarse + hop).min(mono.len().saturating_sub(1));
     let mut best_frame = coarse;
     let mut best_e = f64::NEG_INFINITY;
-    // Peak absolute LPF sample in the fine window (sample-accurate).
     let filt_offset = refine_lo.saturating_sub(lo);
     let filt_end = (refine_hi - lo).min(filtered.len().saturating_sub(1));
     for (j, &s) in filtered
@@ -1593,10 +1415,6 @@ fn finite_or_err(v: f64, name: &str) -> Result<f64> {
     }
 }
 
-/// Onset-strength envelope: 2nd-order LPF (~150 Hz) → hop energy → half-wave Δ.
-///
-/// `pub(crate)` so [`crate::features`] can reuse the exact same kick-oriented
-/// novelty for per-bar onset-density aggregation instead of reimplementing it.
 pub(crate) fn onset_envelope(mono: &[f32], sample_rate: u32, hop: usize) -> Result<OnsetData> {
     if mono.len() < hop * 4 {
         return Err(Error::Analysis(
@@ -1622,8 +1440,6 @@ pub(crate) fn onset_envelope(mono: &[f32], sample_rate: u32, hop: usize) -> Resu
         energy.push(e);
     }
 
-    // Half-wave-rectified first difference (novelty) for the tempo comb filter.
-    // Low-band energy is retained for first-kick detection (LPF cold-start safe).
     let mut novelty = Vec::with_capacity(energy.len());
     novelty.push(0.0);
     for i in 1..energy.len() {
@@ -1643,7 +1459,6 @@ pub(crate) struct OnsetData {
     pub(crate) energy: Vec<f64>,
 }
 
-/// RBJ biquad low-pass, Q = 1/√2 (Butterworth).
 fn biquad_lowpass(input: &[f32], sample_rate: f64, cutoff_hz: f64) -> Vec<f32> {
     if input.is_empty() || !(sample_rate.is_finite() && sample_rate > 0.0) {
         return vec![0.0; input.len()];
@@ -1654,7 +1469,6 @@ fn biquad_lowpass(input: &[f32], sample_rate: f64, cutoff_hz: f64) -> Vec<f32> {
     }
     let cos_w0 = w0.cos();
     let sin_w0 = w0.sin();
-    // Q = 1/√2 ⇒ α = sin(w0) / (2Q) = sin(w0) * √2 / 2 = sin(w0) / √2
     let alpha = sin_w0 * std::f64::consts::FRAC_1_SQRT_2;
 
     let b0 = (1.0 - cos_w0) / 2.0;
@@ -1691,7 +1505,6 @@ fn biquad_lowpass(input: &[f32], sample_rate: f64, cutoff_hz: f64) -> Vec<f32> {
     out
 }
 
-/// 1st-order high-pass for mid/high energy measurement.
 fn highpass_1pole(input: &[f32], sample_rate: f64, cutoff_hz: f64) -> Vec<f32> {
     let rc = 1.0 / (2.0 * std::f64::consts::PI * cutoff_hz);
     let dt = 1.0 / sample_rate;
@@ -1755,7 +1568,6 @@ fn classify_is_funkot(
     (scores.verdict(), scores)
 }
 
-/// Copy [`GridLock`] fields into the public [`ClassifyScores`] shape.
 fn scores_from_locks(head: &GridLock, tail: &GridLock) -> ClassifyScores {
     ClassifyScores {
         head_z: head.z,
@@ -1776,9 +1588,6 @@ impl ClassifyScores {
     }
 }
 
-/// One side's inputs: its onset novelty and the grid BPM `analyze` estimated
-/// from it. Pairing them in a struct keeps the two sides from being swapped
-/// at the call site.
 #[derive(Clone, Copy)]
 struct SideLock<'a> {
     novelty: &'a [f64],
@@ -1792,8 +1601,6 @@ struct GridLock {
 }
 
 impl GridLock {
-    /// The three threshold tests, split out so `probe_classification` can
-    /// reach the same verdict from measurements it already has.
     fn verdict(head: &GridLock, tail: &GridLock) -> bool {
         scores_from_locks(head, tail).verdict()
     }
@@ -1813,8 +1620,6 @@ impl SideLock<'_> {
         let period = bpm_to_period_hops(self.grid_bpm, hop_f, sr);
         let z = comb_z(self.novelty, period, mean, sd);
 
-        // Reference peak: the best normalised score anywhere in the wide band,
-        // swept at `estimate_bpm_range`'s own step so the two are comparable.
         let mut z_best = z;
         let mut bpm = CLASSIFY_BPM_MIN;
         while bpm <= CLASSIFY_BPM_MAX + 1e-9 {
@@ -1833,18 +1638,12 @@ impl SideLock<'_> {
         let half = comb_z(self.novelty, period * 2.0, mean, sd);
         GridLock {
             z,
-            // `z_best` is seeded with `z`, so it is never below it and the
-            // ratio never exceeds 1.
             z_ratio: if z_best > 0.0 { z / z_best } else { 0.0 },
-            // A grid that carries no signal at all must not pass the veto by
-            // dividing two near-zero numbers.
             half_ratio: if z > 0.0 { half / z } else { f64::INFINITY },
         }
     }
 }
 
-/// Mean and standard deviation of a novelty envelope, or `None` when it is
-/// flat enough that normalising by it would be meaningless.
 fn novelty_stats(novelty: &[f64]) -> Option<(f64, f64)> {
     if novelty.len() < 2 {
         return None;
@@ -1858,13 +1657,6 @@ fn novelty_stats(novelty: &[f64]) -> Option<(f64, f64)> {
     Some((mean, sd))
 }
 
-/// [`best_comb_score`] expressed in standard errors above the novelty's own
-/// mean.
-///
-/// The raw comb score is a mean over `len / period` samples, so its noise
-/// floor grows with the period: over a 2:1 search band the long-period
-/// (low-BPM) end wins on variance alone. Dividing by `σ / √N` removes that,
-/// which is what makes scores at different periods comparable at all.
 fn comb_z(novelty: &[f64], period: f64, mean: f64, sd: f64) -> f64 {
     if period < 1.0 || novelty.is_empty() {
         return 0.0;
@@ -1873,16 +1665,6 @@ fn comb_z(novelty: &[f64], period: f64, mean: f64, sd: f64) -> f64 {
     (best_comb_score(novelty, period) - mean) / (sd / count.sqrt())
 }
 
-// ---------------------------------------------------------------------
-// Funkot-classification diagnostics.
-//
-// Read-only view of the three quantities `classify_is_funkot` decides on,
-// for one track. Exists because the thresholds have to be chosen from
-// measurements over a labeled corpus, not from reading the code:
-// `examples/classify_probe` dumps this per file, and re-running it is how a
-// threshold change is checked against the corpus. Nothing here is used by
-// `analyze`.
-//
 // `#[doc(hidden)]` rather than `#[cfg(test)]`: examples link against the
 // normal rlib, so a test-only item would be invisible to them.
 
@@ -1891,19 +1673,9 @@ fn comb_z(novelty: &[f64], period: f64, mean: f64, sd: f64) -> f64 {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct SideProbe {
-    /// Grid BPM (172–188 argmax) — the value `analyze` stores. `None` when
-    /// the estimate failed; the scores below are then measured at
-    /// [`NOMINAL_BPM`] so the row still says something, but `is_funkot` is
-    /// forced false regardless.
     pub grid_bpm: Option<f64>,
-    /// Normalised comb score at the grid period. Tested against
-    /// `CLASSIFY_MIN_Z`.
     pub z: f64,
-    /// `z` as a fraction of the best normalised score anywhere in 100–200.
-    /// Tested against `CLASSIFY_MIN_Z_RATIO`.
     pub z_ratio: f64,
-    /// Normalised score one metrical level down, over `z`. Tested against
-    /// `CLASSIFY_MAX_HALF_RATIO`.
     pub half_ratio: f64,
 }
 
@@ -1959,11 +1731,6 @@ pub fn probe_classification(buffer: &AudioBuffer) -> Result<ClassifyProbe> {
     let head_bpm = estimate_bpm(&head_onset.novelty, HOP, buffer.sample_rate);
     let tail_bpm = estimate_bpm(&tail_onset.novelty, HOP, buffer.sample_rate);
 
-    // `analyze` propagates a failed grid estimate as an error and never
-    // reaches the classifier. The probe measures such a side at the nominal
-    // tempo and reports `grid_bpm: None` instead, so one odd file does not
-    // abort a whole corpus run — but the verdict still counts it as
-    // non-Funkot, matching what `analyze` would have produced.
     let h = SideLock {
         novelty: &head_onset.novelty,
         grid_bpm: *head_bpm.as_ref().unwrap_or(&NOMINAL_BPM),
@@ -2014,8 +1781,6 @@ fn estimate_bpm_range(
         ));
     }
 
-    // Comb-filter tempo: for each BPM, take the best phase of a beat-period comb
-    // on the onset novelty. Impulse-train kicks peak sharply at the true tempo.
     let step = BPM_SEARCH_STEP;
     let mut best_bpm = 0.5 * (bpm_min + bpm_max);
     let mut best_score = f64::NEG_INFINITY;
@@ -2062,15 +1827,11 @@ fn estimate_bpm_range(
 mod is_funkot_classify_tests {
     use super::*;
 
-    /// A perfectly periodic low-band novelty at `bpm`, plus a little noise so
-    /// the sample-count normalisation has a non-degenerate `sd` to work with
-    /// (a noiseless train makes every ratio exactly 1 and hides regressions).
     fn novelty_impulse_train(bpm: f64, sample_rate: u32, secs: f64) -> Vec<f64> {
         let hop = HOP as f64;
         let sr = f64::from(sample_rate);
         let period = (60.0 / bpm) * sr / hop;
         let n = ((secs * sr / hop).ceil() as usize).max(1);
-        // Deterministic low-amplitude hash noise; no rand dependency.
         let mut v: Vec<f64> = (0..n)
             .map(|i| {
                 let h = (i as u64).wrapping_mul(6_364_136_223_846_793_005).rotate_left(17);
@@ -2110,9 +1871,6 @@ mod is_funkot_classify_tests {
         }
     }
 
-    /// The half-tempo case the previous criterion had no defence against: a 90
-    /// BPM pulse also lands on every other tooth of a 180 comb, so the grid
-    /// lock alone looks convincing. Only [`CLASSIFY_MAX_HALF_RATIO`] rejects it.
     #[test]
     fn classify_false_at_half_tempo() {
         let sr = 44_100;
@@ -2120,9 +1878,6 @@ mod is_funkot_classify_tests {
         assert!(!classify(&n, &n, sr));
     }
 
-    /// One dead side must not sink a track: Funkot routinely opens or closes on
-    /// material with no grid at all, and demanding both sides is what made the
-    /// previous criterion reject two thirds of a known-Funkot corpus.
     #[test]
     fn classify_true_when_only_one_side_locks() {
         let sr = 44_100;
@@ -2203,7 +1958,6 @@ mod probe_from_cached_tests {
         assert!(probe_from_cached(&analysis_with(None)).is_none());
     }
 
-    /// Stored `is_funkot` must not override a failing `ClassifyScores::verdict`.
     #[test]
     fn probe_from_cached_uses_verdict_not_stored_bool() {
         let weak = ClassifyScores {
@@ -2248,7 +2002,6 @@ mod probe_from_cached_tests {
             }
         }
 
-        // Any bytes are enough for content_hash; we never decode on the cache path.
         let dir = TempDir::new();
         let wav = dir.0.join("t.wav");
         std::fs::write(&wav, b"RIFF....WAVE").expect("stub file");
@@ -2264,7 +2017,6 @@ mod probe_from_cached_tests {
     }
 }
 
-/// Max over phase of the mean onset value sampled on a comb with the given period.
 fn best_comb_score(onset: &[f64], period: f64) -> f64 {
     if period < 1.0 || onset.is_empty() {
         return 0.0;
@@ -2304,8 +2056,6 @@ fn find_first_downbeat_hop(
     period_hops: f64,
     hop: usize,
 ) -> Result<u64> {
-    // Use low-band energy to find the first kick. Novelty can miss a kick at
-    // t≈0 because the LPF starts from a zero state (cold-start transient).
     let e_peak = energy.iter().copied().fold(0.0f64, f64::max);
     if e_peak < SILENCE_EPS {
         return Err(Error::Analysis("no significant onset for downbeat".into()));
@@ -2316,7 +2066,6 @@ fn find_first_downbeat_hop(
         .position(|&v| v >= e_thresh)
         .ok_or_else(|| Error::Analysis("no significant onset for downbeat".into()))?;
 
-    // Refine within ±¼ beat using novelty when available; otherwise keep energy index.
     let half = (period_hops * 0.25).max(1.0);
     let lo = (first_hop as f64 - half).max(0.0) as usize;
     let hi = ((first_hop as f64 + half) as usize).min(novelty.len().saturating_sub(1));
@@ -2330,7 +2079,6 @@ fn find_first_downbeat_hop(
             }
         }
     }
-    // If novelty refine found nothing useful (all ~0 near start), stay on energy index.
     if best_val < SILENCE_EPS {
         best_hop = first_hop;
     }
@@ -2344,10 +2092,6 @@ pub(crate) enum SectionDir {
     Backward,
 }
 
-/// Bar-start frame offsets for a head/tail scan window, shared by
-/// [`detect_section_bars`] and [`bar_diag_rows`] (and reused by
-/// [`crate::features`] callers via [`SectionDiag`]) so the feature-frontend
-/// bar grid is always identical to the grid the existing detector scores.
 fn section_bar_starts(
     buffer: &AudioBuffer,
     anchor: u64,
@@ -2380,7 +2124,6 @@ fn detect_section_bars(
 ) -> Result<SectionEstimate> {
     let bar_len_frames = bar_len.round().max(1.0) as u64;
     let starts = section_bar_starts(buffer, anchor, bar_len_frames, dir);
-    // Need at least one snap candidate + a short after-window.
     if starts.len() < SNAP_CANDIDATES[0] as usize + 4 {
         return Ok(SectionEstimate {
             bars: FALLBACK_BARS,
@@ -2398,13 +2141,6 @@ fn detect_section_bars(
     })
 }
 
-/// Outro *structural* boundary: the full mid-energy drop.
-///
-/// The mix trigger is no longer decided here. It is one fixed rule away —
-/// [`outro_trigger_bars`], applied once in [`analyze`] — so that this function
-/// answers only "where does the outro start", the same question the labeler
-/// answers by ear. Falls back to candidate scoring without the "prefer longer"
-/// bias used on intros.
 fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
     if let Some(drop) = pick_outro_full_drop(feats) {
         let bars = drop.bars.max(SNAP_CANDIDATES[0]);
@@ -2428,18 +2164,11 @@ fn pick_outro_bars(feats: &[BarFeat]) -> SectionEstimate {
     }
 }
 
-/// Full energy-drop boundary from the file end, snapped to {16,32,64}.
-///
-/// Funkot outros often keep the kick, so RMS/mid body stay up; the collapse that
-/// DJs hear is mid/high content. Detect that via [`BarFeat::midhigh_ratio`]
-/// (earliest sustained rise above the near-end floor). Mixing at this boundary
-/// is too late — callers add [`OUTRO_LEAD_BARS`].
 fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
     if feats.len() < 16 + AFTER_WIN_BARS {
         return None;
     }
 
-    // Skip near-silent trailing bars when sampling the outro floor.
     let mut floor_lo = 0usize;
     while floor_lo + 8 < feats.len() && amp_to_db(feats[floor_lo].rms) < -30.0 {
         floor_lo += 1;
@@ -2449,7 +2178,6 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
         return None;
     }
 
-    // Silence pads often have unstable HF ratios; treat them as 0.
     let ratio: Vec<f64> = feats
         .iter()
         .map(|f| {
@@ -2461,10 +2189,6 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
         })
         .collect();
 
-    // Floor window can mix a bright final fill with the true sparse collapse
-    // (Starmine). When max ≫ median an end-tag is present — use Q1 so the tag
-    // does not raise `enter` and skip the ~16-bar drop (→ false 32+lead=48).
-    // Milder windows keep the median (Totsumal / IVY).
     let mut floor_vals: Vec<f64> = ratio[floor_lo..floor_hi].to_vec();
     floor_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = floor_vals.len();
@@ -2482,11 +2206,9 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
     let mut far_vals = ratio[far_lo..far_hi].to_vec();
     far_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let far_med = far_vals[far_vals.len() / 2];
-    // Need a clear mid/high recovery past the drop floor (≈0.06–0.1 → 0.15+).
     if peak < floor * 1.35 && (peak - floor) < 0.03 {
         return None;
     }
-    // Light threshold: a brief layer-add spike should not wait for a long smooth.
     let enter = (floor * 1.25).max(floor + (peak - floor) * 0.25);
     let soft = enter * 0.85;
     const SUSTAIN: usize = 3;
@@ -2503,7 +2225,6 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
         if !win.iter().all(|&v| v >= soft) {
             continue;
         }
-        // Reject a single-bar spike (common mid-outro hat fills).
         let above_enter = win.iter().filter(|&&v| v >= enter).count();
         if above_enter < 2 {
             continue;
@@ -2519,9 +2240,6 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
         let after_n = AFTER_WIN_BARS.min(feats.len() - c).max(4);
         let before = &feats[..c];
         let after = &feats[c..c + after_n];
-        // Short snap into a mid-outro plateau (after/far in (lo, hi)) is not the
-        // main→outro collapse; keep searching. Sparse after (Sakura) and full-main
-        // after (classic 16-bar floor) are kept.
         if bars <= 16 {
             let mut after_vals: Vec<f64> = ratio[c..c + after_n].to_vec();
             after_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -2539,16 +2257,12 @@ fn pick_outro_full_drop(feats: &[BarFeat]) -> Option<SectionEstimate> {
             low_confidence: false,
             score: peak / floor.max(1e-6),
             sharpness: edge_sharpness(before, after),
-            // This function never adds the mix lead-in itself; `bars` here
-            // already *is* the structural drop point.
             structure_bars: bars,
         });
     }
     None
 }
 
-/// Like [`pick_by_candidate_scores`] but without preferring longer near-ties
-/// (that bias pushed real Funkot outros to 64).
 fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> {
     let mut scored: Vec<SectionEstimate> = Vec::with_capacity(SNAP_CANDIDATES.len());
     for &cand in &SNAP_CANDIDATES {
@@ -2591,7 +2305,6 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
         a.score
             .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            // Near ties: prefer shorter (mix earlier from end is worse than late).
             .then_with(|| b.bars.cmp(&a.bars))
     })?;
     let runner_up = scored
@@ -2603,17 +2316,12 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
 
     let accept = margin >= MIN_SCORE_MARGIN || best_score >= MIN_BOUNDARY_SCORE * 2.0;
     if accept {
-        // The candidate boundary *is* the structural one; the mix lead-in is
-        // added once, in `analyze` (see `outro_trigger_bars`).
         let bars = best.bars;
         Some(SectionEstimate {
             bars,
             low_confidence: false,
             score: best.score,
             sharpness: best.sharpness,
-            // `best.bars` (== `best.structure_bars`, this function never
-            // adds the lead before this point) is the candidate boundary
-            // itself; `bars` above may additionally include OUTRO_LEAD_BARS.
             structure_bars: best.bars,
         })
     } else {
@@ -2622,14 +2330,6 @@ fn pick_by_candidate_scores_outro(feats: &[BarFeat]) -> Option<SectionEstimate> 
 }
 
 
-/// Choose a snap length from per-bar features, or fall back when ambiguous.
-///
-/// Long/medium cues try a 48-bar tension drop, then the stricter 48-bar
-/// fill/shout/rise path, then {64,80,96}, then the earliest sustained short
-/// boundary. Short {16,32} lengths require a sharp boundary; gradual layering
-/// ramps are not accepted as short with high confidence. Mainness and candidate
-/// scoring prefer the earliest sustained boundary and reject later ones that
-/// already contain a clear earlier step.
 fn pick_section_bars(feats: &[BarFeat]) -> SectionEstimate {
     if let Some(hit) = pick_long_intro_bars(feats) {
         return hit;
@@ -2649,19 +2349,6 @@ fn pick_section_bars(feats: &[BarFeat]) -> SectionEstimate {
     }
 }
 
-/// Detect 48/64/80/96-bar intros using cues that energy-rise scoring alone misses.
-///
-/// Real Funkot often keeps adding layers at 32 while the DJ intro continues, or
-/// enters the main via a tension drop (quieter after the boundary) / pre-boundary
-/// shout. Order matters:
-/// 1. Sustained drop at 48 (Shirube RMS / IVY brightness) before {64,80,96}.
-/// 2. Stricter fill/shout/rise at 48 before {64,80,96}: Starmine enters main
-///    with a spectral shout at 47–48 while RMS barely moves, then a quieter
-///    mid-main at 64 that would otherwise win as a long tension/fill cue.
-/// 3. {64,80,96} long cues (Love & Joy needs 64 here when 48 is clean).
-/// Without 64 on this path, a post-drop midband rebuild at 80 can false-trigger
-/// on true 64-bar intros. The medium-48 path stays stricter than {64,80,96} so
-/// mild mid-intro layer adds do not steal those lengths.
 fn pick_long_intro_bars(feats: &[BarFeat]) -> Option<SectionEstimate> {
     if let Some(est) = long_intro_tension_drop(feats, 48) {
         return Some(est);
@@ -2677,11 +2364,6 @@ fn pick_long_intro_bars(feats: &[BarFeat]) -> Option<SectionEstimate> {
     None
 }
 
-/// Sustained before→after energy or brightness drop only (not fill/shout/rise).
-///
-/// Funkot vocal mains enter either quieter (RMS drop, Shirube) or duller — the
-/// machine hats/leads step back for the vocal while RMS holds (IVY). Both are
-/// tension drops; brightness needs a bigger margin since it is noisier.
 fn long_intro_tension_drop(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate> {
     let c = cand as usize;
     let min_before = if cand <= 48 { 24 } else { 32 };
@@ -2694,8 +2376,6 @@ fn long_intro_tension_drop(feats: &[BarFeat], cand: u32) -> Option<SectionEstima
     let before = &feats[c - 8..c];
     let after = &feats[c..c + 8];
     let drop = median_db(before, |f| f.rms) - median_db(after, |f| f.rms);
-    // Only trust brightness with a full head scan: on a short track the
-    // after-window is the (equally dull) outro, not a vocal main.
     let dull = if feats.len() >= MAX_SCAN_BARS_INTRO {
         local_ratio_step(after, before)
     } else {
@@ -2714,11 +2394,6 @@ fn long_intro_tension_drop(feats: &[BarFeat], cand: u32) -> Option<SectionEstima
     })
 }
 
-/// 48-bar intros: same family as long cues, but stricter and blocked when an
-/// earlier clear main step already exists (avoids stealing 16/80/96 tracks).
-///
-/// Called before {64,80,96} long cues so a clear pre-main shout/fill at 48 is
-/// not overwritten by a later mid-main tension drop.
 fn pick_medium_intro_48(feats: &[BarFeat]) -> Option<SectionEstimate> {
     const CAND: u32 = 48;
     let c = CAND as usize;
@@ -2752,7 +2427,6 @@ fn pick_medium_intro_48(feats: &[BarFeat]) -> Option<SectionEstimate> {
     let local_rise = local_boundary_rise(pre, post);
     let local_ratio = local_ratio_step(pre, post);
 
-    // Stricter than {80,96}: weak tension-drop / mild score must not win.
     let ok = shout >= 0.08
         || local_rise >= 3.0
         || local_ratio >= 3.0
@@ -2777,7 +2451,6 @@ fn pick_medium_intro_48(feats: &[BarFeat]) -> Option<SectionEstimate> {
 
 fn long_intro_candidate(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate> {
     let c = cand as usize;
-    // 48 needs a slightly shorter mature window than 80/96.
     let min_before = if cand <= 48 { 24 } else { 32 };
     if c < min_before || c + AFTER_WIN_BARS > feats.len() {
         return None;
@@ -2807,8 +2480,6 @@ fn long_intro_candidate(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate>
     let fill = fill_peak - fill_base;
     let comp = (median_f(post, |f| f.midhigh_ratio) - median_f(pre, |f| f.midhigh_ratio)).abs();
     let shout = ratio_anomaly_peak(feats, c);
-    // Local step without full-window variance penalty (gradual intros kill
-    // [`edge_sharpness`] even when the boundary itself is crisp).
     let local_rise = local_boundary_rise(pre, post);
     let local_ratio = local_ratio_step(pre, post);
 
@@ -2837,7 +2508,6 @@ fn long_intro_candidate(feats: &[BarFeat], cand: u32) -> Option<SectionEstimate>
     })
 }
 
-/// Positive dB step across the 4 bars before/after a candidate (no variance penalty).
 fn local_boundary_rise(pre: &[BarFeat], post: &[BarFeat]) -> f64 {
     let mut step = 0.0;
     step += (median_db(post, |f| f.rms) - median_db(pre, |f| f.rms)).max(0.0);
@@ -2848,14 +2518,12 @@ fn local_boundary_rise(pre: &[BarFeat], post: &[BarFeat]) -> f64 {
     step
 }
 
-/// Positive mid/high-ratio step in dB across local before/after windows.
 fn local_ratio_step(pre: &[BarFeat], post: &[BarFeat]) -> f64 {
     let rb = median_f(pre, |f| f.midhigh_ratio).max(1e-8);
     let ra = median_f(post, |f| f.midhigh_ratio).max(1e-8);
     (20.0 * (ra / rb).log10()).max(0.0)
 }
 
-/// Before-window still resembles the mature intro (not already in the main body).
 fn long_intro_before_is_intro_like(feats: &[BarFeat], c: usize) -> bool {
     let early_hi = 32.min(c.saturating_sub(8)).max(20);
     let early_lo = 16.min(early_hi.saturating_sub(8));
@@ -2865,7 +2533,6 @@ fn long_intro_before_is_intro_like(feats: &[BarFeat], c: usize) -> bool {
     let mature_lo = (c - 32).max(early_hi);
     let mature_hi = c - 8;
     if mature_hi <= mature_lo + 4 {
-        // Short medium intros: compare before-8 to early intro only.
         let early = median_db(&feats[early_lo..early_hi], |f| f.rms);
         let early_mid = median_db(&feats[early_lo..early_hi], |f| f.mid_energy.sqrt());
         let before = median_db(&feats[c - 8..c], |f| f.rms);
@@ -2883,11 +2550,9 @@ fn long_intro_before_is_intro_like(feats: &[BarFeat], c: usize) -> bool {
     let mature = median_db(&feats[mature_lo..mature_hi], |f| f.rms);
     let before = median_db(&feats[c - 8..c], |f| f.rms);
     let before_mid = median_db(&feats[c - 8..c], |f| f.mid_energy.sqrt());
-    // Still near the preceding intro level (reject post-breakdown quiet).
     if before < mature - 1.5 || before > mature + 2.0 {
         return false;
     }
-    // Not already a clear main-body mid jump vs early intro.
     if before_mid > early_mid + 4.0 && before > early + 3.0 {
         return false;
     }
@@ -2933,7 +2598,6 @@ fn pick_by_mainness_onset(feats: &[BarFeat]) -> Option<SectionEstimate> {
     let enter = MAINNESS_ENTER.max(peak * MAINNESS_PEAK_FRAC);
     let soft = enter * 0.75;
 
-    // Collect every sustained onset (gradual tracks often rise early; we gate later).
     let mut onsets = Vec::new();
     let last = smooth.len().saturating_sub(MAINNESS_SUSTAIN);
     for i in 4..last {
@@ -2948,8 +2612,6 @@ fn pick_by_mainness_onset(feats: &[BarFeat]) -> Option<SectionEstimate> {
         return None;
     }
 
-    // Prefer the earliest snap-aligned onset that passes the boundary gate.
-    // Later mid-main builds must not overwrite a true short-intro boundary.
     for &raw in &onsets {
         let (bars, snap_low) = snap_intro_bars(raw as u32);
         if snap_low {
@@ -3025,7 +2687,6 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
         return None;
     }
 
-    // Prefer earliest credible boundary (short intros over mid-main false hits).
     scored.sort_by(|a, b| {
         a.bars.cmp(&b.bars).then_with(|| {
             b.score
@@ -3050,8 +2711,6 @@ fn pick_by_candidate_scores(feats: &[BarFeat]) -> Option<SectionEstimate> {
     }
 }
 
-/// True when `[0..c]` already contains an earlier snap candidate with a clear
-/// sustained mainization — later candidates must not overwrite that boundary.
 fn before_has_clear_main_step(feats: &[BarFeat], c: usize) -> bool {
     for &cand in &INTRO_SNAP_CANDIDATES {
         let k = cand as usize;
@@ -3068,11 +2727,9 @@ fn before_has_clear_main_step(feats: &[BarFeat], c: usize) -> bool {
         if !passes_short_sharpness_gate(cand, before, after, sharp) {
             continue;
         }
-        // Mid-intro layer adds keep climbing; they must not block later mains.
         if still_climbing_after(feats, k) {
             continue;
         }
-        // Require the after-window to stay elevated vs the early intro baseline.
         if !after_stays_mainlike(feats, k) {
             continue;
         }
@@ -3091,7 +2748,6 @@ fn after_stays_mainlike(feats: &[BarFeat], k: usize) -> bool {
         .map(|f| bar_mainness(f, baseline))
         .collect();
     let soft = MAINNESS_ENTER * 0.6;
-    // Spectral sustain: midhi after boundary stays above early intro.
     let early_r = median_f(&feats[..4.min(k)], |f| f.midhigh_ratio);
     let after_r = median_f(&feats[k..(k + AFTER_WIN_BARS).min(feats.len())], |f| {
         f.midhigh_ratio
@@ -3105,7 +2761,6 @@ fn after_stays_mainlike(feats: &[BarFeat], k: usize) -> bool {
     spectral_ok || energy_ok
 }
 
-/// True when energy/spectrum keeps rising after `c` — mid-intro layering, not main.
 fn still_climbing_after(feats: &[BarFeat], c: usize) -> bool {
     if c + 12 > feats.len() {
         return false;
@@ -3135,15 +2790,12 @@ fn passes_short_sharpness_gate(
     } else {
         (0.0, 0.0)
     };
-    // Energy sharpness can be zero on breakdown-into-main (RMS drops); ratio
-    // and local rise still mark a crisp section change.
     let effective = sharpness.max(local_rise).max(local_ratio);
 
     let gradual = before_is_gradual(before);
     let min_sharp = match bars {
         16 | 32 | 48 if gradual => MIN_SHARP_SHORT_GRADUAL,
         16 | 32 | 48 => MIN_SHARP_SHORT,
-        // 64+ used to free-pass; require a real gate so mid-main builds lose.
         _ if gradual => MIN_SHARP_SHORT_GRADUAL,
         _ => MIN_SHARP_SHORT,
     };
@@ -3154,8 +2806,6 @@ fn before_is_gradual(before: &[BarFeat]) -> bool {
     if before.len() < 8 {
         return false;
     }
-    // Monotonic layering: early quarter vs late quarter (RMS or mid/high share).
-    // (Raw min-max spread is too sensitive to single fill spikes.)
     let q = before.len() / 4;
     if q == 0 {
         return false;
@@ -3216,7 +2866,6 @@ fn snap_to_candidates(raw: u32, candidates: &[u32]) -> (u32, bool) {
         }
     }
     let rel = f64::from(best_dist) / f64::from(best.max(1));
-    // Absolute slack covers near-misses like raw=21 → 16 (rel 0.31 > 0.25).
     if rel > SNAP_TOLERANCE && best_dist > SNAP_ABS_TOLERANCE {
         (FALLBACK_BARS, true)
     } else {
@@ -3224,11 +2873,6 @@ fn snap_to_candidates(raw: u32, candidates: &[u32]) -> (u32, bool) {
     }
 }
 
-/// Contrast of a candidate intro/outro window vs the following main-body sample.
-///
-/// Real Funkot often adds bass/mid layers at the main without a 4× HF-ratio jump
-/// (ratio can even fall as low energy rises). Score positive dB-like deltas in
-/// RMS, mid-band energy, absolute HF energy, and HF ratio.
 fn boundary_score(before: &[BarFeat], after: &[BarFeat]) -> f64 {
     if before.is_empty() || after.is_empty() {
         return 0.0;
@@ -3244,7 +2888,6 @@ fn boundary_score(before: &[BarFeat], after: &[BarFeat]) -> f64 {
     let ratio_a = median_f(after, |f| f.midhigh_ratio).max(1e-8);
     let ratio_d = (20.0 * (ratio_a / ratio_b).log10()).max(0.0);
 
-    // Local sharpness: step at the boundary vs variation inside each side.
     let edge = edge_sharpness(before, after);
 
     1.2 * rms_d + 1.0 * mid_d + 1.0 * hf_d + 0.35 * ratio_d + 0.5 * edge
@@ -3263,7 +2906,6 @@ fn edge_sharpness(before: &[BarFeat], after: &[BarFeat]) -> f64 {
             .max(0.0)
         + (median_db(post, |f| f.mid_energy.sqrt()) - median_db(pre, |f| f.mid_energy.sqrt()))
             .max(0.0);
-    // Penalize if the before/after windows themselves already swing a lot.
     let var_b = window_spread_db(before);
     let var_a = window_spread_db(after);
     (step - 0.55 * (var_b + var_a)).max(0.0)
@@ -3395,9 +3037,6 @@ pub fn diagnose_section_bars_ext(
         tail_window,
     )?;
 
-    // Only the leading `*_covered` bars are real window audio; the rest are
-    // `BarFeatures::default()` zero-fill and must not reach `structure::compute`
-    // (see `bar_diag_rows`).
     let intro_structure = intro_new_feats.as_deref().and_then(|f| {
         (intro_covered > 0).then(|| {
             crate::structure::compute(&f[..intro_covered], crate::structure::DEFAULT_PREFIX_BARS)
@@ -3419,22 +3058,6 @@ pub fn diagnose_section_bars_ext(
     })
 }
 
-/// Per-bar diagnostics for one side (intro or outro), plus the Stage 2
-/// feature vectors and how many leading bars of them are safe to feed to
-/// [`crate::structure::compute`].
-///
-/// `window` bounds the audio [`crate::features::bar_features`] actually has
-/// samples for; bars whose `[start, start + bar_len_frames)` span is not
-/// fully inside it come back as `BarFeatures::default()` (all-zero — see that
-/// function's doc), which would otherwise contaminate the SSM/novelty/
-/// prefix-Mahalanobis signals with fake structure. `covered` is the number of
-/// leading bars (bar 0 first, matching `starts`' anchor-nearest-first order
-/// on both the forward intro side and the backward outro side) that are
-/// fully inside the window, determined purely from bar position vs window
-/// bounds — never from whether a bar's features happen to be zero, which
-/// would also drop genuinely silent bars. Scanned front-to-back and stopped
-/// at the first bar that falls outside the window, since both scan
-/// directions lay bars out contiguously from the window's near edge.
 fn bar_diag_rows(
     buffer: &AudioBuffer,
     anchor: u64,
@@ -3491,9 +3114,7 @@ fn bar_diag_rows(
 struct BarFeat {
     midhigh_ratio: f64,
     rms: f64,
-    /// Mean-square energy above [`HIGHPASS_HZ`].
     hf_energy: f64,
-    /// Mean-square energy below the high-pass (kick / bass / mid body).
     mid_energy: f64,
     centroid_hz: f64,
 }
@@ -3517,7 +3138,6 @@ fn bar_features(buffer: &AudioBuffer, bar_starts: &[u64], bar_len_frames: u64) -
         let high = highpass_1pole(&mono, sr, HIGHPASS_HZ);
         let mut total = 0.0f64;
         let mut hi = 0.0f64;
-        // Cheap spectral centroid proxy via zero-crossing rate + HF share.
         let mut zc = 0u32;
         let mut prev = 0.0f32;
         for (&t, &h) in mono.iter().zip(high.iter()) {
@@ -3548,7 +3168,6 @@ fn bar_features(buffer: &AudioBuffer, bar_starts: &[u64], bar_len_frames: u64) -
     out
 }
 
-/// Full-track mono RMS → dBFS and gain toward [`TARGET_RMS_DBFS`], clamped to ±12 dB.
 fn measure_loudness(buffer: &AudioBuffer) -> (f64, f64) {
     let mono = buffer.mono();
     if mono.is_empty() {
