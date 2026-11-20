@@ -1,0 +1,9 @@
+# Read by wl (workspace-lifecycle-native) from the commit a finish accepted.
+# No CI runs on topic pushes, so the workspace tests run on the merged commit
+# in the WSL offload before the target branch moves. `sh -lc` takes cargo
+# from the offload user's login environment.
+slot_cache = ["target", "target-host"]
+
+[[validation]]
+argv = ["sh", "-lc", "cargo test --workspace --locked"]
+where = "any"
